@@ -2,7 +2,8 @@
 # Builds `webmify` as a fully static musl binary. Nothing is installed on the
 # host: ./build.sh runs this and exports the binary to ./dist/webmify.
 
-FROM alpine:3 AS build
+# pinned minor so the toolchain doesn't drift between builds
+FROM alpine:3.24 AS build
 
 RUN apk add --no-cache \
     autoconf automake libtool \

@@ -26,6 +26,17 @@ WEBP_VERSION=1.6.0
 ZIMG_VERSION=3.0.6
 FFMPEG_VERSION=8.1.1
 
+# sha256 of each release tarball; opus and dav1d match their publishers'
+# checksum files, the rest are pinned from a verified-good download (the
+# build fails loudly if upstream ever serves different bytes)
+NASM_SHA256=b7324cbe86e767b65f26f467ed8b12ad80e124e3ccb89076855c98e43a9eddd4
+OPUS_SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+VPX_SHA256=7a479a3c66b9f5d5542a4c6a1b7d3768a983b1e5c14c60a9396edc9b649e015c
+DAV1D_SHA256=732010aa5ef461fa93355ed2c6c5fedb48ddc4b74e697eaabe8907eaeb943011
+WEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+ZIMG_SHA256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
+FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+
 # -ffunction-sections/-fdata-sections lets the final link drop unused code
 SECTION_CFLAGS="-ffunction-sections -fdata-sections"
 
@@ -34,11 +45,12 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 
 mkdir -p "$SRC" "$PREFIX"
 
-fetch() { # <url> <dir-name>
-    local url="$1" name="$2"
+fetch() { # <url> <dir-name> <sha256>
+    local url="$1" name="$2" sum="$3"
     if [ ! -d "$SRC/$name" ]; then
         echo "==> downloading $name"
         curl -fL --retry 3 -o "$SRC/$name.tar" "$url"
+        echo "$sum  $SRC/$name.tar" | sha256sum -c -
         mkdir -p "$SRC/$name"
         tar -xf "$SRC/$name.tar" -C "$SRC/$name" --strip-components=1
         rm -f "$SRC/$name.tar"
@@ -50,7 +62,7 @@ mark()  { touch "$PREFIX/.built-$1"; }
 
 # --- nasm (assembler; only built if the system lacks nasm/yasm) -------------
 if ! built nasm && ! command -v nasm >/dev/null && ! command -v yasm >/dev/null; then
-    fetch "https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.xz" nasm
+    fetch "https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.xz" nasm "$NASM_SHA256"
     echo "==> building nasm"
     (cd "$SRC/nasm" && ./configure --prefix="$PREFIX" && make -j"$JOBS" nasm && \
         install -Dm755 nasm "$PREFIX/bin/nasm")
@@ -59,7 +71,7 @@ fi
 
 # --- libopus ----------------------------------------------------------------
 if ! built opus; then
-    fetch "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz" opus
+    fetch "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz" opus "$OPUS_SHA256"
     echo "==> building libopus"
     (cd "$SRC/opus" && \
         CFLAGS="-O2 -fPIC $SECTION_CFLAGS" ./configure --prefix="$PREFIX" \
@@ -70,7 +82,7 @@ fi
 
 # --- libvpx (VP9 encoder only; decoding uses FFmpeg's native decoders) ------
 if ! built vpx; then
-    fetch "https://github.com/webmproject/libvpx/archive/refs/tags/v$VPX_VERSION.tar.gz" vpx
+    fetch "https://github.com/webmproject/libvpx/archive/refs/tags/v$VPX_VERSION.tar.gz" vpx "$VPX_SHA256"
     echo "==> building libvpx"
     (cd "$SRC/vpx" && \
         ./configure --prefix="$PREFIX" \
@@ -85,7 +97,7 @@ fi
 
 # --- dav1d (AV1 decoder — FFmpeg has no native software AV1 decoding) -------
 if ! built dav1d; then
-    fetch "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" dav1d
+    fetch "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" dav1d "$DAV1D_SHA256"
     echo "==> building dav1d"
     (cd "$SRC/dav1d" && \
         meson setup build --prefix="$PREFIX" --libdir=lib \
@@ -99,7 +111,7 @@ fi
 # --- libwebp (official WebP encoder; libwebpmux is needed by libwebp_anim;
 #     decoding uses FFmpeg's native webp decoder) ----------------------------
 if ! built webp; then
-    fetch "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$WEBP_VERSION.tar.gz" webp
+    fetch "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$WEBP_VERSION.tar.gz" webp "$WEBP_SHA256"
     echo "==> building libwebp"
     (cd "$SRC/webp" && \
         CFLAGS="-O2 -fPIC $SECTION_CFLAGS" ./configure --prefix="$PREFIX" \
@@ -114,7 +126,7 @@ fi
 # --- zimg (colorspace engine for the zscale filter: HDR -> SDR tonemapping;
 #     its only git submodule is googletest, so the release tarball builds) ----
 if ! built zimg; then
-    fetch "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-$ZIMG_VERSION.tar.gz" zimg
+    fetch "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-$ZIMG_VERSION.tar.gz" zimg "$ZIMG_SHA256"
     echo "==> building zimg"
     (cd "$SRC/zimg" && ./autogen.sh && \
         CXXFLAGS="-O2 -fPIC $SECTION_CFLAGS" ./configure --prefix="$PREFIX" \
@@ -125,7 +137,7 @@ fi
 
 # --- FFmpeg -----------------------------------------------------------------
 if ! built ffmpeg; then
-    fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" ffmpeg
+    fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" ffmpeg "$FFMPEG_SHA256"
     if [ ! -f "$SRC/ffmpeg/.patched" ]; then
         for p in "$ROOT"/patches/*.patch; do
             echo "==> applying $(basename "$p")"
