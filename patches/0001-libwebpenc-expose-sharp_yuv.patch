@@ -1,0 +1,31 @@
+diff -ruN a/libavcodec/libwebpenc_common.c b/libavcodec/libwebpenc_common.c
+--- a/libavcodec/libwebpenc_common.c	2026-06-10 09:45:18.675770129 +0000
++++ b/libavcodec/libwebpenc_common.c	2026-06-10 09:45:44.508931260 +0000
+@@ -49,6 +49,7 @@
+     { "cr_threshold","Conditional replenishment threshold",     OFFSET(cr_threshold), AV_OPT_TYPE_INT, { .i64 =  0  },  0, INT_MAX, VE           },
+     { "cr_size"     ,"Conditional replenishment block size",    OFFSET(cr_size)     , AV_OPT_TYPE_INT, { .i64 =  16 },  0, 256,     VE           },
+     { "quality"     ,"Quality",                OFFSET(quality),  AV_OPT_TYPE_FLOAT, { .dbl =  75 }, 0, 100,                         VE           },
++    { "sharp_yuv",  "Use slower, more accurate RGB->YUV conversion", OFFSET(sharp_yuv), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1,        VE           },
+     { NULL },
+ };
+ 
+@@ -115,6 +116,8 @@
+             return AVERROR(EINVAL);
+     }
+ 
++    s->config.use_sharp_yuv = s->sharp_yuv;
++
+     av_log(avctx, AV_LOG_DEBUG, "%s - quality=%.1f method=%d\n",
+            s->lossless ? "Lossless" : "Lossy", s->quality,
+            avctx->compression_level);
+diff -ruN a/libavcodec/libwebpenc_common.h b/libavcodec/libwebpenc_common.h
+--- a/libavcodec/libwebpenc_common.h	2026-06-10 09:45:18.917771674 +0000
++++ b/libavcodec/libwebpenc_common.h	2026-06-10 09:45:36.306880926 +0000
+@@ -47,6 +47,7 @@
+     AVFrame *ref;
+     int cr_size;
+     int cr_threshold;
++    int sharp_yuv;          // use slower, more accurate RGB->YUV conversion
+ } LibWebPContextCommon;
+ 
+ int ff_libwebp_error_to_averror(int err);
