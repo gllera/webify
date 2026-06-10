@@ -9,12 +9,13 @@
 # also builds the independent library stages in parallel.
 
 # pinned minor so the toolchain doesn't drift between builds
-# (cmake + yasm are for libaom: its cmake nasm probe rejects nasm 3.x)
+# (cmake + yasm are for libaom: its cmake nasm probe rejects nasm 3.x;
+# linux-headers for zimg's arm64 cpu detection: asm/hwcap.h)
 FROM alpine:3.24 AS base
 
 RUN apk add --no-cache \
     autoconf automake libtool \
-    bash build-base cmake coreutils curl diffutils meson nasm ninja perl pkgconf tar xz yasm \
+    bash build-base cmake coreutils curl diffutils linux-headers meson nasm ninja perl pkgconf tar xz yasm \
     zlib-dev zlib-static
 
 WORKDIR /build
