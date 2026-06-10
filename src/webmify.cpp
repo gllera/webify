@@ -80,6 +80,8 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
+#define WEBMIFY_VERSION "1.0"
+
 #define VIDEO_FILTERS "format=yuv420p" /* the scale step is built in init_video */
 #define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=flt:channel_layouts=%s"
 /* high-quality swscale conversions for the image pipeline (rounding flags are
@@ -1439,9 +1441,9 @@ end:
     return 0;
 }
 
-static int usage(void)
+static int usage(FILE *f, int status)
 {
-    fprintf(stderr,
+    fprintf(f,
             "webmify: transcode any popular video to VP9/Opus WebM,\n"
             "         or any popular image to WebP (auto-detected)\n"
             "usage: webmify [options] <input> <output>   ('-' = stdin/stdout)\n"
@@ -1463,8 +1465,10 @@ static int usage(void)
             "                         --best runs the slowest searches and\n"
             "                         spools piped video so it can two-pass\n"
             "                         (~2x slower, 1-7%% fewer bytes); the\n"
-            "                         default is the tuned middle ground\n");
-    return 2;
+            "                         default is the tuned middle ground\n"
+            "  -h, --help             show this help\n"
+            "      --version          print version (incl. vendored FFmpeg)\n");
+    return status;
 }
 
 /* -m/--max [HxW | S][@F]: a pixel box (height first; a single number bounds
@@ -1525,19 +1529,26 @@ bad:
 
 int main(int argc, char **argv)
 {
-    enum { OPT_FAST = 1000, OPT_BEST };
+    enum { OPT_FAST = 1000, OPT_BEST, OPT_VERSION };
     static const struct option longopts[] = {
         { "quality", required_argument, NULL, 'q' },
         { "max",     required_argument, NULL, 'm' },
         { "fast",    no_argument,       NULL, OPT_FAST },
         { "best",    no_argument,       NULL, OPT_BEST },
+        { "help",    no_argument,       NULL, 'h' },
+        { "version", no_argument,       NULL, OPT_VERSION },
         { NULL, 0, NULL, 0 },
     };
     int c;
     char *end;
 
-    while ((c = getopt_long(argc, argv, "q:m:", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "hq:m:", longopts, NULL)) != -1) {
         switch (c) {
+        case 'h':
+            return usage(stdout, 0);
+        case OPT_VERSION:
+            printf("webmify %s (FFmpeg %s)\n", WEBMIFY_VERSION, av_version_info());
+            return 0;
         case 'q':
             opt.quality = strtod(optarg, &end);
             if (*end || end == optarg || opt.quality < 0 || opt.quality > 10) {
@@ -1559,11 +1570,11 @@ int main(int argc, char **argv)
             opt.effort = c == OPT_FAST ? -1 : 1;
             break;
         default:
-            return usage();
+            return usage(stderr, 2);
         }
     }
     if (argc - optind != 2)
-        return usage();
+        return usage(stderr, 2);
     /* the '-' convention lives in the ffmpeg CLI, not libavformat */
     const char *in  = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
     const char *out = strcmp(argv[optind + 1], "-") ? argv[optind + 1] : "pipe:1";
