@@ -47,6 +47,14 @@ ff -f lavfi -i "testsrc2=size=1280x720:duration=2:rate=30" \
    -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
 ff -i tv.mp4 -c copy tv.mkv                       # mkv streams when piped (mp4 would spool)
 ff -display_rotation 90 -i tv.mp4 -c copy rot.mp4 # portrait via display matrix
+ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
+   -c:v libx264 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
+python3 - > evil.mp4 <<'EOF'                      # 64-bit atom size that would wrap the moov scan
+import struct, sys
+out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
+out += b"\x00\x00\x00\x01free" + struct.pack(">Q", (1 << 64) - 8)
+sys.stdout.buffer.write(out + b"\x00" * 4096)
+EOF
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "'$WEBMIFY' --help | grep -q usage"
@@ -80,6 +88,7 @@ t "image: stdin -> stdout pipe works"                 cmp -s piped.webp q_def.we
 "$WEBMIFY" -q 9 tv.mp4 v_q9.webm
 "$WEBMIFY" rot.mp4 v_rot.webm
 "$WEBMIFY" - - < tv.mkv > v_piped.webm
+"$WEBMIFY" frag.mp4 v_frag.webm
 
 t "video: VP9 + Opus"                                 eq "$(codecs v_def.webm)" "vp9+opus"
 t "video: 720p source fits the default 480 box"       eq "$(dims v_def.webm)" "854,480"
@@ -88,6 +97,8 @@ t "video: -q 2 smaller than -q 9"                     lt "$(size v_q2.webm)" "$(
 t "video: display-matrix rotation baked in"           eq "$(dims v_rot.webm)" "270,480"
 t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
 t "video: stdin -> stdout pipe (single-pass) works"   eq "$(codecs v_piped.webm)" "vp9+opus"
+t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.webm)" "vp9"
+t "video: crafted mp4 prefix does not hang the probe" bash -c "timeout 5 '$WEBMIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
 
 echo
 [ "$fail" -eq 0 ] && echo "all $pass tests passed" || { echo "$fail of $((pass+fail)) tests FAILED"; exit 1; }

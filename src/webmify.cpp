@@ -300,7 +300,10 @@ static int prefix_has_early_moov(const uint8_t *buf, size_t len)
                 break;
             size = AV_RB64(buf + pos + 8);
         }
-        if (size < 8) /* 0 = "extends to EOF"; <8 = corrupt */
+        if (size < 8 || size > len - pos) /* 0 = "extends to EOF"; <8 =
+                                           * corrupt; past the prefix = done
+                                           * (a crafted 64-bit size could
+                                           * otherwise wrap pos and loop) */
             break;
         pos += size;
     }
@@ -413,8 +416,8 @@ static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO
          * 10-20% smaller than the streamed single-pass */
         if (io->fd >= 0) /* spool started; the pipe is partly consumed */
             return ret;
-        av_log(NULL, AV_LOG_WARNING, "no temp file for seekable input (%s), "
-               "streaming instead\n", err2str(ret));
+        av_log(NULL, AV_LOG_WARNING, "cannot spool piped input to a temp "
+               "file (%s), streaming instead\n", err2str(ret));
     }
 
     if (image) {
@@ -678,7 +681,9 @@ static int input_is_image(const AVFormatContext *ifmt, int vidx, int aidx)
         return 1;
     if (ifmt->streams[vidx]->disposition & AV_DISPOSITION_STILL_IMAGE)
         return 1;
-    return aidx < 0 && ifmt->streams[vidx]->nb_frames <= 1 &&
+    /* exactly 1: heif/avif items report nb_frames = 1, while 0 means the
+     * demuxer doesn't know the count (fragmented mp4) — that is video */
+    return aidx < 0 && ifmt->streams[vidx]->nb_frames == 1 &&
            !strncmp(ifmt->iformat->name, "mov,", 4);
 }
 
