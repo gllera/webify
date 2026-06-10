@@ -1,0 +1,61 @@
+name: vendor-update
+
+# Monthly upstream version check: runs update-vendor.sh, and if any pin
+# changed, opens (or refreshes) a PR on the rolling `vendor-updates` branch.
+# PRs created with GITHUB_TOKEN never fire on:pull_request workflows, so the
+# build is dispatched on the branch explicitly — its result lands on the PR's
+# head commit either way. Merge only when both arches are green.
+
+on:
+  schedule:
+    - cron: '0 6 1 * *' # 06:00 UTC on the 1st of every month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream versions and rewrite pins
+        id: check
+        continue-on-error: true # a failed probe shouldn't drop the bumps that worked
+        run: ./update-vendor.sh | tee /tmp/vendor-update.txt
+
+      - name: Open or refresh the update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "All pins already at the latest upstream versions."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -am 'vendor: bump pins to latest upstream releases' \
+              -m "$(grep '^bump' /tmp/vendor-update.txt)"
+          git push -f origin HEAD:vendor-updates
+          {
+            echo 'Automated monthly vendor version check (`update-vendor.sh`):'
+            echo
+            echo '```'
+            cat /tmp/vendor-update.txt
+            echo '```'
+            echo
+            echo 'CI was dispatched on this branch — merge only when both arches are green.'
+          } > /tmp/pr-body.md
+          gh pr create --head vendor-updates \
+              --title 'vendor: bump pins to latest upstream releases' \
+              --body-file /tmp/pr-body.md \
+            || gh pr edit vendor-updates --body-file /tmp/pr-body.md
+          gh workflow run build.yml --ref vendor-updates
+
+      - name: Surface probe failures
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo 'update-vendor.sh reported at least one failed upstream probe (see its FAIL lines above).'
+          exit 1

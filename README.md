@@ -288,7 +288,11 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
   plus the minimal patches in `patches/` (each a few lines, reviewable
   in-repo, applied verbatim by `vendor.d/80-ffmpeg.sh`; currently one: exposing
   libwebp's `use_sharp_yuv` as an encoder option, which FFmpeg does not
-  surface).
+  surface). The pins stay current: `./update-vendor.sh` checks every
+  upstream for new releases and rewrites the version + sha256 pins, and a
+  monthly workflow (`.github/workflows/vendor-update.yml`) runs it and
+  opens a PR with the bumps, with CI dispatched on the branch so both
+  arches prove they still build before merging.
 - **Minimal FFmpeg** (`--disable-everything --enable-small` + whitelist), so
   the binary stays ~19 MB instead of ~80 MB (libaom — encoder-only,
   8-bit-only, since webify never emits anything else — is ~6 MB of that;
