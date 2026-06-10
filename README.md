@@ -4,8 +4,9 @@ A single, fully static binary that transcodes any popular video file to
 VP9/Opus WebM — and any popular image file to WebP — with sane defaults
 tuned for serving the result over the internet: two-pass VP9 (10-20% smaller
 at equal quality), the seek index at the head of the file (faststart), and
-the densest WebP encoding (`-m 6`). Input type is auto-detected, and one
-option set covers both modes:
+the densest WebP encoding (`-m 6`). `--next` switches to the next-gen
+formats — AV1/Opus WebM and AVIF — at the same visual targets. Input type
+is auto-detected, and one option set covers both modes:
 
 ```
 webmify input.mp4 output.webm
@@ -13,6 +14,8 @@ webmify photo.jpg photo.webp
 webmify -q 6 --max 720x1280 input.mov output.webm   # fit 720 tall, 1280 wide
 cat input.mkv | webmify - - > output.webm   # '-' = stdin/stdout
 cat anim.gif  | webmify - - > anim.webp
+webmify --next input.mp4 output.webm        # AV1/Opus WebM instead of VP9
+webmify --next photo.jpg photo.avif         # AVIF instead of WebP
 ```
 
 Options mean the same thing for video and image inputs (and go before the
@@ -53,6 +56,54 @@ file arguments):
     the default at equal-or-better SSIM for ~75% more encode time (and
     10-20% smaller for piped inputs that could not two-pass before).
     Images already run their densest settings by default.
+- `--next` — output the next-gen formats: video becomes AV1/Opus WebM
+  (libaom) and every image becomes AVIF — animated GIF becomes *animated*
+  AVIF (the `avis` brand, looping forever like the GIF did). `-q` buys the
+  *same look* as the default formats, not the same internal number, so
+  `--next` only changes the file size, never the quality. Every mapping is
+  a piecewise fit of measured equal-SSIM points against the VP9/WebP
+  output across photo, noise and graphics fixtures, rounded a hair
+  *toward* the smaller file (`doc/next-calibration.md` has the data):
+  video keeps its CRF nudged up where libaom outperforms libvpx
+  (+`(crf−20)/6` above CRF 20, `--fast` +4 more) while the bitrate budget
+  follows the shifted CRF and is converted by the same codec-efficiency
+  table that weights the source cap (÷1.3); stills run near-linear to
+  `-q 8` then dive with cwebp's premium top end (q 8 → CRF 28, 9.5 → 12,
+  10 → 6); animations get their own much-higher curve (CRF 63 easing to
+  56 at `-q 8`) because animated WebP is far weaker than stills WebP.
+  Measured at the defaults: video −28% bytes at equal SSIM (low `-q`
+  reaches −60%), stills −26%, and animated GIFs −96% — all within
+  ±0.005 SSIM of their VP9/WebP counterpart. AVIF keeps alpha when the
+  input *really* uses it (a fully opaque alpha channel is detected and
+  dropped instead of wasting a stream) as the standard auxiliary alpha
+  stream — near-lossless and tagged full-range as MIAF demands; EXIF
+  rotation is baked in as usual. RGB-decoded stills above `-q 8` race a
+  4:4:4 candidate against 4:2:0 (full-resolution chroma is what closes
+  most of the gap to WebP's lossless race on sharp graphics) and ship it
+  only while it stays ≤1.35× the 4:2:0 bytes — saturated noise explodes
+  in 4:4:4 and falls back, so the winner stays smaller than the WebP
+  output either way. True lossless stays WebP-only (AV1 lossless is far
+  larger — graphics that want lossless should stay WebP). Effort tiers,
+  each step measured to pay for its time like the VP9/WebP ones:
+  `--fast` runs cpu-used 6 single-pass (about *half* the time of even
+  the VP9 default), the default runs cpu-used 4 two-pass (~3× the VP9
+  default's encode time — libaom is simply heavier; that time is what
+  buys the size win). For video and animations `--best` keeps the
+  default encoder settings, because libaom's deeper searches measured
+  *bigger* (+0.3-1% bytes for 1.2-3.4× the time — at a fixed CRF they
+  buy a sliver of quality, never bytes) — it still spools piped video so
+  the stats pass always runs. Stills use `usage=allintra` +
+  `still-picture` at speeds 6/4/2 (speed 7 measured the same wall time
+  as 6 for −.008 SSIM — a strictly worse point; avifenc defaults to
+  speed 6 — the webmify default digs one step deeper). Two honest
+  caveats, same cause: stills dominated by pure smooth gradients can
+  come out *bigger* than their WebP (libaom spends a byte floor on them
+  at any CRF, at higher quality), and near-static animations hit that
+  floor too (a 30-frame static-background GIF measured 1.8 KB AVIF vs
+  294 B WebP — trivial sizes). Real photos and real motion are
+  unaffected. Everything else —
+  the `--max` box, frame-rate caps, two-pass, tonemapping, faststart
+  cues, mono/Opus audio rules, stdin/stdout — works identically.
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the
   vendored FFmpeg version baked into the binary.
 
@@ -68,7 +119,11 @@ video containers that need a seekable input to keep all their features
 exits. Everything else streams — but a truly streamed video input cannot be
 rewound for the stats pass, so it falls back to single-pass encoding (with a
 warning). Piped video output is playable but carries no duration/seek index
-in the header.
+in the header. AVIF written to stdout is assembled in memory and dumped
+whole at the end (its container back-patches item offsets, which needs a
+seekable sink); piped AV1 WebM streams like VP9 does — webmify pre-extracts
+the AV1 sequence header the muxer needs up front, since libaom only delivers
+it alongside the first encoded packet.
 
 Video is encoded in two passes whenever the input can rewind (files, spooled
 stdin) — only with first-pass stats does libvpx use alt-ref frames and plan
@@ -141,8 +196,12 @@ edges for ~1% more bytes. When lossless wins the race, the winner is
 re-encoded at maximum effort (`cwebp -lossless -q 100 -m 6`) — measured a
 further 1-3% smaller; photos, whose lossless candidate just lost, never pay
 that time. Animations keep libwebp's fast converter (sharp measured ~20%
-more bytes there, like `gif2webp` without `-sharp_yuv`), and stay lossy:
-lossless animation measured 2.5x bigger even on flat-color GIF content.
+more bytes there, like `gif2webp` without `-sharp_yuv`) and always stay
+lossy: lossless animation measured 2.7× bigger on dithered photo-like
+GIFs. Graphics and flat-color GIFs are the exception — they measured
+*smaller* lossless (testsrc2 −19%) — but only single frames race today.
+The animated encoder itself is as small as the format allows: audited
+against `gif2webp` at equal settings, within ±1% on every fixture.
 Inputs: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC, AVIF.
 
 ## Building
@@ -166,19 +225,22 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
 - **Official upstream sources only**, pinned release tarballs (`vendor.sh`)
   verified against pinned sha256 checksums, all latest releases:
   FFmpeg 8.1.1, libvpx 1.16.0 (webmproject), libopus 1.6.1 (xiph),
-  dav1d 1.5.3 (VideoLAN), libwebp 1.6.0 (webmproject), zimg 3.0.6
-  (sekrit-twc), zlib (Alpine static package) — plus the minimal patches in
-  `patches/` (each a few lines, reviewable in-repo, applied verbatim by
-  `vendor.sh`; currently one: exposing libwebp's `use_sharp_yuv` as an
-  encoder option, which FFmpeg does not surface).
-- **Minimal FFmpeg** (`--disable-everything --enable-small` + whitelist), so the
-  binary stays ~10 MB instead of ~80 MB:
+  dav1d 1.5.3 (VideoLAN), libaom 3.14.1 (AOMedia), libwebp 1.6.0
+  (webmproject), zimg 3.0.6 (sekrit-twc), zlib (Alpine static package) —
+  plus the minimal patches in `patches/` (each a few lines, reviewable
+  in-repo, applied verbatim by `vendor.sh`; currently one: exposing
+  libwebp's `use_sharp_yuv` as an encoder option, which FFmpeg does not
+  surface).
+- **Minimal FFmpeg** (`--disable-everything --enable-small` + whitelist), so
+  the binary stays ~18 MB instead of ~80 MB (libaom — encoder-only,
+  8-bit-only, since webmify never emits anything else — is ~6 MB of that):
   - *read*: mp4/mov/3gp, mkv/webm, avi, flv, mpeg-ts/ps, asf/wmv, ogg, wav,
     mp3, aac, flac containers; H.264, HEVC, VP8, VP9, AV1 (dav1d), MPEG-1/2/4,
     WMV/VC-1, H.263, VP6, Theora, MJPEG video; AAC, AC-3/E-AC-3, MP2/3, Opus,
     Vorbis, FLAC, ALAC, WMA, DTS, TrueHD, ADPCM, PCM audio; JPEG, PNG, WebP,
     GIF, BMP, TIFF, HEIC, AVIF images.
-  - *write*: WebM with libvpx-vp9 + libopus; WebP with libwebp.
+  - *write*: WebM with libvpx-vp9 + libopus; WebP with libwebp; with
+    `--next`: WebM with libaom-av1 + libopus, AVIF with libaom-av1.
 - **Fully static** (musl, `ldd` → "not a dynamic executable"); runs on any
   Linux of the same architecture, including `FROM scratch` containers.
 
@@ -188,6 +250,6 @@ inputs, hardware acceleration, subtitle codecs, image-sequence inputs.
 ## License note
 
 The binary statically links LGPL-2.1+ code (FFmpeg), BSD code (libvpx,
-libopus, dav1d, libwebp) and WTFPL code (zimg). No GPL components are
-included. If you redistribute the binary, LGPL terms apply (provide
+libopus, dav1d, libaom, libwebp) and WTFPL code (zimg). No GPL components
+are included. If you redistribute the binary, LGPL terms apply (provide
 source/relink ability).

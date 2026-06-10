@@ -7,13 +7,14 @@ FROM alpine:3.24 AS build
 
 RUN apk add --no-cache \
     autoconf automake libtool \
-    bash build-base coreutils curl diffutils meson nasm ninja perl pkgconf tar xz \
+    bash build-base cmake coreutils curl diffutils meson nasm ninja perl pkgconf tar xz yasm \
     zlib-dev zlib-static
 
 WORKDIR /build
 
 # Heavy, rarely-changing layer: minimal static ffmpeg + libvpx + libopus +
-# dav1d + zimg, with the tiny local patches from patches/ applied.
+# dav1d + libaom + zimg, with the tiny local patches from patches/ applied.
+# (cmake + yasm are for libaom: its cmake nasm probe rejects nasm 3.x)
 COPY vendor.sh ./
 COPY patches ./patches
 RUN ./vendor.sh

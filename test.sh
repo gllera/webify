@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for dist/webmify: exercises the externally observable claims
 # (CLI contract, cwebp byte-identity, -q size ordering, --max scaling,
-# rotation baking, mono audio, VP9/Opus codecs, faststart cues, stdin/stdout).
+# rotation baking, mono audio, VP9/Opus codecs, faststart cues, stdin/stdout,
+# --next: AV1/Opus WebM video, AVIF images w/ alpha + animated GIF -> AVIF).
 # Fixtures are generated on the host: needs ffmpeg, ffprobe, cwebp, python3.
 #
 #   ./build.sh && ./test.sh
@@ -33,6 +34,7 @@ dims()     { ffprobe -v error -select_streams v:0 -show_entries stream=width,hei
 codecs()   { ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$1" | paste -sd+; }
 channels() { ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$1"; }
 trc()      { ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1"; }
+pixfmt()   { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1"; }
 size()     { stat -c%s "$1"; }
 # Matroska Cues (1C53BB6B) must precede the first Cluster (1F43B675)
 cues_at_head() {
@@ -66,6 +68,8 @@ ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
 ff -f lavfi -i "sine=frequency=440:duration=1" audio.wav        # no video stream at all
 ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
 ff -f lavfi -i "color=c=red:size=320x240:duration=1:rate=1" -frames:v 1 flat.png
+ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alpha.png
+ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" -c:v libx264 -pix_fmt yuv420p \
    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4 # PQ-tagged HDR
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
@@ -140,6 +144,40 @@ t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
 t "video: stdin -> stdout pipe (single-pass) works"   eq "$(codecs v_piped.webm)" "vp9+opus"
 t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.webm)" "vp9"
 t "video: crafted mp4 prefix does not hang the probe" bash -c "timeout 5 '$WEBMIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
+
+# --- --next: AV1/Opus WebM video, AVIF still images -------------------------------
+"$WEBMIFY" --next tv.mp4 a_tv.webm
+"$WEBMIFY" --next hdr.mp4 a_hdr.webm
+"$WEBMIFY" --next anim.gif a_anim.avif
+"$WEBMIFY" --next - - < tv.mkv > a_piped.webm
+"$WEBMIFY" --next --fast tiny.mp4 a_fast.webm
+"$WEBMIFY" --next --best tiny.mp4 a_best.webm
+"$WEBMIFY" --next photo.png a_q.avif
+"$WEBMIFY" --next -q 2 photo.png a_q2.avif
+"$WEBMIFY" --next -q 9 photo.png a_q9.avif
+"$WEBMIFY" --next alpha.png a_alpha.avif
+"$WEBMIFY" --next opaque.png a_opaque.avif
+"$WEBMIFY" --next exif.jpg a_exif.avif
+"$WEBMIFY" --next - - < photo.png > a_piped.avif
+
+t "next: video becomes AV1 + Opus"                     eq "$(codecs a_tv.webm)" "av1+opus"
+t "next: 720p source fits the default 480 box"         eq "$(dims a_tv.webm)" "854,480"
+t "next: smaller than the VP9 default at the same -q"  lt "$(size a_tv.webm)" "$(size v_def.webm)"
+t "next: seek cues at the head (faststart)"            cues_at_head a_tv.webm
+t "next: HDR (PQ) tonemapped to SDR bt709"             eq "$(trc a_hdr.webm)" "bt709"
+t "next: animated gif -> animated AVIF (avis brand)"   grep -aq ftypavis a_anim.avif
+t "next: stdin -> stdout video pipe works"             eq "$(codecs a_piped.webm)" "av1+opus"
+t "next: --fast tier produces AV1+Opus"                eq "$(codecs a_fast.webm)" "av1+opus"
+t "next: --best tier produces AV1+Opus"                eq "$(codecs a_best.webm)" "av1+opus"
+t "next: still image -> AVIF (ftyp brand)"             grep -aq ftypavif a_q.avif
+t "next: -q 2 smaller than -q 9"                       lt "$(size a_q2.avif)" "$(size a_q9.avif)"
+t "next: EXIF orientation baked in (-> 480x640)"       eq "$(dims a_exif.avif)" "480,640"
+t "next: alpha kept (auxiliary alpha stream)"          grep -aq "auxiliary:alpha" a_alpha.avif
+t "next: fully opaque alpha channel dropped"           bash -c "! grep -aq 'auxiliary:alpha' a_opaque.avif"
+t "next: stdin -> stdout still is a valid AVIF"        grep -aq ftypavif a_piped.avif
+t "next: default still stays 4:2:0"                    eq "$(pixfmt a_q.avif)" "yuv420p"
+t "next: premium -q RGB graphics race to 4:4:4"        eq "$(pixfmt a_q9.avif)" "yuv444p"
+t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" "$(size anim.webp)"
 
 echo
 [ "$fail" -eq 0 ] && echo "all $pass tests passed" || { echo "$fail of $((pass+fail)) tests FAILED"; exit 1; }
