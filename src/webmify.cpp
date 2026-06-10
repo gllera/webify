@@ -1319,7 +1319,11 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             av_dict_set(&aopts, "still-picture", "1", 0);
         }
         av_dict_set(&aopts, "row-mt", "1", 0);
-        av_dict_set(&aopts, "cpu-used", opt.effort < 0 ? "6" : "4", 0);
+        /* still alpha keeps cpu-used 7 at --fast: the stills ladder's
+         * speed-7 rejection is a lossy-mode result — at crf 0 speed
+         * moves bytes, not the look */
+        av_dict_set(&aopts, "cpu-used",
+                    opt.effort < 0 ? (peeked.animated ? "6" : "7") : "4", 0);
         ret = avcodec_open2(p->enc_a, codec, &aopts);
         av_dict_free(&aopts);
         if (ret < 0)

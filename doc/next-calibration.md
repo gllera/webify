@@ -176,6 +176,11 @@ shifted 93.6 -> 92.1. Fixed by tagging encoder context and frames
 `AVCOL_RANGE_JPEG`. Note host ffmpeg 6.1 cannot demux AVIF alpha at all
 (decodes opaque — useless as a referee here; use `avifdec`).
 
+The aux encoder's speeds are 4 by default and, at `--fast`, 6 for
+animations but **7 for stills** — the speed-7 rejection in the stills
+section above is a lossy-mode result and doesn't carry over: alpha rides
+crf 0, where a faster speed costs bytes, never look.
+
 ## What needs no change
 
 - **Audio**: `init_audio` has no `--next` branch; Opus settings identical
