@@ -2,7 +2,9 @@
 # Smoke test for dist/webmify: exercises the externally observable claims
 # (CLI contract, cwebp byte-identity, -q size ordering, --max scaling,
 # rotation baking, mono audio, VP9/Opus codecs, faststart cues, stdin/stdout,
-# --next: AV1/Opus WebM video, AVIF images w/ alpha + animated GIF -> AVIF).
+# --next: AV1/Opus WebM video, AVIF images w/ alpha + animated GIF -> AVIF,
+# --legacy: H.264/AAC MP4 video w/ faststart, lossless PNG images w/ alpha +
+# animated GIF -> APNG).
 # Fixtures are generated on the host: needs ffmpeg, ffprobe, cwebp, python3.
 #
 #   ./build.sh && ./test.sh
@@ -42,6 +44,18 @@ cues_at_head() {
 d = open(sys.argv[1], "rb").read()
 c = d.find(bytes.fromhex("1C53BB6B")); k = d.find(bytes.fromhex("1F43B675"))
 sys.exit(0 if 0 <= c < k else 1)' "$1"
+}
+# MP4 faststart: the moov atom must precede the mdat atom
+moov_at_head() {
+    python3 -c 'import sys
+d = open(sys.argv[1], "rb").read()
+m = d.find(b"moov"); k = d.find(b"mdat")
+sys.exit(0 if 0 <= m < k else 1)' "$1"
+}
+# the decoded pixels of two images, compared exactly (lossless check)
+same_pixels() {
+    md() { ffmpeg -v error -i "$1" -f framemd5 - | tail -1; }
+    [ "$(md "$1")" = "$(md "$2")" ]
 }
 
 # --- fixtures ----------------------------------------------------------------
@@ -178,6 +192,47 @@ t "next: stdin -> stdout still is a valid AVIF"        grep -aq ftypavif a_piped
 t "next: default still stays 4:2:0"                    eq "$(pixfmt a_q.avif)" "yuv420p"
 t "next: premium -q RGB graphics race to 4:4:4"        eq "$(pixfmt a_q9.avif)" "yuv444p"
 t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" "$(size anim.webp)"
+
+# --- --legacy: H.264/AAC MP4 video, PNG/APNG images ----------------------------
+"$WEBMIFY" --legacy tv.mp4 l_tv.mp4
+"$WEBMIFY" --legacy -q 2 tv.mp4 l_q2.mp4
+"$WEBMIFY" --legacy -q 9 tv.mp4 l_q9.mp4
+"$WEBMIFY" --legacy rot.mp4 l_rot.mp4
+"$WEBMIFY" --legacy hdr.mp4 l_hdr.mp4
+"$WEBMIFY" --legacy - - < tv.mkv > l_piped.mp4
+"$WEBMIFY" --legacy --fast tiny.mp4 l_fast.mp4
+"$WEBMIFY" --legacy --best tiny.mp4 l_best.mp4
+"$WEBMIFY" --legacy photo.png l_q.png
+"$WEBMIFY" --legacy -q 2 photo.png l_q2.png
+"$WEBMIFY" --legacy plain.jpg l_jpg.png
+"$WEBMIFY" --legacy alpha.png l_alpha.png
+"$WEBMIFY" --legacy opaque.png l_opaque.png
+"$WEBMIFY" --legacy exif.jpg l_exif.png
+"$WEBMIFY" --legacy anim.gif l_anim.png
+"$WEBMIFY" --legacy - - < photo.png > l_piped.png
+"$WEBMIFY" --legacy - - < anim.gif > l_piped_anim.png
+
+t "legacy: --next with --legacy rejected"              rejects --next --legacy
+t "legacy: video becomes H.264 + AAC"                  eq "$(codecs l_tv.mp4)" "h264+aac"
+t "legacy: 720p source fits the default 480 box"       eq "$(dims l_tv.mp4)" "854,480"
+t "legacy: mono source stays mono"                     eq "$(channels l_tv.mp4)" "1"
+t "legacy: moov at the head (faststart)"               moov_at_head l_tv.mp4
+t "legacy: -q 2 smaller than -q 9"                     lt "$(size l_q2.mp4)" "$(size l_q9.mp4)"
+t "legacy: display-matrix rotation baked in"           eq "$(dims l_rot.mp4)" "270,480"
+t "legacy: HDR (PQ) tonemapped to SDR bt709"           eq "$(trc l_hdr.mp4)" "bt709"
+t "legacy: stdin -> stdout video pipe (fragmented)"    eq "$(codecs l_piped.mp4)" "h264+aac"
+t "legacy: --fast tier produces H.264+AAC"             eq "$(codecs l_fast.mp4)" "h264+aac"
+t "legacy: --best tier produces H.264+AAC"             eq "$(codecs l_best.mp4)" "h264+aac"
+t "legacy: still image -> PNG"                         eq "$(codecs l_q.png)" "png"
+t "legacy: PNG is pixel-lossless vs the source"        same_pixels l_q.png photo.png
+t "legacy: -q does not change a PNG (always lossless)" cmp -s l_q.png l_q2.png
+t "legacy: YUV source (JPEG) comes out plain rgb24"    eq "$(pixfmt l_jpg.png)" "rgb24"
+t "legacy: real alpha kept (rgba PNG)"                 eq "$(pixfmt l_alpha.png)" "rgba"
+t "legacy: fully opaque alpha channel dropped"         eq "$(pixfmt l_opaque.png)" "rgb24"
+t "legacy: EXIF orientation baked in (-> 480x640)"     eq "$(dims l_exif.png)" "480,640"
+t "legacy: animated gif -> APNG (acTL chunk)"          grep -aq acTL l_anim.png
+t "legacy: stdin -> stdout still is a PNG"             eq "$(codecs l_piped.png)" "png"
+t "legacy: piped APNG keeps its frames (acTL intact)"  grep -aq acTL l_piped_anim.png
 
 echo
 [ "$fail" -eq 0 ] && echo "all $pass tests passed" || { echo "$fail of $((pass+fail)) tests FAILED"; exit 1; }

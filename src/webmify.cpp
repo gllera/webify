@@ -49,6 +49,15 @@
  *     the VP9-anchored rate budget is converted by the same codec-efficiency
  *     table that weights the source cap — so --next changes the file size,
  *     never the look
+ *   - --legacy is the same idea pointed backwards: video becomes H.264/AAC
+ *     MP4 (vendored x264) with the moov up front (fragmented MP4 on pipes,
+ *     where faststart cannot seek back), and every image becomes PNG
+ *     (animated GIF -> APNG) — lossless by definition, so -q steers video
+ *     only. The video -q mapping is the same equal-SSIM fit against the VP9
+ *     pipeline (doc/legacy-calibration.md) and the rate caps are converted
+ *     by the same codec-efficiency table (/0.8 — H.264 needs more bits for
+ *     the look). Always single-pass: x264's two-pass targets a bitrate, not
+ *     a quality, and its CRF mode already plans ahead (lookahead/mbtree)
  *   - progress on stderr when it is a terminal and the duration is known
  *
  * With no options, video is roughly the equivalent of two-pass:
@@ -95,7 +104,7 @@ extern "C" {
 #define WEBMIFY_VERSION "1.1"
 
 #define VIDEO_FILTERS "format=yuv420p" /* the scale step is built in init_video */
-#define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=flt:channel_layouts=%s"
+#define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=%s:channel_layouts=%s"
 /* high-quality swscale conversions for the image pipeline (rounding flags are
  * no-ops where they don't apply; lanczos only kicks in for --max scaling) */
 #define IMAGE_SWS "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp"
@@ -114,7 +123,10 @@ static struct {
     int    next;    /* --next: the next-gen formats at the same visual target
                        per -q — AV1/Opus WebM for video, AVIF for images
                        (animated GIF -> animated AVIF) */
-} opt = { 0, 0, -1.0, 0, 0, 0 };
+    int    legacy;  /* --legacy: the maximum-compatibility formats at the
+                       same visual target per -q — H.264/AAC MP4 for video,
+                       PNG for images (animated GIF -> APNG) */
+} opt = { 0, 0, -1.0, 0, 0, 0, 0 };
 
 /* progress on stderr, only when it is a terminal and the duration is known */
 static struct {
@@ -426,11 +438,13 @@ static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO
             io->size += n;
         }
         avio_closep(&io->src);
-    } else if ((probe_needs_file(fmt, io->buf, io->size) || opt.effort > 0) &&
+    } else if ((probe_needs_file(fmt, io->buf, io->size) ||
+                (opt.effort > 0 && !opt.legacy)) &&
                (ret = spool_to_file(io)) < 0) {
         /* --best spools every piped video (not just the containers that
          * need it) so the stats pass can always run: two-pass measures
-         * 10-20% smaller than the streamed single-pass */
+         * 10-20% smaller than the streamed single-pass (pointless for
+         * --legacy, which never runs a stats pass) */
         if (io->fd >= 0) /* spool started; the pipe is partly consumed */
             return ret;
         av_log(NULL, AV_LOG_WARNING, "cannot spool piped input to a temp "
@@ -838,6 +852,28 @@ static int avif_still_crf(void)
     return (int)lrint(FFMAX(c, 0.0));
 }
 
+/* --legacy maps -q onto the look the *default* pipeline would produce; with
+ * no -q that look depends on whether VP9 would have run two passes (crf 36)
+ * or one (crf 33) — webmify_run records its two-pass decision here */
+static int vp9_ref_twopass;
+
+/* the calibrated x264 CRF that buys the same look as a given VP9 CRF: a
+ * linear fit of measured equal-SSIM points against the VP9 pipeline at the
+ * shipped preset (veryslow), rounded toward the lower-quality side like the
+ * --next curves (doc/legacy-calibration.md has the data). The line is much
+ * flatter than the two CRF scales suggest (x264's quality-per-CRF-step
+ * changes faster than libvpx's). --fast adds 1: preset fast holds quality
+ * at a fixed CRF far better than vpx's fast tier drops it (measured -.002
+ * vs -.010), and +1 lands just below the vpx-fast look it must match */
+static int legacy_video_crf(int vp9crf)
+{
+    int c = (int)lrint(0.34 * vp9crf + 16.5);
+
+    if (opt.effort < 0)
+        c += 1;
+    return av_clip(c, 0, 51);
+}
+
 static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                       int stream_index, int image, int pass, const char *stats)
 {
@@ -915,14 +951,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * WebP race. */
         next444 = opt.next && srcrgb && !peeked.animated &&
                   opt.quality > 80.0 && opt.effort >= 0;
-        rgb = !opt.next && srcrgb;
+        rgb = !opt.next && !opt.legacy && srcrgb;
         snprintf(spec, sizeof(spec), "%s%sformat=%s", rotate, scale,
-                 opt.next ? (peeked.alpha ? (next444 ? "yuva444p" : "yuva420p")
-                                          : (next444 ? "yuv444p"  : "yuv420p"))
-                 : rgb    ? av_get_pix_fmt_name(AV_PIX_FMT_RGB32)
-                          : "yuv420p|yuva420p");
+                 opt.legacy ? (peeked.alpha ? "rgba" : "rgb24")
+                 : opt.next ? (peeked.alpha ? (next444 ? "yuva444p" : "yuva420p")
+                                            : (next444 ? "yuv444p"  : "yuv420p"))
+                 : rgb      ? av_get_pix_fmt_name(AV_PIX_FMT_RGB32)
+                            : "yuv420p|yuva420p");
         /* --next keeps alpha only when the peek saw real transparency: a
-         * fully opaque alpha channel would just waste an extra AV1 stream */
+         * fully opaque alpha channel would just waste an extra AV1 stream
+         * (--legacy PNG likewise drops a fully opaque alpha channel — it
+         * would only add bytes) */
     } else {
         if (hdr) {
             /* HDR (PQ/HLG) source: linearize with zimg, tone-map to SDR in
@@ -980,13 +1019,16 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
 
     /* libwebp_anim writes stills too and is needed for animated GIF -> WebP */
-    codec = avcodec_find_encoder_by_name(opt.next ? "libaom-av1"
-                                         : image ? "libwebp_anim" : "libvpx-vp9");
-    if (!codec && image && !opt.next)
+    codec = avcodec_find_encoder_by_name(
+            opt.legacy ? (!image ? "libx264" : peeked.animated ? "apng" : "png")
+            : opt.next ? "libaom-av1"
+            : image    ? "libwebp_anim" : "libvpx-vp9");
+    if (!codec && image && !opt.next && !opt.legacy)
         codec = avcodec_find_encoder_by_name("libwebp");
     if (!codec) {
         av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n",
-               opt.next ? "libaom-av1" : image ? "libwebp" : "libvpx-vp9");
+               opt.legacy ? (image ? "png" : "libx264")
+               : opt.next ? "libaom-av1" : image ? "libwebp" : "libvpx-vp9");
         return AVERROR_ENCODER_NOT_FOUND;
     }
     if (!(p->enc = avcodec_alloc_context3(codec)))
@@ -1029,7 +1071,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             return AVERROR(ENOMEM);
     }
 
-    if (image && opt.next) {
+    if (image && opt.legacy) {
+        /* PNG/APNG is lossless: -q has nothing left to buy (the quality is
+         * already maximal — and so always at least the WebP pipeline's),
+         * only deflate effort remains. Default and --best run the densest
+         * search the encoder offers (zlib level 9 + the per-row "mixed"
+         * filter scan); --fast keeps the encoder defaults */
+        if (opt.effort >= 0) {
+            p->enc->compression_level = 9;
+            av_dict_set(&opts, "pred", "mixed", 0);
+        }
+    } else if (image && opt.next) {
         /* AVIF. -q buys the same look as the WebP pipeline, not the same
          * number: each curve below is a piecewise fit of measured equal-SSIM
          * points against the WebP output across photo/noise/graphics
@@ -1112,7 +1164,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * frames — those only discard source information (and downscaling
          * washes artifacts out), so the full source rate stays a valid,
          * conservative ceiling for any smaller rendition. */
-        int crf  = opt.quality < 0 ? (pass ? 36 : 33)
+        int crf  = opt.quality < 0 ? (pass || vp9_ref_twopass ? 36 : 33)
                  : (int)lrint((100.0 - opt.quality) * 63.0 / 100.0);
         if (opt.next) {
             /* libaom beats libvpx by a growing margin as CRF rises (equal
@@ -1150,15 +1202,31 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                       * own rate). Together with the CRF nudge above, --next
                       * changes the size, not the look. */
             f /= codec_weight(AV_CODEC_ID_AV1);
-        p->enc->bit_rate     = (int64_t)(750000 * f);
+        else if (opt.legacy) /* same conversion the other way: H.264 buys
+                              * 0.8x the quality per bit, so matching the
+                              * VP9 look needs 1.25x the budget (an H.264
+                              * source caps a --legacy job at its own rate) */
+            f /= codec_weight(AV_CODEC_ID_H264);
+        /* a nonzero bit_rate would flip libx264 from CRF into ABR mode:
+         * --legacy carries only the peak cap, as CRF + VBV (the
+         * conventional 2-second buffer window) */
+        p->enc->bit_rate     = opt.legacy ? 0 : (int64_t)(750000 * f);
         p->enc->rc_max_rate  = (int64_t)(1100000 * f);
+        if (opt.legacy)
+            p->enc->rc_buffer_size =
+                (int)FFMIN(2 * p->enc->rc_max_rate, INT_MAX);
         p->enc->gop_size     = 240;
         p->enc->thread_count = 2 << tlog;
+        if (opt.legacy) /* remapped last: the budget above tracks the look
+                         * (the VP9-scale CRF), not x264's number for it */
+            crf = legacy_video_crf(crf);
         snprintf(crfs, sizeof(crfs), "%d", crf);
         snprintf(tiles, sizeof(tiles), "%d", tlog);
         av_dict_set(&opts, "crf", crfs, 0);
-        av_dict_set(&opts, "row-mt", "1", 0);
-        av_dict_set(&opts, "tile-columns", tiles, 0);
+        if (!opt.legacy) {
+            av_dict_set(&opts, "row-mt", "1", 0);
+            av_dict_set(&opts, "tile-columns", tiles, 0);
+        }
         /* encoder effort by tier — each step has to pay for its time:
          * --fast cpu-used 4 (Google's stats-pass speed, ~4x faster than
          * the default), default cpu-used 1 (Google's VOD setting), --best
@@ -1176,7 +1244,16 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * --best keeps the default encoder settings; it still buys its
          * other measured win, spooling piped input for a universal stats
          * pass */
-        if (opt.next) {
+        if (opt.legacy) {
+            /* the preset ladder at a fixed CRF: medium -> slow buys nothing
+             * (+1.5% bytes), slow -> veryslow buys -19% bytes at equal SSIM
+             * for 2.7x the time (still ~10x faster than the VP9 default), so
+             * the default goes straight to veryslow; --fast (preset fast) is
+             * ~5x faster. --best changes nothing: placebo measured 3.7x the
+             * time for +1% bytes — there is no deeper setting that pays */
+            av_dict_set(&opts, "preset",
+                        opt.effort < 0 ? "fast" : "veryslow", 0);
+        } else if (opt.next) {
             av_dict_set(&opts, "cpu-used", pass == 1 ? "6"
                         : opt.effort < 0 ? "6" : "4", 0);
         } else {
@@ -1300,12 +1377,16 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     /* mono sources stay mono (an upmix would just spend bits twice on the
      * same signal); anything else is downmixed to stereo */
     mono = p->dec->ch_layout.nb_channels == 1;
-    snprintf(spec, sizeof(spec), AUDIO_FILTERS, mono ? "mono" : "stereo");
+    snprintf(spec, sizeof(spec), AUDIO_FILTERS,
+             opt.legacy ? "fltp" : "flt", mono ? "mono" : "stereo");
     if ((ret = init_graph(p, "abuffer", args, "abuffersink", spec, NULL)) < 0)
         return ret;
 
-    if (!(codec = avcodec_find_encoder_by_name("libopus"))) {
-        av_log(NULL, AV_LOG_ERROR, "libopus encoder missing from this build\n");
+    /* --legacy pairs the MP4 with FFmpeg's native AAC encoder */
+    codec = avcodec_find_encoder_by_name(opt.legacy ? "aac" : "libopus");
+    if (!codec) {
+        av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n",
+               opt.legacy ? "aac" : "libopus");
         return AVERROR_ENCODER_NOT_FOUND;
     }
     if (!(p->enc = avcodec_alloc_context3(codec)))
@@ -1325,10 +1406,18 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     {
         double  q   = opt.quality < 0 ? 48.0 : opt.quality;
         int64_t bps = (int64_t)((mono ? 48000 : 64000) * (0.5 + q / 96.0));
+        int64_t lo  = mono ? 16000 : 24000;
         int64_t src = ist->codecpar->bit_rate;
 
+        if (opt.legacy) { /* AAC needs ~1.5x Opus's rate for the same
+                           * quality (96k stereo at the default), and
+                           * FFmpeg's native encoder sits at the weak end
+                           * of AAC encoders — 1.5 errs the right way */
+            bps = bps * 3 / 2;
+            lo  = lo * 3 / 2;
+        }
         if (src > 0 && src < bps)
-            bps = FFMAX(src, mono ? 16000 : 24000);
+            bps = FFMAX(src, lo);
         p->enc->bit_rate = bps;
     }
     p->enc->time_base = AVRational{ 1, p->enc->sample_rate };
@@ -1819,7 +1908,7 @@ static int webmify_run(const char *in_path, const char *out_path)
         (is_hdr_trc((AVColorTransferCharacteristic)
                     ifmt->streams[vidx]->codecpar->color_trc) &&
          ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL))) {
-        peek_first_frame(ifmt, vidx, image && opt.next);
+        peek_first_frame(ifmt, vidx, image && (opt.next || opt.legacy));
         if ((ret = reopen_input(in_path, &ifmt, &io)) < 0)
             goto end;
         vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -1831,7 +1920,13 @@ static int webmify_run(const char *in_path, const char *out_path)
         }
     }
 
-    if (!image && opt.effort >= 0 &&
+    if (!image && opt.legacy) {
+        /* no stats pass ever (x264's CRF mode plans ahead by itself), but
+         * remember when the default pipeline *would* have two-passed: the
+         * no--q look to match is then crf 36, not the streamed 33 */
+        vp9_ref_twopass = opt.effort >= 0 && ifmt->pb &&
+                          (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL);
+    } else if (!image && opt.effort >= 0 &&
         ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         for (unsigned i = 0; i < ifmt->nb_streams; i++)
             if ((int)i != vidx)
@@ -1857,9 +1952,17 @@ static int webmify_run(const char *in_path, const char *out_path)
         if ((int)i != vidx && (int)i != aidx)
             ifmt->streams[i]->discard = AVDISCARD_ALL;
 
+    /* still PNGs go through image2pipe (one packet = the whole file, written
+     * to our own avio like every other muxer here; plain image2 insists on
+     * opening files itself) */
     if ((ret = avformat_alloc_output_context2(&ofmt, NULL,
-                                              image ? (opt.next ? "avif" : "webp")
-                                                    : "webm",
+                                              image ? (opt.next   ? "avif"
+                                                     : !opt.legacy ? "webp"
+                                                     : peeked.animated
+                                                                  ? "apng"
+                                                                  : "image2pipe")
+                                                    : opt.legacy  ? "mp4"
+                                                                  : "webm",
                                               out_path)) < 0)
         goto end;
 
@@ -1877,10 +1980,11 @@ static int webmify_run(const char *in_path, const char *out_path)
         goto end;
     }
 
-    /* the avif muxer (mov family) seeks back to patch item offsets/sizes;
-     * for stdout, write into memory and dump the finished file at the end
-     * (AVIF stills are small) */
-    spool_out = image && opt.next && !strncmp(out_path, "pipe:", 5);
+    /* the avif muxer (mov family) seeks back to patch item offsets/sizes,
+     * and the apng muxer back-patches its frame count (acTL) the same way;
+     * for stdout, write into memory and dump the finished file at the end */
+    spool_out = image && (opt.next || (opt.legacy && peeked.animated)) &&
+                !strncmp(out_path, "pipe:", 5);
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
         ret = spool_out ? avio_open_dyn_buf(&ofmt->pb)
                         : avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE);
@@ -1890,12 +1994,23 @@ static int webmify_run(const char *in_path, const char *out_path)
             goto end;
         }
     }
-    if (image) /* loop animations forever, like GIF (both the webp and the
-                * avif muxer take a loop count, 0 = infinite) */
-        av_dict_set(&muxopts, "loop", "0", 0);
-    else /* faststart for WebM: put the seek index up front so browsers can
-          * seek without fetching the file tail (skipped on pipes, where the
-          * muxer cannot seek and writes no index at all) */
+    if (image) { /* loop animations forever, like GIF (webp and avif muxers
+                  * take a loop count, apng a play count; 0 = infinite) */
+        if (!opt.legacy)
+            av_dict_set(&muxopts, "loop", "0", 0);
+        else if (peeked.animated)
+            av_dict_set(&muxopts, "plays", "0", 0);
+    } else if (opt.legacy) {
+        /* the MP4 spelling of faststart; a pipe cannot seek the moov back
+         * to the head, so it gets a fragmented MP4 instead (playable
+         * everywhere MSE is, and by every player) */
+        av_dict_set(&muxopts, "movflags",
+                    strncmp(out_path, "pipe:", 5)
+                        ? "+faststart"
+                        : "+frag_keyframe+empty_moov+default_base_moof", 0);
+    } else /* faststart for WebM: put the seek index up front so browsers can
+            * seek without fetching the file tail (skipped on pipes, where the
+            * muxer cannot seek and writes no index at all) */
         av_dict_set(&muxopts, "cues_to_front", "1", 0);
     ret = avformat_write_header(ofmt, &muxopts);
     av_dict_free(&muxopts);
@@ -1964,6 +2079,13 @@ static int usage(FILE *f, int status)
             "                         AVIF (animated GIF -> animated AVIF).\n"
             "                         -q buys the same look as the default\n"
             "                         formats — only the file gets smaller\n"
+            "  --legacy               output the maximum-compatibility\n"
+            "                         formats: video becomes H.264/AAC MP4\n"
+            "                         (faststart), images become PNG\n"
+            "                         (animated GIF -> APNG; lossless, so -q\n"
+            "                         steers video only). -q buys the same\n"
+            "                         look as the default formats — only\n"
+            "                         the file gets bigger\n"
             "  -m, --max [HxW|S][@F]  downscale to fit H px tall / W px wide,\n"
             "                         never upscale; a single number S bounds\n"
             "                         both sides, a missing side is unbounded\n"
@@ -2043,11 +2165,12 @@ bad:
 
 int main(int argc, char **argv)
 {
-    enum { OPT_FAST = 1000, OPT_BEST, OPT_NEXT, OPT_VERSION };
+    enum { OPT_FAST = 1000, OPT_BEST, OPT_NEXT, OPT_LEGACY, OPT_VERSION };
     static const struct option longopts[] = {
         { "quality", required_argument, NULL, 'q' },
         { "max",     required_argument, NULL, 'm' },
         { "next",    no_argument,       NULL, OPT_NEXT },
+        { "legacy",  no_argument,       NULL, OPT_LEGACY },
         { "fast",    no_argument,       NULL, OPT_FAST },
         { "best",    no_argument,       NULL, OPT_BEST },
         { "help",    no_argument,       NULL, 'h' },
@@ -2079,6 +2202,9 @@ int main(int argc, char **argv)
         case OPT_NEXT:
             opt.next = 1;
             break;
+        case OPT_LEGACY:
+            opt.legacy = 1;
+            break;
         case OPT_FAST:
         case OPT_BEST:
             if (opt.effort) {
@@ -2090,6 +2216,10 @@ int main(int argc, char **argv)
         default:
             return usage(stderr, 2);
         }
+    }
+    if (opt.next && opt.legacy) {
+        fprintf(stderr, "webmify: --next and --legacy are mutually exclusive\n");
+        return 2;
     }
     if (argc - optind != 2)
         return usage(stderr, 2);

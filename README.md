@@ -5,8 +5,10 @@ VP9/Opus WebM — and any popular image file to WebP — with sane defaults
 tuned for serving the result over the internet: two-pass VP9 (10-20% smaller
 at equal quality), the seek index at the head of the file (faststart), and
 the densest WebP encoding (`-m 6`). `--next` switches to the next-gen
-formats — AV1/Opus WebM and AVIF — at the same visual targets. Input type
-is auto-detected, and one option set covers both modes:
+formats — AV1/Opus WebM and AVIF — and `--legacy` to the
+maximum-compatibility ones — H.264/AAC MP4 and PNG/APNG — both at the same
+visual targets. Input type is auto-detected, and one option set covers both
+modes:
 
 ```
 webmify input.mp4 output.webm
@@ -16,6 +18,8 @@ cat input.mkv | webmify - - > output.webm   # '-' = stdin/stdout
 cat anim.gif  | webmify - - > anim.webp
 webmify --next input.mp4 output.webm        # AV1/Opus WebM instead of VP9
 webmify --next photo.jpg photo.avif         # AVIF instead of WebP
+webmify --legacy input.mkv output.mp4       # H.264/AAC MP4 instead
+webmify --legacy photo.jpg photo.png        # lossless PNG instead
 ```
 
 Options mean the same thing for video and image inputs (and go before the
@@ -104,6 +108,52 @@ file arguments):
   unaffected. Everything else —
   the `--max` box, frame-rate caps, two-pass, tonemapping, faststart
   cues, mono/Opus audio rules, stdin/stdout — works identically.
+- `--legacy` — the same idea pointed backwards: output the
+  maximum-compatibility formats. Video becomes H.264/AAC MP4 (vendored
+  x264 + FFmpeg's native AAC encoder) with the moov up front — the real
+  `+faststart` — and every image becomes PNG; animated GIF becomes APNG,
+  looping forever. Images are lossless by definition, so they are always
+  at least the WebP pipeline's quality (alpha kept exactly; a fully opaque
+  alpha channel is still detected and dropped) and `-q` steers video only.
+  Like `--next`, `-q` buys the *same look* as the VP9 pipeline, not the
+  same number: the mapping is a linear fit of measured equal-SSIM points
+  across noise, graphics and real-content fixtures (`x264crf =
+  0.34·vp9crf + 16.5`, rounded toward the smaller file —
+  `doc/legacy-calibration.md` has the data; the line is far flatter than
+  the two CRF scales suggest), and the VP9-anchored rate budget is
+  converted by the same codec-efficiency table that weights the source cap
+  (÷0.8 — an H.264 source caps a `--legacy` job at exactly its own rate).
+  Always single-pass: x264's two-pass targets a bitrate rather than a
+  quality, and its CRF mode already plans ahead (lookahead/mbtree), so
+  piped input loses nothing. Effort tiers map to x264 presets, each step
+  measured to pay for its time: the default goes straight to `veryslow` —
+  the ladder's last paying step (−19% bytes vs `slow` at equal SSIM for
+  2.7× the time, still ~10× faster than the VP9 default end to end;
+  `placebo` measured 3.7× the time for +1% bytes and is in no tier) —
+  `--fast` is preset `fast` (~5× faster) with a +1 CRF nudge measured
+  against VP9's own fast tier, and `--best` changes nothing: the default
+  already runs the deepest settings that pay, and there is no stats pass
+  to add. At equal look the size varies by content more than folklore
+  suggests — measured 0.4–1.2× the VP9 bytes at the default `-q`
+  (synthetic graphics far smaller, real content slightly bigger): the
+  compatibility tax is mostly the encode time the veryslow default spends.
+  Two honest caveats: below ≈`-q 3` the converted rate caps bind before
+  SSIM parity (x264's CRF mode has no average-rate cap, only the VBV
+  peak, so real content measured +.027 SSIM at 2× the bytes there), and
+  the per-content spread around the mean mapping is wider than AV1's
+  (real content −.023 at `-q 7` while graphics sit above parity). PNG
+  effort: the default runs zlib level 9 plus the per-row "mixed" filter
+  search (−15–19% bytes vs the encoder defaults; the filter search
+  *alone* backfires on gradients — the pairing matters), `--fast` keeps
+  the encoder defaults. Audio becomes AAC at 1.5× the Opus rates (96k
+  stereo / 72k mono at the default) — AAC needs roughly that for equal
+  quality and FFmpeg's native encoder sits at the weak end, so 1.5 errs
+  the right way; the source-rate cap applies as usual. Piped *output*
+  switches to fragmented MP4 (a pipe cannot seek the moov back to the
+  head); piped APNG is assembled in memory like AVIF, so its frame count
+  survives. Everything else — the `--max` box, frame-rate caps,
+  tonemapping, EXIF/rotation, mono rules, stdin/stdout — works
+  identically. Note: x264 is GPL — see the license note below.
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the
   vendored FFmpeg version baked into the binary.
 
@@ -119,11 +169,13 @@ video containers that need a seekable input to keep all their features
 exits. Everything else streams — but a truly streamed video input cannot be
 rewound for the stats pass, so it falls back to single-pass encoding (with a
 warning). Piped video output is playable but carries no duration/seek index
-in the header. AVIF written to stdout is assembled in memory and dumped
-whole at the end (its container back-patches item offsets, which needs a
-seekable sink); piped AV1 WebM streams like VP9 does — webmify pre-extracts
-the AV1 sequence header the muxer needs up front, since libaom only delivers
-it alongside the first encoded packet.
+in the header (`--legacy` switches to fragmented MP4 there, since the moov
+cannot be seeked back to the head of a pipe). AVIF written to stdout is
+assembled in memory and dumped whole at the end (its container back-patches
+item offsets, which needs a seekable sink), and piped APNG is assembled the
+same way (its frame count is back-patched too); piped AV1 WebM streams like
+VP9 does — webmify pre-extracts the AV1 sequence header the muxer needs up
+front, since libaom only delivers it alongside the first encoded packet.
 
 Video is encoded in two passes whenever the input can rewind (files, spooled
 stdin) — only with first-pass stats does libvpx use alt-ref frames and plan
@@ -226,21 +278,25 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
   verified against pinned sha256 checksums, all latest releases:
   FFmpeg 8.1.1, libvpx 1.16.0 (webmproject), libopus 1.6.1 (xiph),
   dav1d 1.5.3 (VideoLAN), libaom 3.14.1 (AOMedia), libwebp 1.6.0
-  (webmproject), zimg 3.0.6 (sekrit-twc), zlib (Alpine static package) —
+  (webmproject), x264 build 165 (VideoLAN; no release tarballs exist, so
+  it is pinned to the tip of the upstream `stable` branch by commit hash),
+  zimg 3.0.6 (sekrit-twc), zlib (Alpine static package) —
   plus the minimal patches in `patches/` (each a few lines, reviewable
   in-repo, applied verbatim by `vendor.sh`; currently one: exposing
   libwebp's `use_sharp_yuv` as an encoder option, which FFmpeg does not
   surface).
 - **Minimal FFmpeg** (`--disable-everything --enable-small` + whitelist), so
-  the binary stays ~18 MB instead of ~80 MB (libaom — encoder-only,
-  8-bit-only, since webmify never emits anything else — is ~6 MB of that):
+  the binary stays ~19 MB instead of ~80 MB (libaom — encoder-only,
+  8-bit-only, since webmify never emits anything else — is ~6 MB of that;
+  x264, built 8-bit 4:2:0-only for the same reason, ~1 MB):
   - *read*: mp4/mov/3gp, mkv/webm, avi, flv, mpeg-ts/ps, asf/wmv, ogg, wav,
     mp3, aac, flac containers; H.264, HEVC, VP8, VP9, AV1 (dav1d), MPEG-1/2/4,
     WMV/VC-1, H.263, VP6, Theora, MJPEG video; AAC, AC-3/E-AC-3, MP2/3, Opus,
     Vorbis, FLAC, ALAC, WMA, DTS, TrueHD, ADPCM, PCM audio; JPEG, PNG, WebP,
     GIF, BMP, TIFF, HEIC, AVIF images.
   - *write*: WebM with libvpx-vp9 + libopus; WebP with libwebp; with
-    `--next`: WebM with libaom-av1 + libopus, AVIF with libaom-av1.
+    `--next`: WebM with libaom-av1 + libopus, AVIF with libaom-av1; with
+    `--legacy`: MP4 with x264 + native AAC, PNG/APNG.
 - **Fully static** (musl, `ldd` → "not a dynamic executable"); runs on any
   Linux of the same architecture, including `FROM scratch` containers.
 
@@ -250,6 +306,9 @@ inputs, hardware acceleration, subtitle codecs, image-sequence inputs.
 ## License note
 
 The binary statically links LGPL-2.1+ code (FFmpeg), BSD code (libvpx,
-libopus, dav1d, libaom, libwebp) and WTFPL code (zimg). No GPL components
-are included. If you redistribute the binary, LGPL terms apply (provide
-source/relink ability).
+libopus, dav1d, libaom, libwebp), WTFPL code (zimg) — and, since
+`--legacy`, **GPL-2.0+ code (x264)**, with FFmpeg built `--enable-gpl`.
+The combined binary is therefore governed by the GPL-2.0+: if you
+redistribute it, GPL terms apply (provide the full corresponding source).
+Drop the x264 section and `--enable-gpl`/`--enable-libx264` from
+`vendor.sh` to get a GPL-free build without `--legacy` video.

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Builds a minimal static FFmpeg (plus libvpx + libopus + dav1d + libaom +
-# zimg) into vendor/out. Runs inside the Docker build image — see Dockerfile.
-# Official upstream release tarballs only, plus the minimal patches in
-# patches/ (each one a few lines, applied verbatim and reviewable in-repo).
+# x264 + zimg) into vendor/out. Runs inside the Docker build image — see
+# Dockerfile. Official upstream release tarballs only, plus the minimal
+# patches in patches/ (each one a few lines, applied verbatim and reviewable
+# in-repo).
 #
 # Only what `webmify` needs is compiled in:
 #   - demuxers/decoders to READ popular video files (mp4/mkv/webm/avi/flv/ts/wmv/ogg...)
 #     and image files (jpeg/png/webp/gif/bmp/tiff/heic/avif)
 #   - encoders libvpx-vp9 + libopus (webm muxer), libwebp (webp muxer),
-#     libaom-av1 for --next (webm + avif muxers)
+#     libaom-av1 for --next (webm + avif muxers), x264 + native aac (mp4
+#     muxer) + png/apng for --legacy
 #   - the filters used by the fixed pipeline (scale, format, aformat, aresample,
 #     transpose/hflip/vflip for phone-rotation metadata, zscale/tonemap for
 #     HDR -> SDR conversion)
@@ -27,6 +29,9 @@ AOM_VERSION=3.14.1
 WEBP_VERSION=1.6.0
 ZIMG_VERSION=3.0.6
 FFMPEG_VERSION=8.1.1
+# x264 publishes no release tarballs: pinned to the tip of the upstream
+# `stable` branch (X264_BUILD 165, 2025-06-08) by commit hash
+X264_COMMIT=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
 
 # sha256 of each release tarball; opus and dav1d match their publishers'
 # checksum files, the rest are pinned from a verified-good download (the
@@ -39,6 +44,7 @@ AOM_SHA256=44bf90dbd23e734d50e70a8c41c285193922938bd0d3bc2ee56764d181d55ef5
 WEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 ZIMG_SHA256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
 FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+X264_SHA256=cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9
 
 # -ffunction-sections/-fdata-sections lets the final link drop unused code
 SECTION_CFLAGS="-ffunction-sections -fdata-sections"
@@ -144,6 +150,23 @@ if ! built webp; then
     mark webp
 fi
 
+# --- x264 (H.264 encoder for --legacy; decoding uses FFmpeg's native h264
+#     decoder). 8-bit 4:2:0 only, like the libaom build: webmify never feeds
+#     it anything else. NOTE: x264 is GPL — see the README license note. -----
+if ! built x264; then
+    fetch "https://code.videolan.org/videolan/x264/-/archive/$X264_COMMIT/x264-$X264_COMMIT.tar.gz" x264 "$X264_SHA256"
+    echo "==> building x264"
+    (cd "$SRC/x264" && \
+        ./configure --prefix="$PREFIX" \
+            --enable-static --enable-pic --disable-cli \
+            --disable-avs --disable-swscale --disable-lavf --disable-ffms \
+            --disable-gpac --disable-lsmash --disable-opencl \
+            --bit-depth=8 --chroma-format=420 \
+            --extra-cflags="$SECTION_CFLAGS" && \
+        make -j"$JOBS" && make install)
+    mark x264
+fi
+
 # --- zimg (colorspace engine for the zscale filter: HDR -> SDR tonemapping;
 #     its only git submodule is googletest, so the release tarball builds) ----
 if ! built zimg; then
@@ -177,8 +200,9 @@ if ! built ffmpeg; then
             --disable-network --disable-autodetect --enable-pthreads --enable-zlib \
             --disable-debug \
             --disable-everything \
+            --enable-gpl \
             --enable-libvpx --enable-libopus --enable-libdav1d --enable-libwebp \
-            --enable-libzimg --enable-libaom \
+            --enable-libzimg --enable-libaom --enable-libx264 \
             --enable-protocol=file,pipe \
             --enable-demuxer=mov,matroska,avi,flv,mpegts,mpegps,asf,ogg,wav,mp3,aac,flac \
             --enable-demuxer=image2,gif,image_bmp_pipe,image_jpeg_pipe,image_png_pipe,image_tiff_pipe,image_webp_pipe \
@@ -187,7 +211,8 @@ if ! built ffmpeg; then
             --enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_u8,pcm_f32le,pcm_alaw,pcm_mulaw \
             --enable-decoder=png,gif,bmp,tiff,webp \
             --enable-encoder=libvpx_vp9,libopus,libwebp,libwebp_anim,libaom_av1 \
-            --enable-muxer=webm,webp,avif \
+            --enable-encoder=libx264,aac,png,apng \
+            --enable-muxer=webm,webp,avif,mp4,image2pipe,apng \
             --enable-parser=h264,hevc,mpeg4video,mpegvideo,vp8,vp9,av1,vc1,mjpeg,aac,aac_latm,ac3,mpegaudio,opus,vorbis,flac,dca \
             --enable-parser=png,bmp,gif,webp \
             --enable-bsf=extract_extradata,vp9_superframe \
