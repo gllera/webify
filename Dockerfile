@@ -21,7 +21,7 @@ RUN ./vendor.sh
 COPY src ./src
 ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
 RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
-    g++ -Os -static -ffunction-sections -fdata-sections \
+    g++ -Os -static -Wall -Wextra -ffunction-sections -fdata-sections \
         $(pkg-config --cflags $libs) \
         src/webmify.cpp -o /webmify \
         $(pkg-config --libs --static $libs) \
