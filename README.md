@@ -1,4 +1,4 @@
-# webmify
+# webify
 
 A single, fully static binary that transcodes any popular video file to
 VP9/Opus WebM — and any popular image file to WebP — with sane defaults
@@ -11,15 +11,15 @@ visual targets. Input type is auto-detected, and one option set covers both
 modes:
 
 ```
-webmify input.mp4 output.webm
-webmify photo.jpg photo.webp
-webmify -q 6 --max 720x1280 input.mov output.webm   # fit 720 tall, 1280 wide
-cat input.mkv | webmify - - > output.webm   # '-' = stdin/stdout
-cat anim.gif  | webmify - - > anim.webp
-webmify --next input.mp4 output.webm        # AV1/Opus WebM instead of VP9
-webmify --next photo.jpg photo.avif         # AVIF instead of WebP
-webmify --legacy input.mkv output.mp4       # H.264/AAC MP4 instead
-webmify --legacy photo.jpg photo.png        # lossless PNG instead
+webify input.mp4 output.webm
+webify photo.jpg photo.webp
+webify -q 6 --max 720x1280 input.mov output.webm   # fit 720 tall, 1280 wide
+cat input.mkv | webify - - > output.webm   # '-' = stdin/stdout
+cat anim.gif  | webify - - > anim.webp
+webify --next input.mp4 output.webm        # AV1/Opus WebM instead of VP9
+webify --next photo.jpg photo.avif         # AVIF instead of WebP
+webify --legacy input.mkv output.mp4       # H.264/AAC MP4 instead
+webify --legacy photo.jpg photo.png        # lossless PNG instead
 ```
 
 Options mean the same thing for video and image inputs (and go before the
@@ -99,7 +99,7 @@ file arguments):
   the stats pass always runs. Stills use `usage=allintra` +
   `still-picture` at speeds 6/4/2 (speed 7 measured the same wall time
   as 6 for −.008 SSIM — a strictly worse point; avifenc defaults to
-  speed 6 — the webmify default digs one step deeper). Two honest
+  speed 6 — the webify default digs one step deeper). Two honest
   caveats, same cause: stills dominated by pure smooth gradients can
   come out *bigger* than their WebP (libaom spends a byte floor on them
   at any CRF, at higher quality), and near-static animations hit that
@@ -174,7 +174,7 @@ cannot be seeked back to the head of a pipe). AVIF written to stdout is
 assembled in memory and dumped whole at the end (its container back-patches
 item offsets, which needs a seekable sink), and piped APNG is assembled the
 same way (its frame count is back-patched too); piped AV1 WebM streams like
-VP9 does — webmify pre-extracts the AV1 sequence header the muxer needs up
+VP9 does — webify pre-extracts the AV1 sequence header the muxer needs up
 front, since libaom only delivers it alongside the first encoded packet.
 
 Video is encoded in two passes whenever the input can rewind (files, spooled
@@ -229,7 +229,7 @@ they would encode "successfully" with gray, washed-out colors. The chain is
 the standard zscale linearize → hable tonemap → bt709 re-encode, run at
 output resolution. The tonemapper needs the source's peak brightness, and
 FFmpeg 8's zscale strips the HDR metadata before `tonemap` can read it, so
-webmify extracts it from the input itself: in-stream SEI (peeked from the
+webify extracts it from the input itself: in-stream SEI (peeked from the
 first decoded frame when the input can rewind), container metadata, or a
 1000-nit assumption as the last resort. The output is tagged bt709/tv.
 
@@ -262,7 +262,7 @@ Inputs: JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC, AVIF.
 Everything builds inside Docker; nothing is installed on the host:
 
 ```
-./build.sh                        # -> dist/webmify (static musl binary)
+./build.sh                        # -> dist/webify (static musl binary)
 UPX=1 ./build.sh                  # also upx-compress (~60% smaller, slower start)
 PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
 ./test.sh                         # smoke test the built binary (needs host
@@ -272,23 +272,26 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
 ## Design
 
 - **Zero third-party code.** The whole program is one C++ file
-  (`src/webmify.cpp`) written against the official FFmpeg API, modeled on
+  (`src/webify.cpp`) written against the official FFmpeg API, modeled on
   FFmpeg's own `doc/examples/transcode.c`, compiled with a single `g++ -static`
   invocation in the Dockerfile.
-- **Official upstream sources only**, pinned release tarballs (`vendor.sh`)
-  verified against pinned sha256 checksums, all latest releases:
+- **Official upstream sources only**, pinned release tarballs (one
+  `vendor.d/*.sh` script per library; `./vendor.sh` runs them all for
+  bare-host builds, while the Dockerfile gives each its own build stage so
+  changing one library only recompiles that library) verified against
+  pinned sha256 checksums, all latest releases:
   FFmpeg 8.1.1, libvpx 1.16.0 (webmproject), libopus 1.6.1 (xiph),
   dav1d 1.5.3 (VideoLAN), libaom 3.14.1 (AOMedia), libwebp 1.6.0
   (webmproject), x264 build 165 (VideoLAN; no release tarballs exist, so
   it is pinned to the tip of the upstream `stable` branch by commit hash),
   zimg 3.0.6 (sekrit-twc), zlib (Alpine static package) —
   plus the minimal patches in `patches/` (each a few lines, reviewable
-  in-repo, applied verbatim by `vendor.sh`; currently one: exposing
+  in-repo, applied verbatim by `vendor.d/80-ffmpeg.sh`; currently one: exposing
   libwebp's `use_sharp_yuv` as an encoder option, which FFmpeg does not
   surface).
 - **Minimal FFmpeg** (`--disable-everything --enable-small` + whitelist), so
   the binary stays ~19 MB instead of ~80 MB (libaom — encoder-only,
-  8-bit-only, since webmify never emits anything else — is ~6 MB of that;
+  8-bit-only, since webify never emits anything else — is ~6 MB of that;
   x264, built 8-bit 4:2:0-only for the same reason, ~1 MB):
   - *read*: mp4/mov/3gp, mkv/webm, avi, flv, mpeg-ts/ps, asf/wmv, ogg, wav,
     mp3, aac, flac containers; H.264, HEVC, VP8, VP9, AV1 (dav1d), MPEG-1/2/4,
@@ -301,8 +304,9 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
 - **Fully static** (musl, `ldd` → "not a dynamic executable"); runs on any
   Linux of the same architecture, including `FROM scratch` containers.
 
-Not included (rare; add a flag in `vendor.sh` and rebuild if needed): network
-inputs, hardware acceleration, subtitle codecs, image-sequence inputs.
+Not included (rare; add a flag in `vendor.d/80-ffmpeg.sh` and rebuild if
+needed): network inputs, hardware acceleration, subtitle codecs,
+image-sequence inputs.
 
 ## License note
 
@@ -311,5 +315,6 @@ libopus, dav1d, libaom, libwebp), WTFPL code (zimg) — and, since
 `--legacy`, **GPL-2.0+ code (x264)**, with FFmpeg built `--enable-gpl`.
 The combined binary is therefore governed by the GPL-2.0+: if you
 redistribute it, GPL terms apply (provide the full corresponding source).
-Drop the x264 section and `--enable-gpl`/`--enable-libx264` from
-`vendor.sh` to get a GPL-free build without `--legacy` video.
+Drop `vendor.d/60-x264.sh` (and its Docker stage) and
+`--enable-gpl`/`--enable-libx264` from `vendor.d/80-ffmpeg.sh` to get a
+GPL-free build without `--legacy` video.

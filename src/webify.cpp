@@ -1,5 +1,5 @@
 /*
- * webmify — transcode any popular video file to VP9/Opus WebM, or any popular
+ * webify — transcode any popular video file to VP9/Opus WebM, or any popular
  * image file to WebP (auto-detected). One option set covers both modes:
  * -q/--quality 0-10 (mapped to VP9 CRF for video, WebP quality for images)
  * and -m/--max [HxW | S][@F] (downscale to fit H px tall / W px wide — a
@@ -101,7 +101,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
-#define WEBMIFY_VERSION "1.1"
+#define WEBIFY_VERSION "1.1"
 
 #define VIDEO_FILTERS "format=yuv420p" /* the scale step is built in init_video */
 #define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=%s:channel_layouts=%s"
@@ -378,7 +378,7 @@ static int spool_to_file(StdinIO *io)
     uint8_t chunk[IO_BUFSIZE];
     int n, ret;
 
-    snprintf(path, sizeof(path), "%s/webmify-XXXXXX",
+    snprintf(path, sizeof(path), "%s/webify-XXXXXX",
              dir && *dir ? dir : "/tmp");
     if ((io->fd = mkstemp(path)) < 0)
         return AVERROR(errno);
@@ -858,7 +858,7 @@ static int avif_still_crf(void)
 
 /* --legacy maps -q onto the look the *default* pipeline would produce; with
  * no -q that look depends on whether VP9 would have run two passes (crf 36)
- * or one (crf 33) — webmify_run records its two-pass decision here */
+ * or one (crf 33) — webify_run records its two-pass decision here */
 static int vp9_ref_twopass;
 
 /* the calibrated x264 CRF that buys the same look as a given VP9 CRF: a
@@ -1125,7 +1125,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             av_dict_set(&opts, "cpu-used", opt.effort < 0 ? "6" : "4", 0);
         } else {
             /* encoder effort (allintra speed 0-9): avifenc defaults to
-             * speed 6; webmify's default digs deeper — files are downloaded
+             * speed 6; webify's default digs deeper — files are downloaded
              * many times — --fast matches the quick end, --best the
              * slowest practical search. --fast stops at 6: speed 7 measured
              * the same wall time as 6 but -.008 SSIM (a strictly worse
@@ -1872,7 +1872,7 @@ static int reopen_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io
     return avformat_find_stream_info(*ifmt, NULL);
 }
 
-static int webmify_run(const char *in_path, const char *out_path)
+static int webify_run(const char *in_path, const char *out_path)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
     Pipe video = {}, audio = {};
@@ -2076,9 +2076,9 @@ end:
 static int usage(FILE *f, int status)
 {
     fprintf(f,
-            "webmify: transcode any popular video to VP9/Opus WebM,\n"
+            "webify: transcode any popular video to VP9/Opus WebM,\n"
             "         or any popular image to WebP (auto-detected)\n"
-            "usage: webmify [options] <input> <output>   ('-' = stdin/stdout)\n"
+            "usage: webify [options] <input> <output>   ('-' = stdin/stdout)\n"
             "  -q, --quality <0-10>   target quality, higher is better\n"
             "                         (default: 8 for images; video picks the\n"
             "                         classic 480p look at the smallest size)\n"
@@ -2127,7 +2127,7 @@ static int parse_max(const char *arg)
         double fps = strtod(at + 1, &end);
 
         if (*end || end == at + 1 || fps < 1 || fps > 240) {
-            fprintf(stderr, "webmify: --max fps must be 1-240, got '%s'\n", at + 1);
+            fprintf(stderr, "webify: --max fps must be 1-240, got '%s'\n", at + 1);
             return -1;
         }
         opt.max_fps = fps;
@@ -2164,10 +2164,10 @@ static int parse_max(const char *arg)
     }
     return 0;
 range:
-    fprintf(stderr, "webmify: --max box sides must be 1-16384, got '%s'\n", arg);
+    fprintf(stderr, "webify: --max box sides must be 1-16384, got '%s'\n", arg);
     return -1;
 bad:
-    fprintf(stderr, "webmify: --max expects [HxW | S][@F], got '%s'\n", arg);
+    fprintf(stderr, "webify: --max expects [HxW | S][@F], got '%s'\n", arg);
     return -1;
 }
 
@@ -2193,12 +2193,12 @@ int main(int argc, char **argv)
         case 'h':
             return usage(stdout, 0);
         case OPT_VERSION:
-            printf("webmify %s (FFmpeg %s)\n", WEBMIFY_VERSION, av_version_info());
+            printf("webify %s (FFmpeg %s)\n", WEBIFY_VERSION, av_version_info());
             return 0;
         case 'q':
             opt.quality = strtod(optarg, &end);
             if (*end || end == optarg || opt.quality < 0 || opt.quality > 10) {
-                fprintf(stderr, "webmify: quality must be 0-10, got '%s'\n", optarg);
+                fprintf(stderr, "webify: quality must be 0-10, got '%s'\n", optarg);
                 return 2;
             }
             opt.quality *= 10; /* the internal scale (and WebP's) is 0-100 */
@@ -2216,7 +2216,7 @@ int main(int argc, char **argv)
         case OPT_FAST:
         case OPT_BEST:
             if (opt.effort) {
-                fprintf(stderr, "webmify: --fast and --best are mutually exclusive\n");
+                fprintf(stderr, "webify: --fast and --best are mutually exclusive\n");
                 return 2;
             }
             opt.effort = c == OPT_FAST ? -1 : 1;
@@ -2226,7 +2226,7 @@ int main(int argc, char **argv)
         }
     }
     if (opt.next && opt.legacy) {
-        fprintf(stderr, "webmify: --next and --legacy are mutually exclusive\n");
+        fprintf(stderr, "webify: --next and --legacy are mutually exclusive\n");
         return 2;
     }
     if (argc - optind != 2)
@@ -2234,5 +2234,5 @@ int main(int argc, char **argv)
     /* the '-' convention lives in the ffmpeg CLI, not libavformat */
     const char *in  = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
     const char *out = strcmp(argv[optind + 1], "-") ? argv[optind + 1] : "pipe:1";
-    return webmify_run(in, out);
+    return webify_run(in, out);
 }

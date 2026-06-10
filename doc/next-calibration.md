@@ -142,7 +142,7 @@ now returned as bytes.
 
 The animated-WebP side itself was audited against `gif2webp` (Google's
 reference tool) at identical settings (`-lossy -q 80 -m 6`) on suspicion
-the −96% gap meant an encoder bug. It doesn't: webmify lands within ±1%
+the −96% gap meant an encoder bug. It doesn't: webify lands within ±1%
 of gif2webp on every fixture (mandelbrot 261,312 vs 259,880 B; testsrc2
 155,752 vs 156,964 B), and a static-background fixture compresses 30
 frames into an identical 294 B from both — frame-diff/delta coding works.

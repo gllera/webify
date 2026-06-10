@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for dist/webmify: exercises the externally observable claims
+# Smoke test for dist/webify: exercises the externally observable claims
 # (CLI contract, cwebp byte-identity, -q size ordering, --max scaling,
 # rotation baking, mono audio, VP9/Opus codecs, faststart cues, stdin/stdout,
 # --next: AV1/Opus WebM video, AVIF images w/ alpha + animated GIF -> AVIF,
@@ -11,11 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-WEBMIFY="${WEBMIFY:-$PWD/dist/webmify}"
+WEBIFY="${WEBIFY:-$PWD/dist/webify}"
 for tool in ffmpeg ffprobe cwebp python3; do
     command -v "$tool" >/dev/null || { echo "missing host tool: $tool"; exit 1; }
 done
-[ -x "$WEBMIFY" ] || { echo "missing $WEBMIFY — run ./build.sh first"; exit 1; }
+[ -x "$WEBIFY" ] || { echo "missing $WEBIFY — run ./build.sh first"; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -29,7 +29,7 @@ t() { # <description> <command...> — command's exit code decides pass/fail
 }
 eq()     { [ "$1" = "$2" ]; }
 lt()     { [ "$1" -lt "$2" ]; }
-rejects() { ! "$WEBMIFY" "$@" in out 2>/dev/null; }
+rejects() { ! "$WEBIFY" "$@" in out 2>/dev/null; }
 
 ff()       { ffmpeg -hide_banner -loglevel error -y "$@"; }
 dims()     { ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1"; }
@@ -119,26 +119,26 @@ open("exif.jpg", "wb").write(jpg[:2] + b"\xff\xe1" +
 EOF
 
 # --- CLI contract --------------------------------------------------------------
-t "--help exits 0 and prints usage"        bash -c "'$WEBMIFY' --help | grep -q usage"
-t "--version names webmify and FFmpeg"     bash -c "'$WEBMIFY' --version | grep -q 'webmify .*FFmpeg'"
+t "--help exits 0 and prints usage"        bash -c "'$WEBIFY' --help | grep -q usage"
+t "--version names webify and FFmpeg"     bash -c "'$WEBIFY' --version | grep -q 'webify .*FFmpeg'"
 t "-q 11 (out of range) rejected"          rejects -q 11
 t "-q 60 (old 0-100 scale) rejected"       rejects -q 60
 t "--max bogus rejected"                   rejects --max bogus
 t "--fast with --best rejected"            rejects --fast --best
-t "audio-only input rejected"              bash -c "! '$WEBMIFY' audio.wav x.webm 2>/dev/null"
+t "audio-only input rejected"              bash -c "! '$WEBIFY' audio.wav x.webm 2>/dev/null"
 
 # --- images --------------------------------------------------------------------
-"$WEBMIFY" photo.png  q_def.webp
-"$WEBMIFY" -q 8   photo.png q8.webp
-"$WEBMIFY" -q 2   photo.png q2.webp
-"$WEBMIFY" -q 9.5 photo.png q95.webp
-"$WEBMIFY" -m 240  photo.png m240.webp
-"$WEBMIFY" -m 2000 photo.png m2000.webp
-"$WEBMIFY" - - < photo.png > piped.webp
-"$WEBMIFY" --fast photo.png q_fast.webp
-"$WEBMIFY" flat.png flat.webp
-"$WEBMIFY" anim.gif anim.webp
-"$WEBMIFY" exif.jpg exif.webp
+"$WEBIFY" photo.png  q_def.webp
+"$WEBIFY" -q 8   photo.png q8.webp
+"$WEBIFY" -q 2   photo.png q2.webp
+"$WEBIFY" -q 9.5 photo.png q95.webp
+"$WEBIFY" -m 240  photo.png m240.webp
+"$WEBIFY" -m 2000 photo.png m2000.webp
+"$WEBIFY" - - < photo.png > piped.webp
+"$WEBIFY" --fast photo.png q_fast.webp
+"$WEBIFY" flat.png flat.webp
+"$WEBIFY" anim.gif anim.webp
+"$WEBIFY" exif.jpg exif.webp
 cwebp -quiet -q 80 -m 6 -sharp_yuv photo.png -o ref80.webp
 
 t "image: default == -q 8 byte-identical"             cmp -s q_def.webp q8.webp
@@ -154,16 +154,16 @@ t "image: animated gif -> animated WebP (ANIM chunk)" grep -aq ANIM anim.webp
 t "image: EXIF orientation baked in (-> 480x640)"     eq "$(dims exif.webp)" "480,640"
 
 # --- video ---------------------------------------------------------------------
-"$WEBMIFY" tv.mp4 v_def.webm
-"$WEBMIFY" -q 2 tv.mp4 v_q2.webm
-"$WEBMIFY" -q 9 tv.mp4 v_q9.webm
-"$WEBMIFY" rot.mp4 v_rot.webm
-"$WEBMIFY" - - < tv.mkv > v_piped.webm
-"$WEBMIFY" frag.mp4 v_frag.webm
-"$WEBMIFY" stereo.mp4 v_stereo.webm
-"$WEBMIFY" hdr.mp4 v_hdr.webm
-"$WEBMIFY" --fast tiny.mp4 v_fast.webm
-"$WEBMIFY" --best tiny.mp4 v_best.webm
+"$WEBIFY" tv.mp4 v_def.webm
+"$WEBIFY" -q 2 tv.mp4 v_q2.webm
+"$WEBIFY" -q 9 tv.mp4 v_q9.webm
+"$WEBIFY" rot.mp4 v_rot.webm
+"$WEBIFY" - - < tv.mkv > v_piped.webm
+"$WEBIFY" frag.mp4 v_frag.webm
+"$WEBIFY" stereo.mp4 v_stereo.webm
+"$WEBIFY" hdr.mp4 v_hdr.webm
+"$WEBIFY" --fast tiny.mp4 v_fast.webm
+"$WEBIFY" --best tiny.mp4 v_best.webm
 
 t "video: VP9 + Opus"                                 eq "$(codecs v_def.webm)" "vp9+opus"
 t "video: 720p source fits the default 480 box"       eq "$(dims v_def.webm)" "854,480"
@@ -177,22 +177,22 @@ t "video: display-matrix rotation baked in"           eq "$(dims v_rot.webm)" "2
 t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
 t "video: stdin -> stdout pipe (single-pass) works"   eq "$(codecs v_piped.webm)" "vp9+opus"
 t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.webm)" "vp9"
-t "video: crafted mp4 prefix does not hang the probe" bash -c "timeout 5 '$WEBMIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
+t "video: crafted mp4 prefix does not hang the probe" bash -c "timeout 5 '$WEBIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
 
 # --- --next: AV1/Opus WebM video, AVIF still images -------------------------------
-"$WEBMIFY" --next tv.mp4 a_tv.webm
-"$WEBMIFY" --next hdr.mp4 a_hdr.webm
-"$WEBMIFY" --next anim.gif a_anim.avif
-"$WEBMIFY" --next - - < tv.mkv > a_piped.webm
-"$WEBMIFY" --next --fast tiny.mp4 a_fast.webm
-"$WEBMIFY" --next --best tiny.mp4 a_best.webm
-"$WEBMIFY" --next photo.png a_q.avif
-"$WEBMIFY" --next -q 2 photo.png a_q2.avif
-"$WEBMIFY" --next -q 9 photo.png a_q9.avif
-"$WEBMIFY" --next alpha.png a_alpha.avif
-"$WEBMIFY" --next opaque.png a_opaque.avif
-"$WEBMIFY" --next exif.jpg a_exif.avif
-"$WEBMIFY" --next - - < photo.png > a_piped.avif
+"$WEBIFY" --next tv.mp4 a_tv.webm
+"$WEBIFY" --next hdr.mp4 a_hdr.webm
+"$WEBIFY" --next anim.gif a_anim.avif
+"$WEBIFY" --next - - < tv.mkv > a_piped.webm
+"$WEBIFY" --next --fast tiny.mp4 a_fast.webm
+"$WEBIFY" --next --best tiny.mp4 a_best.webm
+"$WEBIFY" --next photo.png a_q.avif
+"$WEBIFY" --next -q 2 photo.png a_q2.avif
+"$WEBIFY" --next -q 9 photo.png a_q9.avif
+"$WEBIFY" --next alpha.png a_alpha.avif
+"$WEBIFY" --next opaque.png a_opaque.avif
+"$WEBIFY" --next exif.jpg a_exif.avif
+"$WEBIFY" --next - - < photo.png > a_piped.avif
 
 t "next: video becomes AV1 + Opus"                     eq "$(codecs a_tv.webm)" "av1+opus"
 t "next: 720p source fits the default 480 box"         eq "$(dims a_tv.webm)" "854,480"
@@ -214,23 +214,23 @@ t "next: premium -q RGB graphics race to 4:4:4"        eq "$(pixfmt a_q9.avif)" 
 t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" "$(size anim.webp)"
 
 # --- --legacy: H.264/AAC MP4 video, PNG/APNG images ----------------------------
-"$WEBMIFY" --legacy tv.mp4 l_tv.mp4
-"$WEBMIFY" --legacy -q 2 tv.mp4 l_q2.mp4
-"$WEBMIFY" --legacy -q 9 tv.mp4 l_q9.mp4
-"$WEBMIFY" --legacy rot.mp4 l_rot.mp4
-"$WEBMIFY" --legacy hdr.mp4 l_hdr.mp4
-"$WEBMIFY" --legacy - - < tv.mkv > l_piped.mp4
-"$WEBMIFY" --legacy --fast tiny.mp4 l_fast.mp4
-"$WEBMIFY" --legacy --best tiny.mp4 l_best.mp4
-"$WEBMIFY" --legacy photo.png l_q.png
-"$WEBMIFY" --legacy -q 2 photo.png l_q2.png
-"$WEBMIFY" --legacy plain.jpg l_jpg.png
-"$WEBMIFY" --legacy alpha.png l_alpha.png
-"$WEBMIFY" --legacy opaque.png l_opaque.png
-"$WEBMIFY" --legacy exif.jpg l_exif.png
-"$WEBMIFY" --legacy anim.gif l_anim.png
-"$WEBMIFY" --legacy - - < photo.png > l_piped.png
-"$WEBMIFY" --legacy - - < anim.gif > l_piped_anim.png
+"$WEBIFY" --legacy tv.mp4 l_tv.mp4
+"$WEBIFY" --legacy -q 2 tv.mp4 l_q2.mp4
+"$WEBIFY" --legacy -q 9 tv.mp4 l_q9.mp4
+"$WEBIFY" --legacy rot.mp4 l_rot.mp4
+"$WEBIFY" --legacy hdr.mp4 l_hdr.mp4
+"$WEBIFY" --legacy - - < tv.mkv > l_piped.mp4
+"$WEBIFY" --legacy --fast tiny.mp4 l_fast.mp4
+"$WEBIFY" --legacy --best tiny.mp4 l_best.mp4
+"$WEBIFY" --legacy photo.png l_q.png
+"$WEBIFY" --legacy -q 2 photo.png l_q2.png
+"$WEBIFY" --legacy plain.jpg l_jpg.png
+"$WEBIFY" --legacy alpha.png l_alpha.png
+"$WEBIFY" --legacy opaque.png l_opaque.png
+"$WEBIFY" --legacy exif.jpg l_exif.png
+"$WEBIFY" --legacy anim.gif l_anim.png
+"$WEBIFY" --legacy - - < photo.png > l_piped.png
+"$WEBIFY" --legacy - - < anim.gif > l_piped_anim.png
 
 t "legacy: --next with --legacy rejected"              rejects --next --legacy
 t "legacy: video becomes H.264 + AAC"                  eq "$(codecs l_tv.mp4)" "h264+aac"
