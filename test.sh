@@ -28,10 +28,12 @@ eq()     { [ "$1" = "$2" ]; }
 lt()     { [ "$1" -lt "$2" ]; }
 rejects() { ! "$WEBMIFY" "$@" in out 2>/dev/null; }
 
-ff()     { ffmpeg -hide_banner -loglevel error -y "$@"; }
-dims()   { ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1"; }
-codecs() { ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$1" | paste -sd+; }
-size()   { stat -c%s "$1"; }
+ff()       { ffmpeg -hide_banner -loglevel error -y "$@"; }
+dims()     { ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1"; }
+codecs()   { ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$1" | paste -sd+; }
+channels() { ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$1"; }
+trc()      { ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1"; }
+size()     { stat -c%s "$1"; }
 # Matroska Cues (1C53BB6B) must precede the first Cluster (1F43B675)
 cues_at_head() {
     python3 -c 'import sys
@@ -55,6 +57,28 @@ out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
 out += b"\x00\x00\x00\x01free" + struct.pack(">Q", (1 << 64) - 8)
 sys.stdout.buffer.write(out + b"\x00" * 4096)
 EOF
+ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
+   -f lavfi -i "sine=frequency=440:duration=1" \
+   -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest tiny.mp4    # small clip for the slow tiers
+ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
+   -f lavfi -i "sine=frequency=440:duration=1" \
+   -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest stereo.mp4
+ff -f lavfi -i "sine=frequency=440:duration=1" audio.wav        # no video stream at all
+ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
+ff -f lavfi -i "color=c=red:size=320x240:duration=1:rate=1" -frames:v 1 flat.png
+ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" -c:v libx264 -pix_fmt yuv420p \
+   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4 # PQ-tagged HDR
+ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
+python3 - <<'EOF'                                 # plain.jpg + EXIF Orientation=6 -> exif.jpg
+import struct
+jpg   = open("plain.jpg", "rb").read()
+tiff  = b"II*\x00\x08\x00\x00\x00" + struct.pack("<H", 1)
+tiff += struct.pack("<HHI", 0x0112, 3, 1) + struct.pack("<HH", 6, 0)  # rotate 90 cw
+tiff += struct.pack("<I", 0)
+exif  = b"Exif\x00\x00" + tiff
+open("exif.jpg", "wb").write(jpg[:2] + b"\xff\xe1" +
+                             struct.pack(">H", len(exif) + 2) + exif + jpg[2:])
+EOF
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "'$WEBMIFY' --help | grep -q usage"
@@ -63,6 +87,7 @@ t "-q 11 (out of range) rejected"          rejects -q 11
 t "-q 60 (old 0-100 scale) rejected"       rejects -q 60
 t "--max bogus rejected"                   rejects --max bogus
 t "--fast with --best rejected"            rejects --fast --best
+t "audio-only input rejected"              bash -c "! '$WEBMIFY' audio.wav x.webm 2>/dev/null"
 
 # --- images --------------------------------------------------------------------
 "$WEBMIFY" photo.png  q_def.webp
@@ -72,6 +97,10 @@ t "--fast with --best rejected"            rejects --fast --best
 "$WEBMIFY" -m 240  photo.png m240.webp
 "$WEBMIFY" -m 2000 photo.png m2000.webp
 "$WEBMIFY" - - < photo.png > piped.webp
+"$WEBMIFY" --fast photo.png q_fast.webp
+"$WEBMIFY" flat.png flat.webp
+"$WEBMIFY" anim.gif anim.webp
+"$WEBMIFY" exif.jpg exif.webp
 cwebp -quiet -q 80 -m 6 -sharp_yuv photo.png -o ref80.webp
 
 t "image: default == -q 8 byte-identical"             cmp -s q_def.webp q8.webp
@@ -81,6 +110,10 @@ t "image: -q 8 smaller than -q 9.5"                   lt "$(size q8.webp)" "$(si
 t "image: --max 240 fits the box (640x480 -> 240x180)" eq "$(dims m240.webp)" "240,180"
 t "image: never upscaled (--max 2000)"                eq "$(dims m2000.webp)" "640,480"
 t "image: stdin -> stdout pipe works"                 cmp -s piped.webp q_def.webp
+t "image: --fast tier produces a WebP"                grep -aq WEBP q_fast.webp
+t "image: lossless wins the race on flat graphics"    grep -aq VP8L flat.webp
+t "image: animated gif -> animated WebP (ANIM chunk)" grep -aq ANIM anim.webp
+t "image: EXIF orientation baked in (-> 480x640)"     eq "$(dims exif.webp)" "480,640"
 
 # --- video ---------------------------------------------------------------------
 "$WEBMIFY" tv.mp4 v_def.webm
@@ -89,10 +122,18 @@ t "image: stdin -> stdout pipe works"                 cmp -s piped.webp q_def.we
 "$WEBMIFY" rot.mp4 v_rot.webm
 "$WEBMIFY" - - < tv.mkv > v_piped.webm
 "$WEBMIFY" frag.mp4 v_frag.webm
+"$WEBMIFY" stereo.mp4 v_stereo.webm
+"$WEBMIFY" hdr.mp4 v_hdr.webm
+"$WEBMIFY" --fast tiny.mp4 v_fast.webm
+"$WEBMIFY" --best tiny.mp4 v_best.webm
 
 t "video: VP9 + Opus"                                 eq "$(codecs v_def.webm)" "vp9+opus"
 t "video: 720p source fits the default 480 box"       eq "$(dims v_def.webm)" "854,480"
-t "video: mono source stays mono"                     eq "$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 v_def.webm)" "1"
+t "video: mono source stays mono"                     eq "$(channels v_def.webm)" "1"
+t "video: stereo source stays stereo"                 eq "$(channels v_stereo.webm)" "2"
+t "video: HDR (PQ) tonemapped to SDR bt709"           eq "$(trc v_hdr.webm)" "bt709"
+t "video: --fast tier produces VP9+Opus"              eq "$(codecs v_fast.webm)" "vp9+opus"
+t "video: --best tier produces VP9+Opus"              eq "$(codecs v_best.webm)" "vp9+opus"
 t "video: -q 2 smaller than -q 9"                     lt "$(size v_q2.webm)" "$(size v_q9.webm)"
 t "video: display-matrix rotation baked in"           eq "$(dims v_rot.webm)" "270,480"
 t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
