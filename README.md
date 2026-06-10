@@ -56,7 +56,10 @@ file arguments):
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the
   vendored FFmpeg version baked into the binary.
 
-When stderr is a terminal, video conversions print pass/percentage progress.
+Exit status: 0 on success, 1 when a conversion fails, 2 for usage errors.
+
+When stderr is a terminal and the input declares a duration, video
+conversions print pass/percentage progress.
 
 Every supported format works from stdin: images are buffered in memory, and
 video containers that need a seekable input to keep all their features
