@@ -53,6 +53,8 @@ file arguments):
     the default at equal-or-better SSIM for ~75% more encode time (and
     10-20% smaller for piped inputs that could not two-pass before).
     Images already run their densest settings by default.
+- `-h`, `--help` / `--version` — the usual; `--version` also reports the
+  vendored FFmpeg version baked into the binary.
 
 When stderr is a terminal, video conversions print pass/percentage progress.
 
@@ -148,6 +150,8 @@ Everything builds inside Docker; nothing is installed on the host:
 ./build.sh                        # -> dist/webmify (static musl binary)
 UPX=1 ./build.sh                  # also upx-compress (~60% smaller, slower start)
 PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
+./test.sh                         # smoke test the built binary (needs host
+                                  # ffmpeg, ffprobe, cwebp, python3)
 ```
 
 ## Design
@@ -156,8 +160,8 @@ PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
   (`src/webmify.cpp`) written against the official FFmpeg API, modeled on
   FFmpeg's own `doc/examples/transcode.c`, compiled with a single `g++ -static`
   invocation in the Dockerfile.
-- **Official upstream sources only**, pinned release tarballs (`vendor.sh`),
-  all latest releases:
+- **Official upstream sources only**, pinned release tarballs (`vendor.sh`)
+  verified against pinned sha256 checksums, all latest releases:
   FFmpeg 8.1.1, libvpx 1.16.0 (webmproject), libopus 1.6.1 (xiph),
   dav1d 1.5.3 (VideoLAN), libwebp 1.6.0 (webmproject), zimg 3.0.6
   (sekrit-twc), zlib (Alpine static package) — plus the minimal patches in
