@@ -56,13 +56,18 @@ mkdir -p "$SRC" "$PREFIX"
 
 fetch() { # <url> <dir-name> <sha256>
     local url="$1" name="$2" sum="$3"
+    # the guard dir must appear only after a verified, complete extraction:
+    # extract into a .tmp dir and mv it into place last, so an interrupted
+    # run can't make the next one skip the download and the checksum
     if [ ! -d "$SRC/$name" ]; then
         echo "==> downloading $name"
         curl -fL --retry 3 -o "$SRC/$name.tar" "$url"
         echo "$sum  $SRC/$name.tar" | sha256sum -c -
-        mkdir -p "$SRC/$name"
-        tar -xf "$SRC/$name.tar" -C "$SRC/$name" --strip-components=1
+        rm -rf "$SRC/$name.tmp"
+        mkdir -p "$SRC/$name.tmp"
+        tar -xf "$SRC/$name.tar" -C "$SRC/$name.tmp" --strip-components=1
         rm -f "$SRC/$name.tar"
+        mv "$SRC/$name.tmp" "$SRC/$name"
     fi
 }
 

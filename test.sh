@@ -38,12 +38,32 @@ channels() { ffprobe -v error -select_streams a:0 -show_entries stream=channels 
 trc()      { ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1"; }
 pixfmt()   { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1"; }
 size()     { stat -c%s "$1"; }
-# Matroska Cues (1C53BB6B) must precede the first Cluster (1F43B675)
+# Matroska Cues (1C53BB6B) must precede the first Cluster (1F43B675),
+# walking real EBML elements — a flat byte search always "finds" the Cues
+# at the head, inside the SeekHead's SeekID, which stores that same ID
 cues_at_head() {
     python3 -c 'import sys
 d = open(sys.argv[1], "rb").read()
-c = d.find(bytes.fromhex("1C53BB6B")); k = d.find(bytes.fromhex("1F43B675"))
-sys.exit(0 if 0 <= c < k else 1)' "$1"
+def vint(i, strip):                      # EBML varint at i -> (value, size)
+    n = 8 - d[i].bit_length() + 1        # length = leading zero bits + 1
+    v = d[i] & (0xFF >> n) if strip else d[i]
+    for j in range(1, n):
+        v = v << 8 | d[i + j]
+    return v, n
+def children(i, end):                    # yield (id, payload off, payload size)
+    while i < end:
+        eid, n = vint(i, False); i += n
+        size, n = vint(i, True)
+        if size == (1 << (7 * n)) - 1:   # "unknown size": runs to EOF
+            size = len(d) - i - n
+        i += n
+        yield eid, i, size
+        i += size
+seg = next((o, s) for e, o, s in children(0, len(d)) if e == 0x18538067)
+for eid, off, size in children(seg[0], seg[0] + seg[1]):
+    if eid == 0x1C53BB6B: sys.exit(0)    # Cues before any Cluster
+    if eid == 0x1F43B675: sys.exit(1)    # Cluster first: cues at the tail
+sys.exit(1)' "$1"
 }
 # MP4 faststart: the moov atom must precede the mdat atom
 moov_at_head() {

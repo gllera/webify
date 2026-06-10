@@ -497,14 +497,18 @@ static int open_decoder(AVFormatContext *ifmt, int stream_index, AVCodecContext 
     }
     if (!(dec = avcodec_alloc_context3(codec)))
         return AVERROR(ENOMEM);
-    if ((ret = avcodec_parameters_to_context(dec, st->codecpar)) < 0)
+    if ((ret = avcodec_parameters_to_context(dec, st->codecpar)) < 0) {
+        avcodec_free_context(&dec);
         return ret;
+    }
     dec->pkt_timebase = st->time_base;
     dec->thread_count = 0; /* auto */
     if (dec->codec_type == AVMEDIA_TYPE_VIDEO)
         dec->framerate = av_guess_frame_rate(ifmt, st, NULL);
-    if ((ret = avcodec_open2(dec, codec, NULL)) < 0)
+    if ((ret = avcodec_open2(dec, codec, NULL)) < 0) {
+        avcodec_free_context(&dec);
         return ret;
+    }
     *out = dec;
     return 0;
 }
@@ -1185,7 +1189,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                  * exp2((33 - crf) / 6.0);
         double  ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
         int64_t src  = source_video_rate(ifmt, stream_index);
-        /* tiles/threads follow Google's VOD table by output width:
+        /* tiles follow Google's VOD table by output width; threads run at
+         * double its column, which row-mt keeps busy:
          * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
         int tlog = p->enc->width >= 2560 ? 3 : p->enc->width >= 1280 ? 2
                  : p->enc->width >= 512  ? 1 : 0;
@@ -1314,8 +1319,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             av_dict_set(&aopts, "still-picture", "1", 0);
         }
         av_dict_set(&aopts, "row-mt", "1", 0);
-        av_dict_set(&aopts, "cpu-used",
-                    opt.effort < 0 ? (peeked.animated ? "6" : "7") : "4", 0);
+        av_dict_set(&aopts, "cpu-used", opt.effort < 0 ? "6" : "4", 0);
         ret = avcodec_open2(p->enc_a, codec, &aopts);
         av_dict_free(&aopts);
         if (ret < 0)

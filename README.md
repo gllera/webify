@@ -196,8 +196,9 @@ ffmpeg -i input.mp4 ... -pass 1 -f null - && ffmpeg -i input.mp4 \
 baked into the pixels), aspect-ratio-preserving scaling, and input
 colorspace/range tagging. The stats pass runs at `-cpu-used 4` (it barely
 affects the stats), and `--fast`/`--best` move the final pass to
-`-cpu-used 4`/`-cpu-used 0` as described above. Tiles/threads follow
-Google's VOD table for the output width (0/2 below 512 px, 1/4 for 480p,
+`-cpu-used 4`/`-cpu-used 0` as described above. Tiles follow Google's VOD
+table for the output width, with threads at double the table's column —
+row-mt keeps the extra threads busy (0/2 below 512 px, 1/4 for 480p,
 2/8 for 720-1080p, 3/16 above). The seek index (cues) is written at the
 head of the file — the WebM equivalent of MP4 faststart — so browsers can
 seek immediately. Audio is Opus 64k stereo; mono sources stay mono at 48k
