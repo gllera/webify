@@ -27,7 +27,7 @@ times are measured separately from the same fixtures and settings.
 
 ## Video
 
-![video size vs -q](graph-video-q.svg)
+![video size vs -q](img/graph-video-q.svg)
 
 AV1 is the cheapest through the whole practical range (−25…−60% vs VP9).
 H.264's flat CRF scale shows at both extremes: below `-q 3` its CRF mode
@@ -37,7 +37,7 @@ scale x264-veryslow gets relatively cheaper and lands smallest on this
 clip — maximum compatibility costs mostly encode time, not bytes. The
 no-flag default sits just below `-q 4.8` (it targets VP9 CRF 36 vs 33).
 
-![video size by tier](graph-video-tiers.svg)
+![video size by tier](img/graph-video-tiers.svg)
 
 The effort tiers barely move the *size* at the default `-q` — they trade
 encode time (fast ≈ 4–15x faster, best a few % smaller) at the same
@@ -47,7 +47,7 @@ the fast tier only promises the (lower) VP9-fast look.
 
 ## Still images
 
-![stills size vs -q](graph-stills-q.svg)
+![stills size vs -q](img/graph-stills-q.svg)
 
 AVIF holds roughly −25…−45% under WebP on photographic content across
 the upper `-q` range; the gap narrows toward `-q 10` where cwebp's
@@ -55,7 +55,7 @@ premium top end buys disproportionate quality and the AVIF CRF has to
 dive to keep up. (Sharp graphics at high `-q` are the exception — WebP's
 lossless race wins there; see [next.md](next.md).)
 
-![stills size by tier](graph-stills-tiers.svg)
+![stills size by tier](img/graph-stills-tiers.svg)
 
 The two fast tiers pay for their speed in different currencies: cwebp's
 `-m 4` costs a few percent more bytes at the same quality, while AVIF's
@@ -65,7 +65,7 @@ AVIF, still well under WebP.
 
 ## Animated GIF
 
-![animations size vs -q](graph-anim-q.svg)
+![animations size vs -q](img/graph-anim-q.svg)
 
 The biggest gap in the product: animated WebP re-codes every changed
 region as an independent intra still, while AV1 inter-predicts motion
@@ -81,7 +81,7 @@ Same fixtures, same settings, measured serially on an idle box (gateway:
 x86_64, 16 cores — absolute numbers shift with the host, the *ratios*
 are the point).
 
-![video encode time](graph-video-time.svg)
+![video encode time](img/graph-video-time.svg)
 
 The size wins above are bought with encode time: AV1's default two-pass
 runs ~2.6x the VP9 default (~4x realtime on this 6 s clip), and `--best`
@@ -91,14 +91,14 @@ other direction: maximum compatibility at a *tenth* of the VP9 default's
 time — veryslow already is its `--best` (placebo was rejected), and
 preset fast lands under a second.
 
-![stills encode time](graph-stills-time.svg)
+![stills encode time](img/graph-stills-time.svg)
 
 Stills are interchangeable at the default (~0.23 s each at this size) —
 AVIF's `--fast` pays its 2x-vs-WebP time for holding photographic
 quality (the −4 CRF offset digs more than a shallower search saves),
 and its `--best` triples the default for the last −1-3% bytes.
 
-![animations encode time](graph-anim-time.svg)
+![animations encode time](img/graph-anim-time.svg)
 
 Animated AVIF is *faster* than animated WebP at the default tier on top
 of being ~7x smaller — inter prediction beats re-coding every frame on

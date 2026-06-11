@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render doc/graph-*.svg from a calibrate.sh results.csv.
+"""Render doc/img/graph-*.svg from a calibrate.sh results.csv.
 
     python3 doc/graphs.py --bench [/tmp/webify-calib]    # 1) time encodes
     python3 doc/graphs.py [/tmp/webify-calib/results.csv]  # 2) render
@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 
-DIR = os.path.dirname(os.path.abspath(__file__))
+DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'img')
 
 
 def bench(workdir):
