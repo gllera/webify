@@ -39,9 +39,7 @@ upmixed. The Opus bitrate scales with `-q` (64k stereo / 48k mono at the
 default, half that at `-q 0`, ~1.5× at `-q 10`), and a lossy source's own
 audio rate caps the Opus rate (Opus loses nothing at the rate a weaker
 codec managed; lossless/PCM sources stay uncapped). The source rate is
-*measured* during the stats pass when one runs (see Rate caps below) —
-containers like MKV/WebM declare no per-stream rates, and with only the
-header to go on this cap used to silently no-op there.
+*measured* during the stats pass when one runs — see Rate caps below.
 Subtitle/data/cover-art streams are ignored.
 
 ## Rate caps

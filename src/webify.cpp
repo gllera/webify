@@ -128,7 +128,7 @@ extern "C" {
  * streams per frame. It must run before transpose (rotation would turn the
  * fields into columns) and before scaling (fields are interleaved source
  * lines); send_frame keeps the frame rate */
-#define DEINT_FILTER "bwdif=mode=send_frame:parity=auto:deint=interlaced,"
+#define DEINT_FILTER "bwdif=mode=send_frame:deint=interlaced,"
 #define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=%s:channel_layouts=%s"
 /* high-quality swscale conversions for the image pipeline (rounding flags are
  * no-ops where they don't apply; lanczos only kicks in for --max scaling) */
@@ -222,10 +222,11 @@ static void log_cb(void *ptr, int level, const char *fmt, va_list vl)
 /* ---- stdin input -----------------------------------------------------------
  * Probing the first bytes lets us pick the right strategy: image files are
  * slurped whole into memory so demuxers that need a seekable input still work
- * (HEIC/AVIF item layout, TIFF's no-parser whole-file read); video containers
- * whose index can sit at the end (mp4/mov without faststart, AVI) are spooled
- * to an unlinked temp file so no feature is lost; everything else streams,
- * with the probed prefix replayed ahead of the live pipe. */
+ * (HEIC/AVIF item layout, TIFF's no-parser whole-file read); every other
+ * piped input is spooled to an unlinked temp file so it rewinds like a file
+ * (the stats pass, the HDR peek, end-indexed containers). Streaming the
+ * probed prefix ahead of the live pipe survives only as the fallback when no
+ * temp file can be created. */
 
 #define PREFIX_SIZE (64 * 1024)
 #define IO_BUFSIZE  (64 * 1024)
@@ -352,18 +353,26 @@ static int write_all(int fd, const uint8_t *p, size_t n)
     return 0;
 }
 
+/* every webify temp file comes from here: webify-XXXXXX in $TMPDIR or
+ * /tmp (doc/piping.md documents that name as the SIGKILL-leftover caveat).
+ * Returns the mkstemp fd, path gets the name */
+static int make_temp(char *path, size_t len)
+{
+    const char *dir = getenv("TMPDIR");
+
+    snprintf(path, len, "%s/webify-XXXXXX", dir && *dir ? dir : "/tmp");
+    return mkstemp(path);
+}
+
 /* forward the whole pipe to a temp file, unlinked right away so it is gone
  * when the process exits no matter how it exits */
 static int spool_to_file(StdinIO *io)
 {
-    const char *dir = getenv("TMPDIR");
     char path[512];
     uint8_t chunk[IO_BUFSIZE];
     int n, ret;
 
-    snprintf(path, sizeof(path), "%s/webify-XXXXXX",
-             dir && *dir ? dir : "/tmp");
-    if ((io->fd = mkstemp(path)) < 0)
+    if ((io->fd = make_temp(path, sizeof(path))) < 0)
         return AVERROR(errno);
     unlink(path);
 
@@ -641,14 +650,27 @@ static double codec_weight(enum AVCodecID id)
     }
 }
 
-/* the input video stream's bitrate, best effort: the stream's own header
+/* the source video/audio rates measured during the stats pass (bits/s,
+ * 0 = not measured): the stats pass reads every packet anyway, so it
+ * counts the truth. Single-pass tiers (--fast, --legacy) never measure
+ * and keep the header-based caps; pass 1 itself also runs on those (the
+ * measurement happens during it — libvpx's first pass collects content
+ * stats, not rate plans, so the mismatch is harmless) */
+static int64_t measured_video_rate, measured_audio_rate;
+
+/* the input video stream's bitrate, best effort: the rate measured during
+ * the stats pass beats any header — headers lie or say nothing (mkv/webm
+ * declare no per-stream rates at all) — else the stream's own header
  * value, else the container average minus the rates the other streams
- * declare — which overestimates the video share (mux overhead, undeclared
+ * declare, which overestimates the video share (mux overhead, undeclared
  * streams), erring on the side of a looser cap */
 static int64_t source_video_rate(const AVFormatContext *ifmt, int vidx)
 {
-    int64_t rate = ifmt->streams[vidx]->codecpar->bit_rate;
+    int64_t rate;
 
+    if (measured_video_rate > 0)
+        return measured_video_rate;
+    rate = ifmt->streams[vidx]->codecpar->bit_rate;
     if (rate <= 0 && ifmt->bit_rate > 0) {
         rate = ifmt->bit_rate;
         for (unsigned i = 0; i < ifmt->nb_streams; i++)
@@ -656,6 +678,15 @@ static int64_t source_video_rate(const AVFormatContext *ifmt, int vidx)
                 rate -= ifmt->streams[i]->codecpar->bit_rate;
     }
     return rate;
+}
+
+/* same idea for the audio stream: measured rate first, else the header
+ * value (mkv/webm declare none, which used to silently disable the audio
+ * cap — a 26.5k AAC track was re-encoded at the full 48k anchor) */
+static int64_t source_audio_rate(const AVStream *ist)
+{
+    return measured_audio_rate > 0 ? measured_audio_rate
+                                   : ist->codecpar->bit_rate;
 }
 
 /* does the frame actually use transparency? checks the palette for
@@ -869,14 +900,6 @@ static int avif_still_crf(void)
  * no -q that look depends on whether VP9 would have run two passes (crf 36)
  * or one (crf 33) — webify_run records its two-pass decision here */
 static int vp9_ref_twopass;
-
-/* the source video/audio rates measured during the stats pass (bits/s,
- * 0 = not measured). Container headers lie or say nothing — mkv/webm
- * declare no per-stream rates at all — and the container-average fallback
- * lumps every stream together; the stats pass reads every packet anyway,
- * so it counts the truth. Single-pass tiers (--fast, --legacy) never
- * measure and keep the header-based caps. */
-static int64_t measured_video_rate, measured_audio_rate;
 
 /* bytes accumulated over a packet-dts span -> bits/s; 0 when the span is
  * missing or too short to be meaningful (1-2 packet streams) */
@@ -1208,14 +1231,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         double f = ((double)p->enc->width * p->enc->height) / (854.0 * 480.0)
                  * exp2((33 - crf) / 6.0);
         double  ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
-        /* the measured rate (when a stats pass ran) beats any header: it is
-         * the truth, while headers lie or say nothing and the container
-         * fallback lumps all streams together. Pass 1 itself still runs on
-         * the header-based cap — the measurement happens during it; libvpx's
-         * first pass collects content stats, not rate plans, so the
-         * mismatch is harmless */
-        int64_t src  = measured_video_rate > 0
-                     ? measured_video_rate : source_video_rate(ifmt, stream_index);
+        int64_t src  = source_video_rate(ifmt, stream_index);
         /* tiles follow Google's VOD table by output width; threads run at
          * double its column, which row-mt keeps busy:
          * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
@@ -1439,12 +1455,7 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         double  q   = opt.quality < 0 ? 48.0 : opt.quality;
         int64_t bps = (int64_t)((mono ? 48000 : 64000) * (0.5 + q / 96.0));
         int64_t lo  = mono ? 16000 : 24000;
-        /* prefer the rate measured during the stats pass: mkv/webm declare
-         * no per-stream rates, and with only the header this cap silently
-         * no-opped there (measured: a 26.5k AAC track re-encoded at the
-         * full 48k anchor) */
-        int64_t src = measured_audio_rate > 0
-                    ? measured_audio_rate : ist->codecpar->bit_rate;
+        int64_t src = source_audio_rate(ist);
 
         if (opt.legacy) { /* AAC needs ~1.5x Opus's rate for the same
                            * quality (96k stereo at the default), and
@@ -1778,7 +1789,7 @@ static int first_pass(AVFormatContext *ifmt, int vidx, int aidx, char **stats)
                 span[side][1] = ts + FFMAX(pkt->duration, 0);
             }
         }
-        if (pkt->stream_index == vidx)
+        if (side == 0)
             ret = decode_packet(NULL, &p, pkt);
         av_packet_unref(pkt);
         if (ret < 0)
@@ -1802,9 +1813,21 @@ end:
     return ret;
 }
 
-/* the stats run consumed the input; rewind by reopening, which covers both
- * real files and the spooled/slurped stdin paths behind the custom pb */
-static int reopen_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io)
+/* can the input be read a second time? real files and the spooled/slurped
+ * stdin paths can; only the unspoolable-pipe fallback cannot, which costs
+ * the stats pass, the HDR-peak peek and end-indexed containers */
+static int input_can_rewind(const AVFormatContext *ifmt)
+{
+    return ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL);
+}
+
+/* the stats run or the metadata peek consumed the input; rewind by
+ * reopening, which covers both real files and the spooled/slurped stdin
+ * paths behind the custom pb. Reopening invalidates the stream indices,
+ * so they are rebound here; the discard flags reset too — the caller
+ * re-applies those */
+static int reopen_input(const char *in_path, AVFormatContext **ifmt,
+                        StdinIO *io, int image, int *vidx, int *aidx)
 {
     int64_t pos;
     int ret;
@@ -1822,7 +1845,23 @@ static int reopen_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io
     }
     if (ret < 0)
         return ret;
-    return avformat_find_stream_info(*ifmt, NULL);
+    if ((ret = avformat_find_stream_info(*ifmt, NULL)) < 0)
+        return ret;
+    *vidx = av_find_best_stream(*ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    *aidx = image ? -1
+          : av_find_best_stream(*ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    return *vidx < 0 ? AVERROR_STREAM_NOT_FOUND : 0;
+}
+
+/* let the demuxer drop packets of the streams webify won't read. The audio
+ * stream is kept even for the stats pass, which never decodes it — only so
+ * its bytes can be counted for the measured rate caps. (reopen_input resets
+ * the flags, so this runs again for the final pass) */
+static void discard_other_streams(AVFormatContext *ifmt, int vidx, int aidx)
+{
+    for (unsigned i = 0; i < ifmt->nb_streams; i++)
+        if ((int)i != vidx && (int)i != aidx)
+            ifmt->streams[i]->discard = AVDISCARD_ALL;
 }
 
 static int webify_run(const char *in_path, const char *out_path)
@@ -1833,7 +1872,9 @@ static int webify_run(const char *in_path, const char *out_path)
     AVPacket *pkt = NULL;
     AVDictionary *muxopts = NULL;
     char *stats = NULL, tmp_out[512] = "";
+    const char *sink, *oname;
     int ret, vidx, aidx, image, spool_out = 0;
+    int out_pipe = !strncmp(out_path, "pipe:", 5);
 
     av_log_set_level(AV_LOG_WARNING);
     av_log_set_callback(log_cb);
@@ -1868,52 +1909,30 @@ static int webify_run(const char *in_path, const char *out_path)
     if (image ||
         (is_hdr_trc((AVColorTransferCharacteristic)
                     ifmt->streams[vidx]->codecpar->color_trc) &&
-         ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL))) {
+         input_can_rewind(ifmt))) {
         peek_first_frame(ifmt, vidx, image && (opt.next || opt.legacy));
-        if ((ret = reopen_input(in_path, &ifmt, &io)) < 0)
+        if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
             goto end;
-        vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-        aidx = image ? -1
-             : av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        if (vidx < 0) {
-            ret = AVERROR_STREAM_NOT_FOUND;
-            goto end;
-        }
     }
 
     if (!image && opt.legacy) {
         /* no stats pass ever (x264's CRF mode plans ahead by itself), but
          * remember when the default pipeline *would* have two-passed: the
          * no--q look to match is then crf 36, not the streamed 33 */
-        vp9_ref_twopass = opt.effort >= 0 && ifmt->pb &&
-                          (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL);
-    } else if (!image && opt.effort >= 0 &&
-        ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
-        /* the audio stream stays undiscarded only so the stats pass can
-         * count its bytes (measured source rates) — it is never decoded */
-        for (unsigned i = 0; i < ifmt->nb_streams; i++)
-            if ((int)i != vidx && (int)i != aidx)
-                ifmt->streams[i]->discard = AVDISCARD_ALL;
+        vp9_ref_twopass = opt.effort >= 0 && input_can_rewind(ifmt);
+    } else if (!image && opt.effort >= 0 && input_can_rewind(ifmt)) {
+        discard_other_streams(ifmt, vidx, aidx);
         if ((ret = first_pass(ifmt, vidx, aidx, &stats)) < 0)
             goto end;
-        if ((ret = reopen_input(in_path, &ifmt, &io)) < 0)
+        if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
             goto end;
-        vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-        aidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        if (vidx < 0) {
-            ret = AVERROR_STREAM_NOT_FOUND;
-            goto end;
-        }
     } else if (!image && opt.effort >= 0) {
         av_log(NULL, AV_LOG_WARNING,
                "input is not seekable: encoding in a single pass "
                "(two-pass saves 10-20%% bandwidth at the same quality)\n");
     } /* --fast skips the stats pass on purpose: single-pass, no warning */
 
-    /* let the demuxer drop packets of streams we won't transcode */
-    for (unsigned i = 0; i < ifmt->nb_streams; i++)
-        if ((int)i != vidx && (int)i != aidx)
-            ifmt->streams[i]->discard = AVDISCARD_ALL;
+    discard_other_streams(ifmt, vidx, aidx);
 
     /* piped video output spools through a named temp file so the pipe
      * changes nothing about the bytes: faststart re-shuffles the finished
@@ -1922,13 +1941,10 @@ static int webify_run(const char *in_path, const char *out_path)
      * faststart pass re-opens the output by URL to read it back. The file
      * is streamed to stdout and removed at the end. Images never need
      * this — they stream, or are assembled in memory below */
-    if (!image && !strncmp(out_path, "pipe:", 5)) {
-        const char *dir = getenv("TMPDIR");
-        int fd;
+    if (!image && out_pipe) {
+        int fd = make_temp(tmp_out, sizeof(tmp_out));
 
-        snprintf(tmp_out, sizeof(tmp_out), "%s/webify-XXXXXX",
-                 dir && *dir ? dir : "/tmp");
-        if ((fd = mkstemp(tmp_out)) < 0) {
+        if (fd < 0) {
             av_log(NULL, AV_LOG_WARNING, "cannot create a temp file for "
                    "piped output (%s): writing a streamable file instead\n",
                    err2str(AVERROR(errno)));
@@ -1937,20 +1953,19 @@ static int webify_run(const char *in_path, const char *out_path)
             close(fd);
         }
     }
+    /* the muxer's actual sink: the temp spool when one was made, the real
+     * output otherwise — every "can the muxer seek?" decision keys off it */
+    sink = tmp_out[0] ? tmp_out : out_path;
 
     /* still PNGs go through image2pipe (one packet = the whole file, written
      * to our own avio like every other muxer here; plain image2 insists on
      * opening files itself) */
-    if ((ret = avformat_alloc_output_context2(&ofmt, NULL,
-                                              image ? (opt.next   ? "avif"
-                                                     : !opt.legacy ? "webp"
-                                                     : peeked.animated
-                                                                  ? "apng"
-                                                                  : "image2pipe")
-                                                    : opt.legacy  ? "mp4"
-                                                                  : "webm",
-                                              tmp_out[0] ? tmp_out
-                                                         : out_path)) < 0)
+    oname = image ? (opt.next        ? "avif"
+                   : !opt.legacy     ? "webp"
+                   : peeked.animated ? "apng"
+                                     : "image2pipe")
+                  : opt.legacy ? "mp4" : "webm";
+    if ((ret = avformat_alloc_output_context2(&ofmt, NULL, oname, sink)) < 0)
         goto end;
     /* deterministic output: the same input and options always produce the
      * same bytes. This is what makes the piped-output spool byte-identical
@@ -1975,13 +1990,12 @@ static int webify_run(const char *in_path, const char *out_path)
 
     /* the avif muxer (mov family) seeks back to patch item offsets/sizes,
      * and the apng muxer back-patches its frame count (acTL) the same way;
-     * for stdout, write into memory and dump the finished file at the end */
-    spool_out = image && (opt.next || (opt.legacy && peeked.animated)) &&
-                !strncmp(out_path, "pipe:", 5);
+     * for stdout, write into memory and dump the finished file at the end
+     * (images stay off disk on purpose — video uses the temp spool above) */
+    spool_out = out_pipe && (!strcmp(oname, "avif") || !strcmp(oname, "apng"));
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
         ret = spool_out ? avio_open_dyn_buf(&ofmt->pb)
-                        : avio_open(&ofmt->pb, tmp_out[0] ? tmp_out : out_path,
-                                    AVIO_FLAG_WRITE);
+                        : avio_open(&ofmt->pb, sink, AVIO_FLAG_WRITE);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "cannot create '%s': %s\n", out_path,
                    err2str(ret));
@@ -1999,7 +2013,7 @@ static int webify_run(const char *in_path, const char *out_path)
          * spool above — only its no-temp-file fallback drops to a fragmented
          * MP4 (playable everywhere MSE is, but not by every old player) */
         av_dict_set(&muxopts, "movflags",
-                    tmp_out[0] || strncmp(out_path, "pipe:", 5)
+                    strncmp(sink, "pipe:", 5)
                         ? "+faststart"
                         : "+frag_keyframe+empty_moov+default_base_moof", 0);
     } else /* faststart for WebM: put the seek index up front so browsers can
