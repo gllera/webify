@@ -13,9 +13,13 @@ the calibration docs' tables.
 
 Regenerate after a re-calibration with:
 
-    DIR=/tmp/webify-calib ./calibrate.sh all       # sizes (parallel, cached)
+    DIR=/tmp/webify-calib SQS="def 8.5 9 9.5 10" AQS="def 5 6.5 9.5" \
+        ./calibrate.sh all                           # sizes (parallel, cached)
     python3 doc/graphs.py --bench /tmp/webify-calib  # encode times (serial!)
     python3 doc/graphs.py /tmp/webify-calib/results.csv
+
+(The SQS/AQS knobs add the line charts' still and animation `-q` points
+beyond the harness defaults; the video grid is covered by the default QS.)
 
 The bench step runs strictly serially on an idle box — wall times from
 the harness's 16-way encode pool would be contention noise, so sizes and

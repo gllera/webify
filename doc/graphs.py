@@ -218,7 +218,7 @@ bar_chart(os.path.join(DIR, 'graph-video-tiers.svg'),
                     for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))}),
            ('H.264 (--legacy)', {t: rows[('vid5', 'x264' + s, 'def')]
                     for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))})],
-          [('default', BLUE), ('--fast', ORANGE), ('--best', GREEN)])
+          [('--fast', ORANGE), ('default', BLUE), ('--best', GREEN)])
 
 # stills: photo pair mean across the upper -q range (default tier)
 sq = ['def', 8.5, 9, 9.5, 10]
@@ -238,7 +238,7 @@ bar_chart(os.path.join(DIR, 'graph-stills-tiers.svg'),
                      for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))}),
            ('AVIF (--next)', {t: photo_mean('avif' + s, 'def')
                      for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))})],
-          [('default', BLUE), ('--fast', ORANGE), ('--best', GREEN)])
+          [('--fast', ORANGE), ('default', BLUE), ('--best', GREEN)])
 
 # animations: the headline gap, on the GIF class the curve is anchored to
 line_chart(os.path.join(DIR, 'graph-anim-q.svg'),
@@ -269,7 +269,7 @@ if os.path.exists(tcsv):
          [('animated WebP', tierd('vid5', 'animwebp')),
           ('animated AVIF (--next)', tierd('vid5', 'animavif'))])):
         bar_chart(os.path.join(DIR, out), title, groups,
-                  [('default', BLUE), ('--fast', ORANGE), ('--best', GREEN)],
+                  [('--fast', ORANGE), ('default', BLUE), ('--best', GREEN)],
                   tickfmt=fmt_s, vfmt=lambda v: f'{v:.2g}s')
 else:
     print(f'no {tcsv}: skipping the encode-time charts '

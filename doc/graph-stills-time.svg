@@ -17,23 +17,23 @@
 <line x1="86" y1="44.0" x2="704" y2="44.0" stroke="#8b949e" stroke-opacity="0.25"/>
 <text x="78" y="48.0" text-anchor="end" fill="#8b949e" font-size="12">0.7s</text>
 <text x="240.5" y="388" text-anchor="middle" fill="#8b949e" font-size="13">WebP</text>
-<rect x="185.5" y="262.9" width="34" height="105.1" fill="#2f81f7" rx="2"/>
-<text x="202.5" y="257.93142857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
-<rect x="223.5" y="356.4" width="34" height="11.6" fill="#e8793a" rx="2"/>
-<text x="240.5" y="351.42857142857144" text-anchor="middle" fill="#8b949e" font-size="11">0.025s</text>
-<rect x="261.5" y="263.4" width="34" height="104.6" fill="#3fb950" rx="2"/>
-<text x="278.5" y="258.3942857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
+<rect x="185.5" y="356.0" width="34" height="12.0" fill="#e8793a" rx="2"/>
+<text x="202.5" y="350.9657142857143" text-anchor="middle" fill="#8b949e" font-size="11">0.026s</text>
+<rect x="223.5" y="262.9" width="34" height="105.1" fill="#2f81f7" rx="2"/>
+<text x="240.5" y="257.93142857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
+<rect x="261.5" y="262.9" width="34" height="105.1" fill="#3fb950" rx="2"/>
+<text x="278.5" y="257.93142857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
 <text x="549.5" y="388" text-anchor="middle" fill="#8b949e" font-size="13">AVIF (--next)</text>
-<rect x="494.5" y="263.4" width="34" height="104.6" fill="#2f81f7" rx="2"/>
-<text x="511.5" y="258.3942857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
-<rect x="532.5" y="340.7" width="34" height="27.3" fill="#e8793a" rx="2"/>
-<text x="549.5" y="335.69142857142856" text-anchor="middle" fill="#8b949e" font-size="11">0.059s</text>
-<rect x="570.5" y="100.0" width="34" height="268.0" fill="#3fb950" rx="2"/>
-<text x="587.5" y="95.00571428571428" text-anchor="middle" fill="#8b949e" font-size="11">0.58s</text>
-<rect x="96" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
-<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">default</text>
-<rect x="206" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
-<text x="224" y="42" text-anchor="start" fill="#8b949e" font-size="12">--fast</text>
+<rect x="494.5" y="341.2" width="34" height="26.8" fill="#e8793a" rx="2"/>
+<text x="511.5" y="336.1542857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.058s</text>
+<rect x="532.5" y="262.9" width="34" height="105.1" fill="#2f81f7" rx="2"/>
+<text x="549.5" y="257.93142857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.23s</text>
+<rect x="570.5" y="100.9" width="34" height="267.1" fill="#3fb950" rx="2"/>
+<text x="587.5" y="95.93142857142857" text-anchor="middle" fill="#8b949e" font-size="11">0.58s</text>
+<rect x="96" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
+<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">--fast</text>
+<rect x="206" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
+<text x="224" y="42" text-anchor="start" fill="#8b949e" font-size="12">default</text>
 <rect x="316" y="32" width="12" height="12" fill="#3fb950" rx="2"/>
 <text x="334" y="42" text-anchor="start" fill="#8b949e" font-size="12">--best</text>
 </svg>
