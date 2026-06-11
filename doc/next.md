@@ -23,12 +23,18 @@ the data and method):
   table that weights the source cap (÷1.3).
 - **Stills** run near-linear to `-q 8` then dive with cwebp's premium top
   end (q 8 → CRF 28, 9.5 → 12, 10 → 6).
-- **Animations** get their own much-higher curve (CRF 63 easing to 56 at
-  `-q 8`) because animated WebP is far weaker than stills WebP.
+- **Animations** get their own much-higher curve (CRF 63 ceiling easing
+  to 36 at `-q 8`, `--fast` 4 lower) because animated WebP is far weaker
+  than stills WebP. The curve tracks *live-action* equal points: the
+  per-content spread is huge (graphics' equal point sits ~25 CRF higher),
+  and a mean fit paid the size win back as visible quality loss on faces
+  while graphics merely overdeliver at sizes that stay under ~0.27× of
+  animated WebP anyway.
 
 Measured at the defaults: video −28% bytes at equal SSIM (low `-q` reaches
-−60%), stills −26%, and animated GIFs −96% — all within ±0.005 SSIM of
-their VP9/WebP counterpart.
+−60%), stills −26%, and animated GIFs −86% on live action (synthetic and
+graphic anims −79…−92%, riding above parity) — all within ±0.005 SSIM of
+their VP9/WebP counterpart on real content.
 
 ## Alpha and chroma
 
@@ -63,7 +69,11 @@ Each step measured to pay for its time like the VP9/WebP ones:
 - Stills use `usage=allintra` + `still-picture` at speeds 6/4/2 (speed 7
   measured the same wall time as 6 for −.008 SSIM — a strictly worse
   point; avifenc defaults to speed 6 — the webify default digs one step
-  deeper).
+  deeper). `--fast` stills and animations also ride the CRF 4 lower: the
+  WebP side's fast settings cost bytes but not quality, while libaom's
+  faster speeds drop real photographic detail at the same CRF — the fast
+  look needs the bits back (measured on real-content fixtures,
+  doc/next-calibration.md).
 
 ## No film grain synthesis
 

@@ -50,8 +50,9 @@ file arguments):
 - `--next` — output AV1/Opus WebM and AVIF (animated GIF → animated AVIF)
   instead. `-q` buys the *same look* as the default formats — every
   mapping is an equal-SSIM fit — so `--next` only changes the file size:
-  measured at the defaults, video −28%, stills −26%, animated GIFs −96%,
-  all within ±0.005 SSIM. Everything stays 8-bit 4:2:0, i.e. AV1 Main
+  measured at the defaults, video −28%, stills −26%, animated GIFs −86%
+  on live action (synthetic/graphic anims −79…−92%, riding above parity),
+  all within ±0.005 SSIM on real content. Everything stays 8-bit 4:2:0, i.e. AV1 Main
   profile end-to-end — the one profile hardware decoders reliably
   implement. Details and caveats: [doc/next.md](doc/next.md).
 - `--legacy` — output H.264/AAC MP4 (real `+faststart`) and lossless

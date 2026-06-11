@@ -37,8 +37,14 @@ Fixtures (diversity matters — the equal point moves a lot by content):
 - `grad`: smooth multi-color gradients (banding probe).
 - `graphic`: flat single-color icon (degenerate case).
 - `vid1`/`vid2`: 6 s 720p x264-crf12 masters of mandelbrot / testsrc2.
+- `vid5`: 6 s live-action Tears of Steel segment (`fixtures/tos.mp4`, a
+  fixtures-v1 release asset, 1280x534) re-mastered at crf 12 — faces, low light
+  and film grain, the content class the synthetic fixtures miss (added
+  2026-06-11, after the Kodak stills exposed how far grain moves the
+  equal point).
 - `vid1.gif`/`vid2.gif`: 3 s 320x240 10 fps sierra2_4a-dithered GIFs of the
-  same — typical GIF material.
+  same — typical GIF material; `vid5.gif` is the same pipeline on the
+  live-action segment (real-content GIF).
 - `alphagrad`: photo + radial alpha gradient.
 
 ## Stills: WebP -> AVIF (4:2:0, allintra, cpu-used 4)
@@ -66,6 +72,17 @@ middle of the scale and wrong at both ends (q0 mapped to crf 63, far below
 WebP q0's quality floor; q95 mapped to 18 where parity needs ~12).
 Validation at the shipped curve: photos land 0–.005 SSIM *below* WebP at
 −20…37% bytes; mandel/chart at parity, −26…59%.
+
+The Kodak fixtures (2026-06-11) re-measured the photo equal points a
+touch lower — q80: 25.9/23.7 (vs the SRR thumbs' 26.5/25), q90: ~13,
+q95: 7.6/7.6 — with the film-grain portrait (kodim04) the consistent
+outlier: −.0185 at the shipped default crf, the same family as the
+mandel saturation case (libaom smooths grain SSIM penalizes; grain
+synthesis was removed on purpose). The curve stays: closing kodim04's
+gap needs ~4 CRF steps globally, overspending on every other still for
+quality the bias rule says not to buy. Documented as the photographic
+extreme; the per-q means sit at −.0058/−.0057, a hair under the band
+edge, entirely from that one fixture.
 
 Notes per content extreme:
 
@@ -123,25 +140,52 @@ CRF (cpu-used 3: +1% bytes/1.2x time; 2: +0.8%/3.4x; arnr-max-frames 15:
 +0.3%) — `--best` keeps default encoder settings, its win is the piped-
 input spool for a universal two-pass.
 
+The fast tier has no speed headroom either (measured 2026-06-11, at the
+shipped thread/tile counts and caps): `good` usage *accepts* cpu-used 7–8
+but silently clamps them — outputs at 6/7/8 are byte-identical on every
+fixture — and `realtime` usage is 4–9x faster (vid1 8.1 s -> 0.92 s) at a
+catastrophic −.028…−.075 SSIM with *bigger* files on synthetic content
+(vid2 −.063 at +6% bytes). No CRF re-fit recovers that: realtime strips
+the RD tools that produce `--next`'s size win, so cpu-used 6 single-pass
+stays the fast ceiling.
+
 ## Animations: animated WebP -> animated AVIF
 
 Animated WebP is far weaker than stills WebP, so the equal point sits much
-higher than the stills curve:
+higher than the stills curve — but the 2026-06-11 re-fit with the
+live-action fixture (`vid5.gif`) showed the equal point also spreads
+enormously by content (dense AVIF ladder crf 63→24 via `-q` inversion,
+WebP baselines at q 50/65/80/95):
 
-| q (internal) | vid1.gif | vid2.gif | shipped |
-|---|---|---|---|
-| <= 50 | >63 (capped) | >63 | 63 |
-| 80    | ~54          | ~59 | 56 |
-| 95    | flat/uncertain | ~51 | 32 |
+| q (internal) | vid1.gif | vid2.gif | vid5.gif (live action) | shipped |
+|---|---|---|---|---|
+| 50 | 62.2 | 61.6 | 50.8  | 52 |
+| 65 | 58.2 | 60.9 | 45.2  | 44 |
+| 80 | 48.6 | 60.0 | 33.3  | 36 |
+| 95 | 32.0 | 52.9 | <24 (~9 extrapolated) | 18 |
 
-    q <= 50: crf = 63
-    q <= 80: crf = 63 - (q - 50) * 7/30
-    q >  80: crf = 56 - 1.60 * (q - 80)
+A mean fit (the first shipped curve, 63 → 56@q80 → 32@q95, fitted on the
+synthetics alone) left live action **−.055 SSIM below** animated WebP at
+the default q — the −96% size win partly paid back as visible quality
+loss on faces. And the trade is lopsided: AVIF's size win is so large
+that even tracking the *live-action* equal points keeps every synthetic
+anim at 0.08–0.27x of animated WebP. So the curve now follows vid5,
+letting graphics overdeliver:
 
-At default q: vid1 .9026 vs WebP .9060 (slightly lower ✓) at **6.0 KB vs
-226 KB (−97%)**; vid2 well above parity at −96%. The old shared-stills
-mapping (crf 25) overdelivered hugely (+.02…+.12 SSIM) — that surplus is
-now returned as bytes.
+    q <= 80: crf = min(63, 78.7 - 0.533*q)   (hits the 63 ceiling below q ~29)
+    q >  80: crf = 36 - 1.20 * (q - 80)
+    --fast: 4 lower (not under the 63 ceiling): cpu-used 6 loses ~.0045
+            SSIM to the default speed at the same CRF on live action,
+            while animated WebP's -m 4 fast tier loses nothing — the
+            fast look needs the bits back (measured back in band)
+
+Validation (vs animated WebP at the same q and tier): live action lands
+in band at q 50/65/80 (−.0034/+.0030/−.0043, fast −.0033 at the default)
+at 0.11–0.15x the bytes; only q 95 stays −.013 below — its equal point
+sits beyond the curve's reach and chasing it (~crf 9, extrapolated)
+would triple the bytes for the last sliver. Synthetics now ride +.02…+.09
+*above* parity at 0.08–0.27x (−79…−92%; the headline anim shrink is
+−86% on live action at the default q, was −96% under the synthetic fit).
 
 The animated-WebP side itself was audited against `gif2webp` (Google's
 reference tool) at identical settings (`-lossy -q 80 -m 6`) on suspicion
@@ -166,8 +210,29 @@ trivial sizes, same family as the gradient-stills case).
 allintra cpu-used ladder at fixed crf (photo, host libaom): 4 = .9666/0.17s,
 5 = .9649/0.14s, 6 = .9610/0.08s, **7 = .9537/0.07s**, 8 = .9525/0.07s.
 Speed 7 is a strictly bad point (same time as 6, −.008 SSIM) and broke fast-
-tier parity (−.021 vs WebP-fast's −.0004). `--fast` stills now use
-**cpu-used 6**.
+tier parity (−.021 vs WebP-fast's −.0004), so `--fast` stills first
+shipped **cpu-used 6**.
+
+Speed 8 re-measured with the *shipped binary* (2026-06-11) looked ~2x
+faster than 6 at −.002 SSIM and briefly shipped — but that was synthetic
+fixtures only, and the Kodak real-photo fixtures sank it the same day:
+−.018…−.038 vs WebP-fast on photographic content (grain and skin detail
+are exactly what the shallower search drops). Reverting to speed 6 was
+not enough either — photos still measured −.011…−.025 (the old "−.0004
+fast parity" was a synthetic-only number; this tier had simply never
+seen a photo). **Shipped: `--fast` stills run cpu-used 6 with the CRF 4
+lower** (cwebp's -m 4 fast tier costs bytes, not quality, so the AVIF
+side must return the speed loss as bits — the same shape as the anim
+fast offset). Validated mean −.0001, every fixture within ±.005
+(photo2d, the film-grain extreme, right at the edge: −.0049); photos
+0.69–0.78x of webpf, ~20% more bytes than the unoffset tier paid. The
+alpha aux encoder is untouched: its `--fast` already runs speed 7, and
+at crf 0 speed moves bytes, not look.
+
+The `--best` end was laddered too (2026-06-11, fixed crf 28, shipped
+thread counts): speed 1 buys −0.5% bytes for up to 2.4x the time, speed 0
+−0.3…−1.8% for 3.5–3.8x, SSIM flat — the same shape as x264's rejected
+placebo preset. `--best` stills stay at cpu-used 2.
 
 ## Alpha
 
@@ -202,10 +267,16 @@ range for video; below stills-crf 16 use a scratch build with factor 1.0.
 
 `calibrate.sh` (repo root) automates the whole sweep: it regenerates the
 fixture matrix (including the documented content extremes), encodes
-baseline + `--next` + `--legacy` through the shipped binary in parallel
-with caching, referees everything with RGB SSIM, and prints the parity
-tables. Supply real photos via `PHOTOS=` — the synthetic fixtures alone do
-not represent photographic content. Note the fixtures it generates are
+baseline + `--next` + `--legacy` — at all three effort tiers by default
+(`TIERS` knob), so the tier offsets above are validated against the
+same-tier baseline — through the shipped binary in parallel with caching,
+referees everything with RGB SSIM, and prints the parity tables (one per
+content type and tier). Real photos ride `PHOTOS=` — the synthetic
+fixtures alone do not represent photographic content; it defaults to the
+pinned Kodak True Color pair in `fixtures/` (kodim23 parrots, kodim04
+portrait — the latter's film grain is the hard case for libaom). All
+real-content fixtures are sha256-pinned assets of the `fixtures-v1`
+GitHub Release, auto-fetched by the harness (`./fixtures.sh`). Note the fixtures it generates are
 *equivalent*, not byte-identical, to the 2026-06-10 originals (the GIF and
 chart masters measurably differ), so compare its output against a baseline
 run recorded with the same fixtures, not against the absolute numbers in

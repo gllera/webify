@@ -114,7 +114,6 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mastering_display_metadata.h>
-#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
 }
@@ -173,6 +172,12 @@ static void progress_tick(double t)
         fprintf(stderr, "\r%s %3d%%", prog.label, pct);
         prog.pct = pct;
     }
+}
+
+static void progress_start(const char *label)
+{
+    prog.label = label;
+    prog.pct   = -1; /* the first tick always prints */
 }
 
 static void progress_done(void)
@@ -337,6 +342,12 @@ static int probe_is_image(const AVInputFormat *fmt, const uint8_t *buf, int size
     return 0;
 }
 
+/* the ffmpeg-CLI "pipe:" URL convention (main maps '-' onto it) */
+static int is_pipe(const char *path)
+{
+    return !strncmp(path, "pipe:", 5);
+}
+
 static int write_all(int fd, const uint8_t *p, size_t n)
 {
     while (n > 0) {
@@ -414,6 +425,15 @@ static int drain_file_to_stdout(const char *path)
     return ret;
 }
 
+/* open a demuxer on a custom avio context (the stdin paths) */
+static int open_with_pb(AVFormatContext **ifmt, AVIOContext *pb)
+{
+    if (!(*ifmt = avformat_alloc_context()))
+        return AVERROR(ENOMEM);
+    (*ifmt)->pb = pb;
+    return avformat_open_input(ifmt, "", NULL, NULL);
+}
+
 static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io)
 {
     uint8_t *iobuf;
@@ -480,10 +500,7 @@ static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO
         av_free(iobuf);
         return AVERROR(ENOMEM);
     }
-    if (!(*ifmt = avformat_alloc_context()))
-        return AVERROR(ENOMEM);
-    (*ifmt)->pb = io->pb;
-    return avformat_open_input(ifmt, "", NULL, NULL);
+    return open_with_pb(ifmt, io->pb);
 }
 
 static void close_stdin_io(StdinIO *io)
@@ -650,6 +667,19 @@ static double codec_weight(enum AVCodecID id)
     }
 }
 
+/* tile-columns log2 follows Google's VOD table by output width; threads run
+ * at double the column count, which row-mt keeps busy:
+ * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
+static int width_tlog(int w)
+{
+    return w >= 2560 ? 3 : w >= 1280 ? 2 : w >= 512 ? 1 : 0;
+}
+
+static int width_threads(int w)
+{
+    return 2 << width_tlog(w);
+}
+
 /* the source video/audio rates measured during the stats pass (bits/s,
  * 0 = not measured): the stats pass reads every packet anyway, so it
  * counts the truth. Single-pass tiers (--fast, --legacy) never measure
@@ -730,6 +760,28 @@ static int frame_has_real_alpha(const AVFrame *fr)
     return 0;
 }
 
+/* the source's peak brightness from HDR metadata payloads, in the 100-nit
+ * units the tonemap chain wants: MaxCLL when present, else the mastering
+ * display's max luminance, else 0 (the caller picks the fallback) */
+static double peak_from_metadata(const uint8_t *cll, const uint8_t *mdm)
+{
+    if (cll && ((const AVContentLightMetadata *)cll)->MaxCLL > 0)
+        return ((const AVContentLightMetadata *)cll)->MaxCLL / 100.0;
+    if (mdm && ((const AVMasteringDisplayMetadata *)mdm)->has_luminance)
+        return av_q2d(((const AVMasteringDisplayMetadata *)mdm)
+                      ->max_luminance) / 100.0;
+    return 0;
+}
+
+/* a stream's coded (container-level) side data payload, NULL when absent */
+static const uint8_t *coded_sd(const AVStream *st, enum AVPacketSideDataType t)
+{
+    const AVPacketSideData *sd =
+        av_packet_side_data_get(st->codecpar->coded_side_data,
+                                st->codecpar->nb_coded_side_data, t);
+    return sd ? sd->data : NULL;
+}
+
 /* EXIF rotation and HDR peak brightness (SEI) only surface as side data of a
  * *decoded frame*, and the filter graph (with its transpose/tonemap steps)
  * must exist before frames flow; so when the input can rewind — images
@@ -748,10 +800,7 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
     AVFrame *fr = av_frame_alloc();
     int ret, flushed = 0, frames = 0;
 
-    peeked.set      = 0;
-    peeked.peak     = 0;
-    peeked.animated = 0;
-    peeked.alpha    = 0;
+    peeked = {};
     if (!pkt || !fr || open_decoder(ifmt, vidx, &dec) < 0)
         goto end;
     for (;;) {
@@ -767,22 +816,20 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
         if (ret < 0)
             break;
         while (avcodec_receive_frame(dec, fr) >= 0) {
-            const AVFrameSideData *sd =
-                av_frame_get_side_data(fr, AV_FRAME_DATA_DISPLAYMATRIX);
-
             if (++frames == 1) {
+                const AVFrameSideData *sd =
+                    av_frame_get_side_data(fr, AV_FRAME_DATA_DISPLAYMATRIX);
+                const AVFrameSideData *cll =
+                    av_frame_get_side_data(fr, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+                const AVFrameSideData *mdm =
+                    av_frame_get_side_data(fr, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+
                 if (sd && sd->size >= 9 * sizeof(int32_t)) {
                     memcpy(peeked.m, sd->data, sizeof(peeked.m));
                     peeked.set = 1;
                 }
-                if ((sd = av_frame_get_side_data(fr, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) &&
-                    ((const AVContentLightMetadata *)sd->data)->MaxCLL > 0)
-                    peeked.peak =
-                        ((const AVContentLightMetadata *)sd->data)->MaxCLL / 100.0;
-                else if ((sd = av_frame_get_side_data(fr, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) &&
-                         ((const AVMasteringDisplayMetadata *)sd->data)->has_luminance)
-                    peeked.peak = av_q2d(((const AVMasteringDisplayMetadata *)
-                                          sd->data)->max_luminance) / 100.0;
+                peeked.peak = peak_from_metadata(cll ? cll->data : NULL,
+                                                 mdm ? mdm->data : NULL);
             }
             if (detect_anim && !peeked.alpha && frame_has_real_alpha(fr))
                 peeked.alpha = 1;
@@ -816,6 +863,31 @@ static int input_is_image(const AVFormatContext *ifmt, int vidx, int aidx)
            !strncmp(ifmt->iformat->name, "mov,", 4);
 }
 
+/* one frame in -> the encoder's single output packet (flushing it) */
+static int encode_full(AVCodecContext *enc, AVFrame *frame, AVPacket *out)
+{
+    int ret = avcodec_send_frame(enc, frame);
+
+    if (ret >= 0)
+        ret = avcodec_send_frame(enc, NULL);
+    if (ret < 0 && ret != AVERROR_EOF)
+        return ret;
+    return avcodec_receive_packet(enc, out);
+}
+
+/* the geometry/timing/flags fields every secondary encoder inherits from an
+ * already-configured one (the AV1 priming clone, the AVIF alpha encoder,
+ * the still-race re-encodes); callers override what genuinely differs */
+static void copy_enc_geometry(AVCodecContext *dst, const AVCodecContext *src)
+{
+    dst->width               = src->width;
+    dst->height              = src->height;
+    dst->pix_fmt             = src->pix_fmt;
+    dst->time_base           = src->time_base;
+    dst->sample_aspect_ratio = src->sample_aspect_ratio;
+    dst->flags               = src->flags;
+}
+
 /* libaom only delivers the AV1 sequence header alongside its first encoded
  * packet (aomedia bug #2208), but the webm muxer writing to a pipe needs it
  * in CodecPrivate when the header goes out — seekable outputs get
@@ -840,17 +912,13 @@ static void prime_av1_extradata(const AVCodecContext *base, const AVCodec *codec
     *extra_size = 0;
     if (!c || !fr || !pkt)
         goto end;
-    c->width               = base->width;
-    c->height              = base->height;
-    c->pix_fmt             = base->pix_fmt;
-    c->time_base           = base->time_base;
-    c->framerate           = base->framerate;
-    c->sample_aspect_ratio = base->sample_aspect_ratio;
-    c->bit_rate            = base->bit_rate;
-    c->rc_max_rate         = base->rc_max_rate;
-    c->gop_size            = base->gop_size;
-    c->thread_count        = base->thread_count;
-    c->flags               = AV_CODEC_FLAG_GLOBAL_HEADER; /* no pass flags */
+    copy_enc_geometry(c, base);
+    c->framerate    = base->framerate;
+    c->bit_rate     = base->bit_rate;
+    c->rc_max_rate  = base->rc_max_rate;
+    c->gop_size     = base->gop_size;
+    c->thread_count = base->thread_count;
+    c->flags        = AV_CODEC_FLAG_GLOBAL_HEADER; /* no pass flags */
     if (avcodec_open2(c, codec, &opts) < 0)
         goto end;
     fr->format = c->pix_fmt;
@@ -862,8 +930,7 @@ static void prime_av1_extradata(const AVCodecContext *base, const AVCodec *codec
     memset(fr->data[0], 16,  (size_t)fr->linesize[0] * fr->height);
     memset(fr->data[1], 128, (size_t)fr->linesize[1] * ((fr->height + 1) / 2));
     memset(fr->data[2], 128, (size_t)fr->linesize[2] * ((fr->height + 1) / 2));
-    if (avcodec_send_frame(c, fr) < 0 || avcodec_send_frame(c, NULL) < 0 ||
-        avcodec_receive_packet(c, pkt) < 0)
+    if (encode_full(c, fr, pkt) < 0)
         goto end;
     sd = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &sd_size);
     if (!sd && c->extradata_size > 0) {
@@ -882,17 +949,25 @@ end:
     av_dict_free(&opts);
 }
 
-/* image != 0 selects the WebP pipeline: no scaling, alpha kept, libwebp.
- * pass 0 = single-pass video; pass 1 = stats-gathering run (ofmt is NULL, no
- * output stream is created); pass 2 = final encode driven by `stats`. */
-/* the calibrated still-image AVIF CRF for the current -q: equal-SSIM fit
- * against the WebP pipeline, near-linear to q 80 then diving with cwebp's
- * premium top end (see the mapping comment in init_video and
- * doc/next-calibration.md). */
-static int avif_still_crf(void)
+/* -q with the image pipelines' default applied (cwebp's 80) */
+static double image_quality(void)
 {
-    double q = opt.quality < 0 ? 80.0 : opt.quality;
+    return opt.quality < 0 ? 80.0 : opt.quality;
+}
+
+/* the calibrated still-image AVIF CRF for a -q: equal-SSIM fit against the
+ * WebP pipeline, near-linear to q 80 then diving with cwebp's premium top
+ * end (see the mapping comment in init_video and doc/next-calibration.md).
+ * --fast rides 4 lower: cwebp's quick settings (-m 4) cost bytes but not
+ * quality, while allintra cpu-used 6 drops ~.01-.02 SSIM on photographic
+ * detail at the same CRF — the fast look needs the bits back (measured on
+ * the Kodak fixtures; synthetic content never showed it). */
+static int avif_still_crf(double q)
+{
     double c = q <= 80 ? 52.0 - 0.30 * q : 28.0 - 1.10 * (q - 80.0);
+
+    if (opt.effort < 0)
+        c -= 4.0;
     return (int)lrint(FFMAX(c, 0.0));
 }
 
@@ -927,19 +1002,37 @@ static int legacy_video_crf(int vp9crf)
     return av_clip(c, 0, 51);
 }
 
+/* one output stream mirroring an opened encoder: parameters copied, the
+ * encoder's time base kept, the stream index returned */
+static int add_stream(AVFormatContext *ofmt, const AVCodecContext *enc, int *index)
+{
+    AVStream *ost = avformat_new_stream(ofmt, NULL);
+    int ret;
+
+    if (!ost)
+        return AVERROR(ENOMEM);
+    if ((ret = avcodec_parameters_from_context(ost->codecpar, enc)) < 0)
+        return ret;
+    ost->time_base = enc->time_base;
+    *index = ost->index;
+    return 0;
+}
+
+/* image != 0 selects the WebP pipeline: no scaling, alpha kept, libwebp.
+ * pass 0 = single-pass video; pass 1 = stats-gathering run (ofmt is NULL, no
+ * output stream is created); pass 2 = final encode driven by `stats`. */
 static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                       int stream_index, int image, int pass, const char *stats)
 {
     AVStream *ist = ifmt->streams[stream_index];
     AVRational sar;
     const AVCodec *codec;
-    AVStream *ost;
     AVDictionary *opts = NULL, *primeopts = NULL;
     const AVPacketSideData *psd;
     const int32_t *mat = NULL;
     uint8_t *extra = NULL;
     char args[512], spec[768], scale[256] = "", rotate[40], tonemap[256] = "";
-    int ret, rgb = 0, hdr = 0, alpha = 0, extra_size = 0;
+    int ret, rgb = 0, hdr, alpha = 0, extra_size = 0;
     int maxw = opt.max_w, maxh = opt.max_h;
 
     p->in_index = stream_index;
@@ -1020,22 +1113,12 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
              * of the input ourselves: the peeked first frame (in-stream
              * SEI), the container (mkv/mp4 boxes), or assume the typical
              * 1000-nit master. */
-            const AVPacketSideData *sd;
             double peak = peeked.peak;
 
-            if (peak <= 0 &&
-                (sd = av_packet_side_data_get(ist->codecpar->coded_side_data,
-                                              ist->codecpar->nb_coded_side_data,
-                                              AV_PKT_DATA_CONTENT_LIGHT_LEVEL)) &&
-                ((const AVContentLightMetadata *)sd->data)->MaxCLL > 0)
-                peak = ((const AVContentLightMetadata *)sd->data)->MaxCLL / 100.0;
-            if (peak <= 0 &&
-                (sd = av_packet_side_data_get(ist->codecpar->coded_side_data,
-                                              ist->codecpar->nb_coded_side_data,
-                                              AV_PKT_DATA_MASTERING_DISPLAY_METADATA)) &&
-                ((const AVMasteringDisplayMetadata *)sd->data)->has_luminance)
-                peak = av_q2d(((const AVMasteringDisplayMetadata *)
-                               sd->data)->max_luminance) / 100.0;
+            if (peak <= 0)
+                peak = peak_from_metadata(
+                    coded_sd(ist, AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
+                    coded_sd(ist, AV_PKT_DATA_MASTERING_DISPLAY_METADATA));
             if (peak <= 0)
                 peak = 10.0;
 
@@ -1068,16 +1151,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
 
     /* libwebp_anim writes stills too and is needed for animated GIF -> WebP */
-    codec = avcodec_find_encoder_by_name(
+    const char *enc_name =
             opt.legacy ? (!image ? "libx264" : peeked.animated ? "apng" : "png")
             : opt.next ? "libaom-av1"
-            : image    ? "libwebp_anim" : "libvpx-vp9");
+            : image    ? "libwebp_anim" : "libvpx-vp9";
+
+    codec = avcodec_find_encoder_by_name(enc_name);
     if (!codec && image && !opt.next && !opt.legacy)
-        codec = avcodec_find_encoder_by_name("libwebp");
+        codec = avcodec_find_encoder_by_name(enc_name = "libwebp");
     if (!codec) {
         av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n",
-               opt.legacy ? (image ? "png" : "libx264")
-               : opt.next ? "libaom-av1" : image ? "libwebp" : "libvpx-vp9");
+               enc_name);
         return AVERROR_ENCODER_NOT_FOUND;
     }
     if (!(p->enc = avcodec_alloc_context3(codec)))
@@ -1137,25 +1221,33 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * the data). Stills track cwebp's scale: near-linear up to q 80,
          * then cwebp's top end buys disproportionate quality and the crf
          * has to dive (q 80 -> crf 28, q 95 -> 12, q 100 -> 6). Animations
-         * get their own much-higher curve: animated WebP is far weaker than
-         * stills WebP, so AVIF matches it from crf 63 (q <= 50) easing to
-         * 56 at q 80 and 32 at q 95 — measured -96% bytes at equal SSIM on
-         * dithered GIFs. bit_rate 0 selects pure constant-quality mode — no
-         * rate caps, like the WebP side. */
-        double q   = opt.quality < 0 ? 80.0 : opt.quality;
+         * get their own much-higher curve — animated WebP is far weaker
+         * than stills WebP — but its equal point spreads enormously by
+         * content (q 80: live action crf 33, dithered noise 49, synthetic
+         * graphics 60), so the curve tracks the *live-action* equal points
+         * (52 at q 50 -> 36 at q 80 -> 18 at q 95, ceiling 63 below
+         * q ~29): a mean fit would pay the size win back as visible loss
+         * on faces, while graphics merely overdeliver at sizes that stay
+         * under ~0.2x of animated WebP anyway (-79..-89% at the default
+         * -q, was -96% under the old synthetic-only fit). */
+        double q   = image_quality();
         int    crf = peeked.animated
-                   ? (int)lrint(q <= 50 ? 63.0
-                              : q <= 80 ? 63.0 - (q - 50.0) * (7.0 / 30.0)
-                                        : 56.0 - 1.60 * (q - 80.0))
-                   : avif_still_crf();
-        int   tlog = p->enc->width >= 2560 ? 3 : p->enc->width >= 1280 ? 2
-                   : p->enc->width >= 512  ? 1 : 0;
-        char crfs[16];
+                   ? (int)lrint(q <= 80 ? FFMIN(63.0, 78.7 - 0.533 * q)
+                                        : 36.0 - 1.20 * (q - 80.0))
+                   : avif_still_crf(q);
 
-        snprintf(crfs, sizeof(crfs), "%d", crf);
+        /* anim --fast rides 4 CRF lower: cpu-used 6 loses ~.0045 SSIM to
+         * the default speed at the same CRF on live action, but animated
+         * WebP's fast tier loses nothing (-m 4 only costs bytes), so the
+         * fast look needs the bits back (-4 measured back in band). Not
+         * under the 63 ceiling though — there the default tier already
+         * sits below parity on purpose. */
+        if (peeked.animated && opt.effort < 0 && crf < 63)
+            crf = FFMAX(crf - 4, 0);
+
         p->enc->bit_rate     = 0;
-        p->enc->thread_count = 2 << tlog; /* same width table as video */
-        av_dict_set(&opts, "crf", crfs, 0);
+        p->enc->thread_count = width_threads(p->enc->width);
+        av_dict_set_int(&opts, "crf", crf, 0);
         av_dict_set(&opts, "row-mt", "1", 0);
         if (peeked.animated) {
             /* animated GIF -> animated AVIF (the muxer's 'avis' brand),
@@ -1170,9 +1262,12 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             /* encoder effort (allintra speed 0-9): avifenc defaults to
              * speed 6; webify's default digs deeper — files are downloaded
              * many times — --fast matches the quick end, --best the
-             * slowest practical search. --fast stops at 6: speed 7 measured
-             * the same wall time as 6 but -.008 SSIM (a strictly worse
-             * point), while 6 stays within WebP's own fast-tier drop */
+             * slowest practical search. --fast briefly ran speed 8 (~2x
+             * faster than 6, -.002 SSIM on synthetic fixtures) but real
+             * photos sank it: -.018..-.038 vs WebP-fast on the Kodak
+             * fixtures — grain and skin detail are exactly what the
+             * shallower search drops — so 6 is the fast ceiling that
+             * holds the parity band (doc/next-calibration.md). */
             av_dict_set(&opts, "usage", "allintra", 0); /* like avifenc */
             av_dict_set(&opts, "still-picture", "1", 0);
             av_dict_set(&opts, "cpu-used", opt.effort < 0 ? "6"
@@ -1181,7 +1276,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     } else if (image) {
         char q[32];
 
-        snprintf(q, sizeof(q), "%g", opt.quality < 0 ? 80.0 : opt.quality);
+        snprintf(q, sizeof(q), "%g", image_quality());
         av_dict_set(&opts, "quality", q, 0); /* default matches cwebp's 80 */
         /* cwebp's -m 6: best compression the format allows, worth the extra
          * encode time for files that are downloaded many times. --fast
@@ -1232,12 +1327,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                  * exp2((33 - crf) / 6.0);
         double  ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
         int64_t src  = source_video_rate(ifmt, stream_index);
-        /* tiles follow Google's VOD table by output width; threads run at
-         * double its column, which row-mt keeps busy:
-         * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
-        int tlog = p->enc->width >= 2560 ? 3 : p->enc->width >= 1280 ? 2
-                 : p->enc->width >= 512  ? 1 : 0;
-        char crfs[16], tiles[4];
+        int     tlog = width_tlog(p->enc->width);
 
         if (ofps > 30)
             f *= pow(ofps / 30.0, 0.75);
@@ -1264,20 +1354,21 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             p->enc->rc_buffer_size =
                 (int)FFMIN(2 * p->enc->rc_max_rate, INT_MAX);
         p->enc->gop_size     = 240;
-        p->enc->thread_count = 2 << tlog;
+        p->enc->thread_count = width_threads(p->enc->width);
         if (opt.legacy) /* remapped last: the budget above tracks the look
                          * (the VP9-scale CRF), not x264's number for it */
             crf = legacy_video_crf(crf);
-        snprintf(crfs, sizeof(crfs), "%d", crf);
-        snprintf(tiles, sizeof(tiles), "%d", tlog);
-        av_dict_set(&opts, "crf", crfs, 0);
+        av_dict_set_int(&opts, "crf", crf, 0);
         if (!opt.legacy) {
             av_dict_set(&opts, "row-mt", "1", 0);
-            av_dict_set(&opts, "tile-columns", tiles, 0);
+            av_dict_set_int(&opts, "tile-columns", tlog, 0);
         }
         /* encoder effort by tier — each step has to pay for its time:
          * --fast cpu-used 4 (Google's stats-pass speed, ~4x faster than
-         * the default), default cpu-used 1 (Google's VOD setting), --best
+         * the default; cpu-used 5 measured *strictly worse* at webify's
+         * tile/thread counts — 1.5-1.8x slower than 4, -.002 SSIM, +1%
+         * bytes — so 4 is the fast ceiling that pays), default cpu-used 1
+         * (Google's VOD setting), --best
          * cpu-used 0 + longer alt-ref noise reduction (together measured
          * 1-7% smaller at equal-or-better SSIM, ~75% more time; deadline
          * "best" was measured 5x slower for -0.06% and rejected). The
@@ -1337,15 +1428,11 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
 
         if (!(p->enc_a = avcodec_alloc_context3(codec)))
             return AVERROR(ENOMEM);
-        p->enc_a->width               = p->enc->width;
-        p->enc_a->height              = p->enc->height;
-        p->enc_a->pix_fmt             = AV_PIX_FMT_GRAY8; /* monochrome AV1 —
-                                         the muxer wants one plane here */
-        p->enc_a->time_base           = p->enc->time_base;
-        p->enc_a->sample_aspect_ratio = p->enc->sample_aspect_ratio;
-        p->enc_a->thread_count        = p->enc->thread_count;
-        p->enc_a->bit_rate            = 0;
-        p->enc_a->flags               = p->enc->flags;
+        copy_enc_geometry(p->enc_a, p->enc);
+        p->enc_a->pix_fmt      = AV_PIX_FMT_GRAY8; /* monochrome AV1 — the
+                                         muxer wants one plane here */
+        p->enc_a->thread_count = p->enc->thread_count;
+        p->enc_a->bit_rate     = 0;
         /* alpha is full-range by definition (MIAF), and decoders assume so:
          * left at the limited-range default the bitstream says "tv" and
          * libavif-class decoders stretch 16-235 to 0-255, distorting every
@@ -1377,25 +1464,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     p->prog = !image;
 
     if (ofmt) {
-        if (!(ost = avformat_new_stream(ofmt, NULL)))
-            return AVERROR(ENOMEM);
-        if ((ret = avcodec_parameters_from_context(ost->codecpar, p->enc)) < 0)
+        if ((ret = add_stream(ofmt, p->enc, &p->out_index)) < 0)
             return ret;
         if (extra) { /* the primed AV1 sequence header (see above) */
-            ost->codecpar->extradata      = extra;
-            ost->codecpar->extradata_size = extra_size;
+            AVCodecParameters *par = ofmt->streams[p->out_index]->codecpar;
+
+            par->extradata      = extra;
+            par->extradata_size = extra_size;
             extra = NULL;
         }
-        ost->time_base = p->enc->time_base;
-        p->out_index = ost->index;
-        if (p->enc_a) {
-            if (!(ost = avformat_new_stream(ofmt, NULL)))
-                return AVERROR(ENOMEM);
-            if ((ret = avcodec_parameters_from_context(ost->codecpar, p->enc_a)) < 0)
-                return ret;
-            ost->time_base = p->enc_a->time_base;
-            p->out_index_a = ost->index;
-        }
+        if (p->enc_a && (ret = add_stream(ofmt, p->enc_a, &p->out_index_a)) < 0)
+            return ret;
     }
 
     return alloc_pipe_buffers(p);
@@ -1406,7 +1485,6 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
 {
     AVStream *ist = ifmt->streams[stream_index];
     const AVCodec *codec;
-    AVStream *ost;
     char args[512], layout[128], spec[128];
     int ret, mono;
 
@@ -1431,10 +1509,12 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
 
     /* --legacy pairs the MP4 with FFmpeg's native AAC encoder */
-    codec = avcodec_find_encoder_by_name(opt.legacy ? "aac" : "libopus");
+    const char *enc_name = opt.legacy ? "aac" : "libopus";
+
+    codec = avcodec_find_encoder_by_name(enc_name);
     if (!codec) {
         av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n",
-               opt.legacy ? "aac" : "libopus");
+               enc_name);
         return AVERROR_ENCODER_NOT_FOUND;
     }
     if (!(p->enc = avcodec_alloc_context3(codec)))
@@ -1477,14 +1557,19 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     /* opus consumes fixed-size frames; let the sink chunk them for us */
     av_buffersink_set_frame_size(p->sink, p->enc->frame_size);
 
-    if (!(ost = avformat_new_stream(ofmt, NULL)))
-        return AVERROR(ENOMEM);
-    if ((ret = avcodec_parameters_from_context(ost->codecpar, p->enc)) < 0)
+    if ((ret = add_stream(ofmt, p->enc, &p->out_index)) < 0)
         return ret;
-    ost->time_base = p->enc->time_base;
-    p->out_index = ost->index;
 
     return alloc_pipe_buffers(p);
+}
+
+/* tag, rescale and hand one encoded packet to the muxer's interleaver */
+static int write_packet(AVFormatContext *ofmt, AVPacket *pkt,
+                        AVRational enc_tb, int out_index)
+{
+    pkt->stream_index = out_index;
+    av_packet_rescale_ts(pkt, enc_tb, ofmt->streams[out_index]->time_base);
+    return av_interleaved_write_frame(ofmt, pkt);
 }
 
 /* frame == NULL flushes the encoder */
@@ -1504,10 +1589,7 @@ static int encode_one(AVFormatContext *ofmt, Pipe *p, AVCodecContext *enc,
             av_packet_unref(p->enc_pkt);
             continue;
         }
-        p->enc_pkt->stream_index = out_index;
-        av_packet_rescale_ts(p->enc_pkt, enc->time_base,
-                             ofmt->streams[out_index]->time_base);
-        if ((ret = av_interleaved_write_frame(ofmt, p->enc_pkt)) < 0)
+        if ((ret = write_packet(ofmt, p->enc_pkt, enc->time_base, out_index)) < 0)
             return ret;
     }
 }
@@ -1630,33 +1712,31 @@ static int decode_packet(AVFormatContext *ofmt, Pipe *p, AVPacket *pkt)
     }
 }
 
-/* one frame in -> the encoder's single output packet (flushing it) */
-static int encode_full(AVCodecContext *enc, AVFrame *frame, AVPacket *out)
+/* one-frame re-encode of the held still on a fresh clone of the streaming
+ * context (libwebp's "quality" doubles as the effort dial when lossless) */
+static int reencode_still(Pipe *p, int lossless, double quality, int sharp,
+                          AVPacket *out)
 {
-    int ret = avcodec_send_frame(enc, frame);
+    AVCodecContext *c = avcodec_alloc_context3(p->enc->codec);
+    AVDictionary *opts = NULL;
+    char q[32];
+    int ret = AVERROR(ENOMEM);
 
-    if (ret >= 0)
-        ret = avcodec_send_frame(enc, NULL);
-    if (ret < 0 && ret != AVERROR_EOF)
-        return ret;
-    return avcodec_receive_packet(enc, out);
-}
-
-/* fresh encoder context with the streaming context's geometry, for the
- * one-frame re-encodes of the still race */
-static AVCodecContext *clone_image_enc(const AVCodecContext *base)
-{
-    AVCodecContext *c = avcodec_alloc_context3(base->codec);
-
-    if (!c)
-        return NULL;
-    c->width               = base->width;
-    c->height              = base->height;
-    c->pix_fmt             = base->pix_fmt;
-    c->time_base           = base->time_base;
-    c->sample_aspect_ratio = base->sample_aspect_ratio;
-    c->flags               = base->flags;
-    return c;
+    if (c) {
+        copy_enc_geometry(c, p->enc);
+        snprintf(q, sizeof(q), "%g", quality);
+        if (lossless)
+            av_dict_set(&opts, "lossless", "1", 0);
+        av_dict_set(&opts, "quality", q, 0);
+        av_dict_set(&opts, "compression_level", "6", 0);
+        if (sharp)
+            av_dict_set(&opts, "sharp_yuv", "1", 0);
+        if ((ret = avcodec_open2(c, p->enc->codec, &opts)) >= 0)
+            ret = encode_full(c, p->first, out);
+    }
+    av_dict_free(&opts);
+    avcodec_free_context(&c);
+    return ret;
 }
 
 /* A single-frame RGB image: flat-color graphics often compress smaller as
@@ -1665,8 +1745,6 @@ static AVCodecContext *clone_image_enc(const AVCodecContext *base)
  * (their lossless attempt just comes out bigger and loses the race). */
 static int finish_still(AVFormatContext *ofmt, Pipe *p)
 {
-    AVCodecContext *sy = NULL, *ll = NULL, *hq = NULL;
-    AVDictionary *opts = NULL;
     AVPacket *lossy = av_packet_alloc(), *less = av_packet_alloc();
     AVPacket *best = av_packet_alloc(), *pick;
     int ret;
@@ -1681,56 +1759,26 @@ static int finish_still(AVFormatContext *ofmt, Pipe *p)
      * vendored ffmpeg by patches/0001-*). Stills only: animations would pay
      * a measured ~20% more bytes for it, so the streaming context (p->enc)
      * keeps libwebp's fast converter and confirmed stills re-encode here. */
-    if ((sy = clone_image_enc(p->enc))) {
-        char q[32];
-
-        snprintf(q, sizeof(q), "%g", opt.quality < 0 ? 80.0 : opt.quality);
-        av_dict_set(&opts, "quality", q, 0);
-        av_dict_set(&opts, "compression_level", "6", 0);
-        av_dict_set(&opts, "sharp_yuv", "1", 0);
-        if (avcodec_open2(sy, p->enc->codec, &opts) < 0)
-            avcodec_free_context(&sy); /* fall back to the streaming ctx */
-        av_dict_free(&opts);
-        opts = NULL;
-    }
-    if ((ret = encode_full(sy ? sy : p->enc, p->first, lossy)) < 0)
+    if (reencode_still(p, 0, image_quality(), 1, lossy) < 0 &&
+        (ret = encode_full(p->enc, p->first, lossy)) < 0) /* streaming-ctx
+                                                             fallback */
         goto end;
 
     pick = lossy;
-    if ((ll = clone_image_enc(p->enc))) {
-        av_dict_set(&opts, "lossless", "1", 0);
-        av_dict_set(&opts, "quality", "75", 0); /* = effort when lossless */
-        av_dict_set(&opts, "compression_level", "6", 0);
-        /* a failed lossless attempt is not fatal: the lossy one stands */
-        if (avcodec_open2(ll, p->enc->codec, &opts) >= 0 &&
-            encode_full(ll, p->first, less) >= 0 &&
-            less->size && less->size < lossy->size)
-            pick = less;
-    }
-    if (pick == less && (hq = clone_image_enc(p->enc))) {
+    /* a failed lossless attempt is not fatal: the lossy one stands */
+    if (reencode_still(p, 1, 75, 0, less) >= 0 &&
+        less->size && less->size < lossy->size) {
+        pick = less;
         /* lossless won: re-run the winner at maximum effort (cwebp
          * -lossless -q 100 -m 6) — measured 1-3% smaller for ~20x the
          * lossless encode time, paid only on graphics that already won;
          * photos saw their lossless candidate lose and skip this */
-        av_dict_free(&opts);
-        opts = NULL;
-        av_dict_set(&opts, "lossless", "1", 0);
-        av_dict_set(&opts, "quality", "100", 0); /* = max effort */
-        av_dict_set(&opts, "compression_level", "6", 0);
-        if (avcodec_open2(hq, p->enc->codec, &opts) >= 0 &&
-            encode_full(hq, p->first, best) >= 0 &&
+        if (reencode_still(p, 1, 100, 0, best) >= 0 &&
             best->size && best->size < less->size)
             pick = best;
     }
-    pick->stream_index = p->out_index;
-    av_packet_rescale_ts(pick, p->enc->time_base,
-                         ofmt->streams[p->out_index]->time_base);
-    ret = av_interleaved_write_frame(ofmt, pick);
+    ret = write_packet(ofmt, pick, p->enc->time_base, p->out_index);
 end:
-    av_dict_free(&opts);
-    avcodec_free_context(&sy);
-    avcodec_free_context(&ll);
-    avcodec_free_context(&hq);
     av_packet_free(&lossy);
     av_packet_free(&less);
     av_packet_free(&best);
@@ -1770,8 +1818,7 @@ static int first_pass(AVFormatContext *ifmt, int vidx, int aidx, char **stats)
 
     if (!pkt)
         return AVERROR(ENOMEM);
-    prog.label = "pass 1/2:";
-    prog.pct   = -1;
+    progress_start("pass 1/2:");
     if ((ret = init_video(&p, ifmt, NULL, vidx, 0, 1, NULL)) < 0)
         goto end;
     while ((ret = av_read_frame(ifmt, pkt)) >= 0) {
@@ -1836,10 +1883,7 @@ static int reopen_input(const char *in_path, AVFormatContext **ifmt,
     if (io->pb) {
         if ((pos = avio_seek(io->pb, 0, SEEK_SET)) < 0)
             return (int)pos;
-        if (!(*ifmt = avformat_alloc_context()))
-            return AVERROR(ENOMEM);
-        (*ifmt)->pb = io->pb;
-        ret = avformat_open_input(ifmt, "", NULL, NULL);
+        ret = open_with_pb(ifmt, io->pb);
     } else {
         ret = avformat_open_input(ifmt, in_path, NULL, NULL);
     }
@@ -1874,12 +1918,12 @@ static int webify_run(const char *in_path, const char *out_path)
     char *stats = NULL, tmp_out[512] = "";
     const char *sink, *oname;
     int ret, vidx, aidx, image, spool_out = 0;
-    int out_pipe = !strncmp(out_path, "pipe:", 5);
+    int out_pipe = is_pipe(out_path);
 
     av_log_set_level(AV_LOG_WARNING);
     av_log_set_callback(log_cb);
 
-    if (!strncmp(in_path, "pipe:", 5))
+    if (is_pipe(in_path))
         ret = open_stdin_input(in_path, &ifmt, &io);
     else
         ret = avformat_open_input(&ifmt, in_path, NULL, NULL);
@@ -1915,22 +1959,25 @@ static int webify_run(const char *in_path, const char *out_path)
             goto end;
     }
 
-    if (!image && opt.legacy) {
-        /* no stats pass ever (x264's CRF mode plans ahead by itself), but
-         * remember when the default pipeline *would* have two-passed: the
-         * no--q look to match is then crf 36, not the streamed 33 */
-        vp9_ref_twopass = opt.effort >= 0 && input_can_rewind(ifmt);
-    } else if (!image && opt.effort >= 0 && input_can_rewind(ifmt)) {
-        discard_other_streams(ifmt, vidx, aidx);
-        if ((ret = first_pass(ifmt, vidx, aidx, &stats)) < 0)
-            goto end;
-        if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
-            goto end;
-    } else if (!image && opt.effort >= 0) {
-        av_log(NULL, AV_LOG_WARNING,
-               "input is not seekable: encoding in a single pass "
-               "(two-pass saves 10-20%% bandwidth at the same quality)\n");
-    } /* --fast skips the stats pass on purpose: single-pass, no warning */
+    if (!image) {
+        if (opt.legacy) {
+            /* no stats pass ever (x264's CRF mode plans ahead by itself),
+             * but remember when the default pipeline *would* have
+             * two-passed: the no--q look to match is then crf 36, not the
+             * streamed 33 */
+            vp9_ref_twopass = opt.effort >= 0 && input_can_rewind(ifmt);
+        } else if (opt.effort >= 0 && input_can_rewind(ifmt)) {
+            discard_other_streams(ifmt, vidx, aidx);
+            if ((ret = first_pass(ifmt, vidx, aidx, &stats)) < 0)
+                goto end;
+            if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
+                goto end;
+        } else if (opt.effort >= 0) {
+            av_log(NULL, AV_LOG_WARNING,
+                   "input is not seekable: encoding in a single pass "
+                   "(two-pass saves 10-20%% bandwidth at the same quality)\n");
+        } /* --fast skips the stats pass on purpose: single-pass, no warning */
+    }
 
     discard_other_streams(ifmt, vidx, aidx);
 
@@ -1974,10 +2021,8 @@ static int webify_run(const char *in_path, const char *out_path)
      * wallclock DateUTC into every file */
     ofmt->flags |= AVFMT_FLAG_BITEXACT;
 
-    if (!image) {
-        prog.label = stats ? "pass 2/2:" : "encoding:";
-        prog.pct   = -1;
-    }
+    if (!image)
+        progress_start(stats ? "pass 2/2:" : "encoding:");
     if ((ret = init_video(&video, ifmt, ofmt, vidx, image, stats ? 2 : 0, stats)) < 0)
         goto end;
     if (aidx >= 0 && (ret = init_audio(&audio, ifmt, ofmt, aidx)) < 0)
@@ -2013,9 +2058,9 @@ static int webify_run(const char *in_path, const char *out_path)
          * spool above — only its no-temp-file fallback drops to a fragmented
          * MP4 (playable everywhere MSE is, but not by every old player) */
         av_dict_set(&muxopts, "movflags",
-                    strncmp(sink, "pipe:", 5)
-                        ? "+faststart"
-                        : "+frag_keyframe+empty_moov+default_base_moof", 0);
+                    is_pipe(sink)
+                        ? "+frag_keyframe+empty_moov+default_base_moof"
+                        : "+faststart", 0);
     } else /* faststart for WebM: put the seek index up front so browsers can
             * seek without fetching the file tail (pipes again covered by the
             * temp-file spool; on its fallback the muxer cannot seek and
