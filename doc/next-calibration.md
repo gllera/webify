@@ -95,11 +95,14 @@ not "slightly" lower. Options measured (chart):
 True parity is unreachable: even 444 crf 0 caps at .86 (the limited-range
 RGB->YUV round trip itself is lossy; only RGB-domain lossless hits 1.0) and
 is already *bigger* than lossless WebP — AV1 has no competitive lossless
-mode for graphics. Shipped compromise: **RGB-decoded stills with q > 80
-encode 4:4:4** at the same mapped CRF. Photos in 444 also stay below WebP's
-size at those q (13.5 vs 17.5 KB at q 95). YUV-decoded sources (jpeg…)
-always stay 4:2:0 — both pipelines share the source's chroma there and
-parity is free.
+mode for graphics. A compromise shipped for a while — RGB-decoded stills
+with q > 80 raced a 4:4:4 candidate at the same mapped CRF (photos in 444
+also stayed below WebP's size at those q: 13.5 vs 17.5 KB at q 95) — but
+it was **removed**: 4:4:4 needs AV1 High profile (seq_profile 1), which
+hardware decoders commonly lack, and webify ships Main-profile-only output
+on purpose. The numbers above stay as the record of what 4:4:4 would buy.
+Everything now encodes 4:2:0, and q > 80 graphics keep the known gap to
+WebP's lossless race — use the default pipeline for that content.
 
 ## Video: VP9 -> AV1 (same content, two-pass, 480p box)
 

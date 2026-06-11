@@ -2,8 +2,9 @@
 
 `--legacy` is the same idea as `--next` pointed backwards: output the
 maximum-compatibility formats. Video becomes H.264/AAC MP4 (vendored x264 +
-FFmpeg's native AAC encoder) with the moov up front — the real `+faststart`
-— and every image becomes PNG; animated GIF becomes APNG, looping forever.
+FFmpeg's native AAC encoder) with the moov up front — the real `+faststart`,
+piped output included ([piping.md](piping.md)) — and every image becomes
+PNG; animated GIF becomes APNG, looping forever.
 
 Everything else — the `--max` box, frame-rate caps, tonemapping,
 EXIF/rotation, mono rules, stdin/stdout — works identically. Note: x264 is

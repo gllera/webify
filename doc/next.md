@@ -37,13 +37,16 @@ channel is detected and dropped instead of wasting a stream) as the
 standard auxiliary alpha stream — near-lossless and tagged full-range as
 MIAF demands; EXIF rotation is baked in as usual.
 
-RGB-decoded stills above `-q 8` race a 4:4:4 candidate against 4:2:0
-(full-resolution chroma is what closes most of the gap to WebP's lossless
-race on sharp graphics) and ship it only while it stays ≤1.35× the 4:2:0
-bytes — saturated noise explodes in 4:4:4 and falls back, so the winner
-stays smaller than the WebP output either way. True lossless stays
-WebP-only (AV1 lossless is far larger — graphics that want lossless should
-stay WebP).
+Chroma stays 4:2:0 everywhere — stills, animations and video — so every
+file webify writes decodes as **AV1 Main profile**, the one profile
+hardware decoders reliably implement. A 4:4:4 race for premium-`-q` RGB
+stills used to live here (full-resolution chroma closes most of the gap to
+WebP's lossless race on sharp graphics) but was dropped on purpose: 4:4:4
+needs High profile (seq_profile 1), and trading decoder compatibility for
+a niche size win is the wrong default for a web-delivery tool. Sharp
+graphics that want pixel-exact chroma should use the default pipeline —
+its lossless WebP race exists for exactly that content. True lossless
+stays WebP-only anyway (AV1 lossless is far larger).
 
 ## Effort tiers
 
@@ -56,11 +59,23 @@ Each step measured to pay for its time like the VP9/WebP ones:
 - For video and animations `--best` keeps the default encoder settings,
   because libaom's deeper searches measured *bigger* (+0.3-1% bytes for
   1.2-3.4× the time — at a fixed CRF they buy a sliver of quality, never
-  bytes) — it still spools piped video so the stats pass always runs.
+  bytes).
 - Stills use `usage=allintra` + `still-picture` at speeds 6/4/2 (speed 7
   measured the same wall time as 6 for −.008 SSIM — a strictly worse
   point; avifenc defaults to speed 6 — the webify default digs one step
   deeper).
+
+## No film grain synthesis
+
+AV1 can carry a *model* of the source's noise instead of the noise itself
+(film grain synthesis): the encoder denoises, ships a grain table, and the
+decoder re-synthesizes texture on playback. webify briefly had a `--grain`
+knob for it and removed it on purpose: grain synthesis is AV1's
+least-exercised decoder path — some hardware decoders skip or mishandle
+the re-synthesis, and browsers may punt grainy streams to software
+decode — and trading decoder compatibility for bytes is the wrong deal
+for a web-delivery tool (the same reasoning that keeps chroma at 4:2:0
+above).
 
 ## Known extremes
 

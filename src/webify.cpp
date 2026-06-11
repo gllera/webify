@@ -8,26 +8,34 @@
  * default).
  *
  * Everything is tuned for serving the result over the internet:
- *   - two-pass VP9 whenever the input can rewind (files, spooled stdin) —
- *     only then does libvpx use alt-ref frames and plan rates ahead, which
- *     measures 10-20% smaller at equal quality; streamed stdin single-passes
- *     (the stats pass runs at cpu-used 4; it barely affects the stats)
+ *   - two-pass VP9 — only with a stats pass does libvpx use alt-ref frames
+ *     and plan rates ahead, which measures 10-20% smaller at equal quality
+ *     (the stats pass runs at cpu-used 4; it barely affects the stats).
+ *     Piping changes nothing: piped video input is spooled to a temp file
+ *     so the stats pass (and the HDR-peak peek) can rewind, and piped
+ *     video output spools through a temp file so the seek index lands at
+ *     the head — byte-identical to file i/o either way
  *   - cpu-used 1 / frame-parallel 0 by default (Google's VOD setting);
  *     --fast single-passes at cpu-used 4 (~4x faster, the classic crf-33
- *     look) and --best two-passes at cpu-used 0 + arnr-maxframes 15 and
- *     spools piped input so the stats pass always runs (measured 1-7%
- *     smaller than default at equal-or-better SSIM, ~75% more time);
- *     tiles/threads follow Google's VOD table for the output width
+ *     look) and --best two-passes at cpu-used 0 + arnr-maxframes 15
+ *     (measured 1-7% smaller than default at equal-or-better SSIM, ~75%
+ *     more time); tiles/threads follow Google's VOD table for the width
  *   - the rate caps follow the input: >30fps output scales the budget up
  *     (Google's 60fps rows are ~1.7x their 30fps ones), and the source
  *     stream's own bitrate — weighted by how its codec compares to VP9 —
  *     caps the budget from above, so bits are never spent re-encoding
- *     compression artifacts more faithfully than the source stored them
- *   - the seek index (cues) is written at the head of the file (faststart)
+ *     compression artifacts more faithfully than the source stored them.
+ *     When a stats pass runs, the source video and audio rates are
+ *     *measured* from the packets it reads anyway — container headers lie
+ *     or say nothing (mkv/webm declare no per-stream rates); --fast and
+ *     --legacy keep the header-based caps
+ *   - the seek index (cues) is written at the head of the file (faststart),
+ *     piped output included (the temp-file spool above)
  *   - mono audio stays mono (48k) instead of being upmixed to stereo (64k),
  *     -q scales the Opus bitrate along with the video quality, and a lossy
  *     source's own rate caps it (Opus loses nothing at the rate the source
- *     itself managed with a weaker codec)
+ *     itself managed with a weaker codec; measured like the video rate
+ *     when a stats pass runs)
  *   - images use libwebp method 6 (cwebp -m 6), the densest WebP encoding;
  *     single-frame RGB images are also tried lossless and the smaller wins,
  *     and their lossy candidate uses sharp RGB->YUV (cwebp -sharp_yuv:
@@ -35,10 +43,16 @@
  *     ~20% more bytes there)
  *   - EXIF orientation (frame side data) and display-matrix rotation are
  *     baked into the pixels, including the mirrored variants
+ *   - interlaced video frames are deinterlaced (bwdif, always in the video
+ *     chain): frames the decoder flags interlaced are rebuilt before any
+ *     rotation/scaling touches their fields, progressive frames pass
+ *     through untouched — combing both looks bad and wastes bits
  *   - HDR video (PQ/HLG) is tonemapped to SDR bt709 (zscale linearize +
  *     hable), with the source peak taken from in-stream SEI or container
  *     metadata (1000-nit fallback) since ffmpeg 8's zscale strips HDR side
- *     data before tonemap can read it
+ *     data before tonemap can read it; the final float -> 8-bit step is
+ *     error-diffusion dithered or the smooth gradients tonemapping
+ *     produces would band visibly
  *   - --next switches to the next-gen formats at the same visual targets:
  *     video becomes AV1/Opus WebM via libaom and every image becomes AVIF
  *     (animated GIF -> animated AVIF, alpha kept as the auxiliary stream).
@@ -48,10 +62,14 @@
  *     a hair *below* parity by design — see doc/next-calibration.md), and
  *     the VP9-anchored rate budget is converted by the same codec-efficiency
  *     table that weights the source cap — so --next changes the file size,
- *     never the look
+ *     never the look. Everything stays 8-bit 4:2:0 — AV1 Main profile
+ *     end-to-end, the only profile hardware decoders reliably implement
+ *     (4:4:4 and film grain synthesis were tried and dropped on purpose:
+ *     both trade decoder compatibility for bytes)
  *   - --legacy is the same idea pointed backwards: video becomes H.264/AAC
- *     MP4 (vendored x264) with the moov up front (fragmented MP4 on pipes,
- *     where faststart cannot seek back), and every image becomes PNG
+ *     MP4 (vendored x264) with the moov up front — piped output included
+ *     via the temp-file spool (only its no-temp-file fallback still writes
+ *     a fragmented MP4) — and every image becomes PNG
  *     (animated GIF -> APNG) — lossless by definition, so -q steers video
  *     only. The video -q mapping is the same equal-SSIM fit against the VP9
  *     pipeline (doc/legacy-calibration.md) and the rate caps are converted
@@ -67,13 +85,14 @@
  *          -c:a libopus -b:a 64k OUT.webm
  * except that smaller-than-480p input is not upscaled, and the bitrate caps
  * follow the job (anchored at 750k/1100k for 854x480 crf 33, the
- * single-pass/piped default): they scale with the output pixel count, the
+ * single-pass default --fast keeps): they scale with the output pixel count, the
  * CRF target, the >30fps output frame rate, and are capped from above by
  * the source stream's own codec-weighted bitrate.
  *
  * Official libav* API only; structure follows FFmpeg's doc/examples/transcode.c.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
@@ -98,12 +117,18 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
-#include <libswscale/swscale.h>
 }
 
-#define WEBIFY_VERSION "1.1"
+#define WEBIFY_VERSION "1.2"
 
 #define VIDEO_FILTERS "format=yuv420p" /* the scale step is built in init_video */
+/* always first in the video chain: frames the decoder flagged interlaced are
+ * deinterlaced, progressive frames pass through untouched (a zero-copy ref
+ * forward), so this needs no detection step and handles mixed/telecined
+ * streams per frame. It must run before transpose (rotation would turn the
+ * fields into columns) and before scaling (fields are interleaved source
+ * lines); send_frame keeps the frame rate */
+#define DEINT_FILTER "bwdif=mode=send_frame:parity=auto:deint=interlaced,"
 #define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=%s:channel_layouts=%s"
 /* high-quality swscale conversions for the image pipeline (rounding flags are
  * no-ops where they don't apply; lanczos only kicks in for --max scaling) */
@@ -311,48 +336,6 @@ static int probe_is_image(const AVInputFormat *fmt, const uint8_t *buf, int size
     return 0;
 }
 
-/* walk top-level mp4 atoms in the prefix: a 'moov' before any 'mdat' means
- * faststart, i.e. the file is streamable without seeking */
-static int prefix_has_early_moov(const uint8_t *buf, size_t len)
-{
-    uint64_t pos = 0;
-
-    while (pos + 8 <= len) {
-        uint64_t size = AV_RB32(buf + pos);
-
-        if (!memcmp(buf + pos + 4, "moov", 4))
-            return 1;
-        if (!memcmp(buf + pos + 4, "mdat", 4))
-            return 0;
-        if (size == 1) { /* 64-bit atom size */
-            if (pos + 16 > len)
-                break;
-            size = AV_RB64(buf + pos + 8);
-        }
-        if (size < 8 || size > len - pos) /* 0 = "extends to EOF"; <8 =
-                                           * corrupt; past the prefix = done
-                                           * (a crafted 64-bit size could
-                                           * otherwise wrap pos and loop) */
-            break;
-        pos += size;
-    }
-    return 0; /* moov not up front: assume it sits at the end */
-}
-
-/* containers whose streaming path would drop features: mp4/mov keeps its
- * index (moov) at the end unless written with faststart, and AVI may be
- * non-interleaved, which the demuxer only handles with seekable input */
-static int probe_needs_file(const AVInputFormat *fmt, const uint8_t *buf, size_t size)
-{
-    if (!fmt)
-        return 0;
-    if (!strcmp(fmt->name, "avi"))
-        return 1;
-    if (!strncmp(fmt->name, "mov,", 4))
-        return !prefix_has_early_moov(buf, size);
-    return 0;
-}
-
 static int write_all(int fd, const uint8_t *p, size_t n)
 {
     while (n > 0) {
@@ -398,6 +381,30 @@ static int spool_to_file(StdinIO *io)
     return lseek(io->fd, 0, SEEK_SET) < 0 ? AVERROR(errno) : 0;
 }
 
+/* stream a finished temp output file to stdout (the piped-output spool:
+ * the muxer wrote a regular seekable file, the pipe gets its bytes now) */
+static int drain_file_to_stdout(const char *path)
+{
+    uint8_t chunk[IO_BUFSIZE];
+    ssize_t n;
+    int ret = 0, fd = open(path, O_RDONLY);
+
+    if (fd < 0)
+        return AVERROR(errno);
+    while ((n = read(fd, chunk, sizeof(chunk))) != 0) {
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            ret = AVERROR(errno);
+            break;
+        }
+        if ((ret = write_all(STDOUT_FILENO, chunk, (size_t)n)) < 0)
+            break;
+    }
+    close(fd);
+    return ret;
+}
+
 static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io)
 {
     uint8_t *iobuf;
@@ -438,13 +445,12 @@ static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO
             io->size += n;
         }
         avio_closep(&io->src);
-    } else if ((probe_needs_file(fmt, io->buf, io->size) ||
-                (opt.effort > 0 && !opt.legacy)) &&
-               (ret = spool_to_file(io)) < 0) {
-        /* --best spools every piped video (not just the containers that
-         * need it) so the stats pass can always run: two-pass measures
-         * 10-20% smaller than the streamed single-pass (pointless for
-         * --legacy, which never runs a stats pass) */
+    } else if ((ret = spool_to_file(io)) < 0) {
+        /* every piped video is spooled so the pipe changes nothing about
+         * the output: the stats pass and the HDR-peak peek can always
+         * rewind, exactly as with a file argument (and containers that
+         * outright need a seekable input — mp4/mov without faststart,
+         * AVI — just work). Images are slurped above for the same reason */
         if (io->fd >= 0) /* spool started; the pipe is partly consumed */
             return ret;
         av_log(NULL, AV_LOG_WARNING, "cannot spool piped input to a temp "
@@ -782,7 +788,10 @@ static int input_is_image(const AVFormatContext *ifmt, int vidx, int aidx)
 /* libaom only delivers the AV1 sequence header alongside its first encoded
  * packet (aomedia bug #2208), but the webm muxer writing to a pipe needs it
  * in CodecPrivate when the header goes out — seekable outputs get
- * back-patched later, pipes error out. The sequence header depends on the
+ * back-patched later, pipes error out. Since the piped-output spool, only
+ * its no-temp-file fallback still writes WebM to a true pipe, but the
+ * priming costs one black frame, so it simply always runs. The sequence
+ * header depends on the
  * configuration, not the pixels: encode one black frame on a clone of the
  * just-configured encoder and lift the extradata its wrapper extracts.
  * Best-effort by design — on failure file outputs still self-heal. */
@@ -848,7 +857,7 @@ end:
 /* the calibrated still-image AVIF CRF for the current -q: equal-SSIM fit
  * against the WebP pipeline, near-linear to q 80 then diving with cwebp's
  * premium top end (see the mapping comment in init_video and
- * doc/next-calibration.md). Shared with the 444/420 race re-encode. */
+ * doc/next-calibration.md). */
 static int avif_still_crf(void)
 {
     double q = opt.quality < 0 ? 80.0 : opt.quality;
@@ -860,6 +869,23 @@ static int avif_still_crf(void)
  * no -q that look depends on whether VP9 would have run two passes (crf 36)
  * or one (crf 33) — webify_run records its two-pass decision here */
 static int vp9_ref_twopass;
+
+/* the source video/audio rates measured during the stats pass (bits/s,
+ * 0 = not measured). Container headers lie or say nothing — mkv/webm
+ * declare no per-stream rates at all — and the container-average fallback
+ * lumps every stream together; the stats pass reads every packet anyway,
+ * so it counts the truth. Single-pass tiers (--fast, --legacy) never
+ * measure and keep the header-based caps. */
+static int64_t measured_video_rate, measured_audio_rate;
+
+/* bytes accumulated over a packet-dts span -> bits/s; 0 when the span is
+ * missing or too short to be meaningful (1-2 packet streams) */
+static int64_t span_rate(int64_t bytes, const int64_t t[2], AVRational tb)
+{
+    double s = t[0] == AV_NOPTS_VALUE ? 0 : (t[1] - t[0]) * av_q2d(tb);
+
+    return s >= 0.1 ? (int64_t)(bytes * 8 / s) : 0;
+}
 
 /* the calibrated x264 CRF that buys the same look as a given VP9 CRF: a
  * linear fit of measured equal-SSIM points against the VP9 pipeline at the
@@ -889,8 +915,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     const AVPacketSideData *psd;
     const int32_t *mat = NULL;
     uint8_t *extra = NULL;
-    char args[512], spec[640], scale[256] = "", rotate[40], tonemap[224] = "";
-    int ret, rgb = 0, hdr = 0, alpha = 0, extra_size = 0, next444 = 0;
+    char args[512], spec[768], scale[256] = "", rotate[40], tonemap[256] = "";
+    int ret, rgb = 0, hdr = 0, alpha = 0, extra_size = 0;
     int maxw = opt.max_w, maxh = opt.max_h;
 
     p->in_index = stream_index;
@@ -942,24 +968,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         if (hdr)
             av_log(NULL, AV_LOG_WARNING, "HDR image input: colors may come "
                    "out washed; only video inputs are tonemapped\n");
-        int srcrgb = desc &&
+        /* --next stays 4:2:0 everywhere so every AVIF webify writes decodes
+         * as AV1 Main profile: 4:4:4 chroma would help sharp graphics at
+         * the premium -q end (a 444-vs-420 race used to live here) but
+         * needs High profile (seq_profile 1), which hardware AV1 decoders
+         * commonly lack — graphics that want pixel-exact chroma should use
+         * the default pipeline's lossless WebP race instead */
+        rgb = !opt.next && !opt.legacy && desc &&
               (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL));
-        /* --next stills from RGB sources race a 4:4:4 candidate above the
-         * q-80 break: that is the premium-quality zone where the WebP
-         * side's lossless race starts winning on sharp graphics, and
-         * full-resolution chroma is what closes most of that gap. The race
-         * in finish_still_next keeps 444 only while it is cheap enough to
-         * stay under the WebP size (saturated noise explodes in 444).
-         * YUV sources stay 4:2:0 — both pipelines then share the source's
-         * chroma and parity is free. --fast skips it like it skips the
-         * WebP race. */
-        next444 = opt.next && srcrgb && !peeked.animated &&
-                  opt.quality > 80.0 && opt.effort >= 0;
-        rgb = !opt.next && !opt.legacy && srcrgb;
         snprintf(spec, sizeof(spec), "%s%sformat=%s", rotate, scale,
                  opt.legacy ? (peeked.alpha ? "rgba" : "rgb24")
-                 : opt.next ? (peeked.alpha ? (next444 ? "yuva444p" : "yuva420p")
-                                            : (next444 ? "yuv444p"  : "yuv420p"))
+                 : opt.next ? (peeked.alpha ? "yuva420p" : "yuv420p")
                  : rgb      ? av_get_pix_fmt_name(AV_PIX_FMT_RGB32)
                             : "yuv420p|yuva420p");
         /* --next keeps alpha only when the peek saw real transparency: a
@@ -997,10 +1016,13 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             if (peak <= 0)
                 peak = 10.0;
 
+            /* the last zscale quantizes tonemap's float output down to 8
+             * bits: undithered, the smooth gradients tonemapping produces
+             * band visibly (zscale's dither default is none) */
             snprintf(tonemap, sizeof(tonemap),
                      "zscale=tin=%s%s%s:t=linear:npl=100,format=gbrpf32le,"
                      "zscale=p=bt709,tonemap=hable:desat=0:peak=%.6g,"
-                     "zscale=t=bt709:m=bt709:r=tv,",
+                     "zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,",
                      p->dec->color_trc == AVCOL_TRC_SMPTE2084
                          ? "smpte2084" : "arib-std-b67",
                      p->dec->colorspace == AVCOL_SPC_UNSPECIFIED
@@ -1014,8 +1036,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                        p->dec->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ" : "HLG",
                        peak * 100);
         }
-        snprintf(spec, sizeof(spec), "%s%s%s%s", rotate, scale, tonemap,
-                 VIDEO_FILTERS);
+        snprintf(spec, sizeof(spec), DEINT_FILTER "%s%s%s%s", rotate, scale,
+                 tonemap, VIDEO_FILTERS);
     }
 
     if ((ret = init_graph(p, "buffer", args, "buffersink", spec,
@@ -1041,14 +1063,12 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     p->enc->width               = av_buffersink_get_w(p->sink);
     p->enc->height              = av_buffersink_get_h(p->sink);
     p->enc->pix_fmt             = (AVPixelFormat)av_buffersink_get_format(p->sink);
-    if (opt.next && (p->enc->pix_fmt == AV_PIX_FMT_YUVA420P ||
-                     p->enc->pix_fmt == AV_PIX_FMT_YUVA444P)) {
-        /* libaom takes no alpha plane: the color planes of a yuva* frame
-         * are a valid yuv* frame as-is, and the alpha plane rides as a
+    if (opt.next && p->enc->pix_fmt == AV_PIX_FMT_YUVA420P) {
+        /* libaom takes no alpha plane: the color planes of a yuva420p frame
+         * are a valid yuv420p frame as-is, and the alpha plane rides as a
          * second AV1 stream that the avif muxer stores as the auxiliary
          * alpha item (the standard AVIF transparency layout) */
-        p->enc->pix_fmt = p->enc->pix_fmt == AV_PIX_FMT_YUVA420P
-                        ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_YUV444P;
+        p->enc->pix_fmt = AV_PIX_FMT_YUV420P;
         alpha = 1;
     }
     p->enc->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(p->sink);
@@ -1149,8 +1169,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         /* -q 0-10 maps linearly onto VP9's CRF 63-0. With no -q, two-pass
          * defaults to crf 36: measured against the old single-pass crf 33 it
          * is slightly *better* on SSIM/PSNR while ~8-20% smaller, because
-         * two-pass actually reaches its quality target. Single-pass (piped
-         * input) keeps the classic crf 33 (= -q 4.8).
+         * two-pass actually reaches its quality target. Single-pass (--fast,
+         * or the rare unspoolable pipe) keeps the classic crf 33 (= -q 4.8).
          *
          * The constrained-quality caps start from Google's published 480p
          * VOD numbers (750k avg / 1100k max at 854x480 crf 33) and follow
@@ -1188,7 +1208,14 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         double f = ((double)p->enc->width * p->enc->height) / (854.0 * 480.0)
                  * exp2((33 - crf) / 6.0);
         double  ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
-        int64_t src  = source_video_rate(ifmt, stream_index);
+        /* the measured rate (when a stats pass ran) beats any header: it is
+         * the truth, while headers lie or say nothing and the container
+         * fallback lumps all streams together. Pass 1 itself still runs on
+         * the header-based cap — the measurement happens during it; libvpx's
+         * first pass collects content stats, not rate plans, so the
+         * mismatch is harmless */
+        int64_t src  = measured_video_rate > 0
+                     ? measured_video_rate : source_video_rate(ifmt, stream_index);
         /* tiles follow Google's VOD table by output width; threads run at
          * double its column, which row-mt keeps busy:
          * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
@@ -1246,9 +1273,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * libaom's slower speeds buy a sliver of quality, never bytes
          * (cpu-used 3 measured +1% bytes for 1.2x time, cpu-used 2 +0.8%
          * for 3.4x time, arnr-max-frames 15 +0.3% — all rejected), so
-         * --best keeps the default encoder settings; it still buys its
-         * other measured win, spooling piped input for a universal stats
-         * pass */
+         * --best keeps the default encoder settings */
         if (opt.legacy) {
             /* the preset ladder at a fixed CRF: medium -> slow buys nothing
              * (+1.5% bytes), slow -> veryslow buys -19% bytes at equal SSIM
@@ -1331,9 +1356,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     }
 
     /* a still might do better lossless: race them (--fast skips the race
-     * and the sharp_yuv re-encode — the streamed packet ships as-is).
-     * --next races 4:4:4 vs 4:2:0 instead, same hold-the-frame plumbing */
-    p->dual = image && (rgb || next444) && opt.effort >= 0;
+     * and the sharp_yuv re-encode — the streamed packet ships as-is) */
+    p->dual = image && rgb && opt.effort >= 0;
     p->prog = !image;
 
     if (ofmt) {
@@ -1415,7 +1439,12 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         double  q   = opt.quality < 0 ? 48.0 : opt.quality;
         int64_t bps = (int64_t)((mono ? 48000 : 64000) * (0.5 + q / 96.0));
         int64_t lo  = mono ? 16000 : 24000;
-        int64_t src = ist->codecpar->bit_rate;
+        /* prefer the rate measured during the stats pass: mkv/webm declare
+         * no per-stream rates, and with only the header this cap silently
+         * no-opped there (measured: a 26.5k AAC track re-encoded at the
+         * full 48k anchor) */
+        int64_t src = measured_audio_rate > 0
+                    ? measured_audio_rate : ist->codecpar->bit_rate;
 
         if (opt.legacy) { /* AAC needs ~1.5x Opus's rate for the same
                            * quality (96k stereo at the default), and
@@ -1619,104 +1648,6 @@ static AVCodecContext *clone_image_enc(const AVCodecContext *base)
     return c;
 }
 
-/* --next premium still race (RGB source, q > 80): the held frame is
- * 4:4:4 — full-resolution chroma is what closes most of the gap to the
- * WebP side's lossless race on sharp graphics — but saturated-noise
- * chroma explodes in 4:4:4 (measured 1.9x the 4:2:0 bytes on the
- * mandelbrot fixture, *bigger* than the WebP output). So both get
- * encoded and 444 ships only while it costs <= 1.35x the 420 candidate:
- * graphics measure ~1.28, photos ~1.15, noise ~1.9, and 1.35 sits under
- * the smallest measured WebP/420 size ratio (1.5), keeping the winner
- * smaller than the WebP output either way (doc/next-calibration.md). */
-static int finish_still_next(AVFormatContext *ofmt, Pipe *p)
-{
-    AVCodecContext *e420 = NULL;
-    AVDictionary *opts = NULL;
-    AVPacket *c444 = av_packet_alloc(), *c420 = av_packet_alloc();
-    AVPacket *apkt = av_packet_alloc(), *pick;
-    AVFrame *m = NULL, *f = NULL, *a = NULL;
-    struct SwsContext *sws = NULL;
-    char crfs[16];
-    int ret;
-
-    if (!c444 || !c420 || !apkt || !(m = av_frame_clone(p->first))) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-    /* color planes only: alpha rides its own stream, identical either way */
-    m->format      = p->enc->pix_fmt;
-    m->data[3]     = NULL;
-    m->linesize[3] = 0;
-    if ((ret = encode_full(p->enc, m, c444)) < 0)
-        goto end;
-
-    pick = c444;
-    if (!(f = av_frame_alloc())) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-    f->format = AV_PIX_FMT_YUV420P;
-    f->width  = m->width;
-    f->height = m->height;
-    if ((ret = av_frame_get_buffer(f, 0)) < 0)
-        goto end;
-    f->pts       = m->pts;
-    f->duration  = m->duration;
-    f->pict_type = AV_PICTURE_TYPE_NONE;
-    sws = sws_getContext(m->width, m->height, AV_PIX_FMT_YUV444P,
-                         f->width, f->height, AV_PIX_FMT_YUV420P,
-                         SWS_LANCZOS | SWS_ACCURATE_RND, NULL, NULL, NULL);
-    /* a failed 420 attempt is not fatal: the 444 candidate stands */
-    if (sws && (e420 = clone_image_enc(p->enc))) {
-        sws_scale(sws, m->data, m->linesize, 0, m->height,
-                  f->data, f->linesize);
-        e420->pix_fmt      = AV_PIX_FMT_YUV420P;
-        e420->bit_rate     = 0; /* constant quality, not the 200k default */
-        e420->thread_count = p->enc->thread_count;
-        snprintf(crfs, sizeof(crfs), "%d", avif_still_crf());
-        av_dict_set(&opts, "crf", crfs, 0);
-        av_dict_set(&opts, "usage", "allintra", 0);
-        av_dict_set(&opts, "still-picture", "1", 0);
-        av_dict_set(&opts, "cpu-used", opt.effort > 0 ? "2" : "4", 0);
-        av_dict_set(&opts, "row-mt", "1", 0);
-        if (avcodec_open2(e420, p->enc->codec, &opts) >= 0 &&
-            encode_full(e420, f, c420) >= 0 &&
-            c420->size && c444->size > c420->size * 1.35)
-            pick = c420;
-    }
-    if (pick == c420) /* keep the container header honest about subsampling */
-        ofmt->streams[p->out_index]->codecpar->format = AV_PIX_FMT_YUV420P;
-    pick->stream_index = p->out_index;
-    av_packet_rescale_ts(pick, p->enc->time_base,
-                         ofmt->streams[p->out_index]->time_base);
-    if ((ret = av_interleaved_write_frame(ofmt, pick)) < 0)
-        goto end;
-    if (p->enc_a) { /* the held frame's alpha plane, like encode_write does */
-        if (!(a = alpha_frame(p->first))) {
-            ret = AVERROR(ENOMEM);
-            goto end;
-        }
-        if ((ret = encode_full(p->enc_a, a, apkt)) < 0)
-            goto end;
-        apkt->stream_index = p->out_index_a;
-        av_packet_rescale_ts(apkt, p->enc_a->time_base,
-                             ofmt->streams[p->out_index_a]->time_base);
-        ret = av_interleaved_write_frame(ofmt, apkt);
-    }
-end:
-    sws_freeContext(sws);
-    av_dict_free(&opts);
-    avcodec_free_context(&e420);
-    av_packet_free(&c444);
-    av_packet_free(&c420);
-    av_packet_free(&apkt);
-    av_frame_free(&m);
-    av_frame_free(&f);
-    av_frame_free(&a);
-    av_frame_free(&p->first);
-    return ret;
-}
-
 /* A single-frame RGB image: flat-color graphics often compress smaller as
  * lossless WebP than as lossy q80 — and lossless is by definition the best
  * quality — so encode both and keep the smaller file. Photos stay lossy
@@ -1809,18 +1740,21 @@ static int flush_pipe(AVFormatContext *ofmt, Pipe *p)
     if ((ret = drain_sink(ofmt, p)) < 0)
         return ret;
     if (p->first) /* exactly one frame arrived: the still race */
-        return opt.next ? finish_still_next(ofmt, p) : finish_still(ofmt, p);
+        return finish_still(ofmt, p);
     return encode_write(ofmt, p, NULL);                 /* flush encoder  */
 }
 
 /* Only with two-pass stats does libvpx use alt-ref frames and plan its rate
  * budget ahead, which measures 10-20% smaller files at equal quality (or
- * ~2 dB better quality where the rate caps bind). Inputs that can rewind get
- * a stats run; truly streamed stdin stays single-pass. */
-static int first_pass(AVFormatContext *ifmt, int vidx, char **stats)
+ * ~2 dB better quality where the rate caps bind). Piped stdin is spooled so
+ * it can rewind like a file; only --fast (by design) and the rare
+ * unspoolable pipe stay single-pass. */
+static int first_pass(AVFormatContext *ifmt, int vidx, int aidx, char **stats)
 {
     Pipe p = {};
     AVPacket *pkt = av_packet_alloc();
+    int64_t bytes[2] = { 0, 0 };
+    int64_t span[2][2] = { { AV_NOPTS_VALUE, 0 }, { AV_NOPTS_VALUE, 0 } };
     int ret;
 
     if (!pkt)
@@ -1830,6 +1764,20 @@ static int first_pass(AVFormatContext *ifmt, int vidx, char **stats)
     if ((ret = init_video(&p, ifmt, NULL, vidx, 0, 1, NULL)) < 0)
         goto end;
     while ((ret = av_read_frame(ifmt, pkt)) >= 0) {
+        /* this pass touches every packet anyway: measure the true source
+         * rates (audio packets arrive here only to be counted) */
+        int side = pkt->stream_index == vidx ? 0
+                 : pkt->stream_index == aidx ? 1 : -1;
+        if (side >= 0) {
+            int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+
+            bytes[side] += pkt->size;
+            if (ts != AV_NOPTS_VALUE) {
+                if (span[side][0] == AV_NOPTS_VALUE)
+                    span[side][0] = ts;
+                span[side][1] = ts + FFMAX(pkt->duration, 0);
+            }
+        }
         if (pkt->stream_index == vidx)
             ret = decode_packet(NULL, &p, pkt);
         av_packet_unref(pkt);
@@ -1838,6 +1786,11 @@ static int first_pass(AVFormatContext *ifmt, int vidx, char **stats)
     }
     if (ret != AVERROR_EOF)
         goto end;
+    measured_video_rate = span_rate(bytes[0], span[0],
+                                    ifmt->streams[vidx]->time_base);
+    if (aidx >= 0)
+        measured_audio_rate = span_rate(bytes[1], span[1],
+                                        ifmt->streams[aidx]->time_base);
     if ((ret = flush_pipe(NULL, &p)) < 0)
         goto end;
     /* no stats (e.g. zero frames) is not fatal: the caller single-passes */
@@ -1879,7 +1832,7 @@ static int webify_run(const char *in_path, const char *out_path)
     StdinIO io = {};
     AVPacket *pkt = NULL;
     AVDictionary *muxopts = NULL;
-    char *stats = NULL;
+    char *stats = NULL, tmp_out[512] = "";
     int ret, vidx, aidx, image, spool_out = 0;
 
     av_log_set_level(AV_LOG_WARNING);
@@ -1936,10 +1889,12 @@ static int webify_run(const char *in_path, const char *out_path)
                           (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL);
     } else if (!image && opt.effort >= 0 &&
         ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+        /* the audio stream stays undiscarded only so the stats pass can
+         * count its bytes (measured source rates) — it is never decoded */
         for (unsigned i = 0; i < ifmt->nb_streams; i++)
-            if ((int)i != vidx)
+            if ((int)i != vidx && (int)i != aidx)
                 ifmt->streams[i]->discard = AVDISCARD_ALL;
-        if ((ret = first_pass(ifmt, vidx, &stats)) < 0)
+        if ((ret = first_pass(ifmt, vidx, aidx, &stats)) < 0)
             goto end;
         if ((ret = reopen_input(in_path, &ifmt, &io)) < 0)
             goto end;
@@ -1960,6 +1915,29 @@ static int webify_run(const char *in_path, const char *out_path)
         if ((int)i != vidx && (int)i != aidx)
             ifmt->streams[i]->discard = AVDISCARD_ALL;
 
+    /* piped video output spools through a named temp file so the pipe
+     * changes nothing about the bytes: faststart re-shuffles the finished
+     * MP4 and cues_to_front back-patches the WebM header, both seek-back
+     * operations a pipe cannot do. Named, not an unlinked fd: movenc's
+     * faststart pass re-opens the output by URL to read it back. The file
+     * is streamed to stdout and removed at the end. Images never need
+     * this — they stream, or are assembled in memory below */
+    if (!image && !strncmp(out_path, "pipe:", 5)) {
+        const char *dir = getenv("TMPDIR");
+        int fd;
+
+        snprintf(tmp_out, sizeof(tmp_out), "%s/webify-XXXXXX",
+                 dir && *dir ? dir : "/tmp");
+        if ((fd = mkstemp(tmp_out)) < 0) {
+            av_log(NULL, AV_LOG_WARNING, "cannot create a temp file for "
+                   "piped output (%s): writing a streamable file instead\n",
+                   err2str(AVERROR(errno)));
+            tmp_out[0] = '\0';
+        } else {
+            close(fd);
+        }
+    }
+
     /* still PNGs go through image2pipe (one packet = the whole file, written
      * to our own avio like every other muxer here; plain image2 insists on
      * opening files itself) */
@@ -1971,8 +1949,15 @@ static int webify_run(const char *in_path, const char *out_path)
                                                                   : "image2pipe")
                                                     : opt.legacy  ? "mp4"
                                                                   : "webm",
-                                              out_path)) < 0)
+                                              tmp_out[0] ? tmp_out
+                                                         : out_path)) < 0)
         goto end;
+    /* deterministic output: the same input and options always produce the
+     * same bytes. This is what makes the piped-output spool byte-identical
+     * to a file run (and same-input reruns cache-friendly) — without it
+     * the webm muxer stamps a random SegmentUID, random track UIDs and a
+     * wallclock DateUTC into every file */
+    ofmt->flags |= AVFMT_FLAG_BITEXACT;
 
     if (!image) {
         prog.label = stats ? "pass 2/2:" : "encoding:";
@@ -1995,7 +1980,8 @@ static int webify_run(const char *in_path, const char *out_path)
                 !strncmp(out_path, "pipe:", 5);
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
         ret = spool_out ? avio_open_dyn_buf(&ofmt->pb)
-                        : avio_open(&ofmt->pb, out_path, AVIO_FLAG_WRITE);
+                        : avio_open(&ofmt->pb, tmp_out[0] ? tmp_out : out_path,
+                                    AVIO_FLAG_WRITE);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "cannot create '%s': %s\n", out_path,
                    err2str(ret));
@@ -2009,16 +1995,17 @@ static int webify_run(const char *in_path, const char *out_path)
         else if (peeked.animated)
             av_dict_set(&muxopts, "plays", "0", 0);
     } else if (opt.legacy) {
-        /* the MP4 spelling of faststart; a pipe cannot seek the moov back
-         * to the head, so it gets a fragmented MP4 instead (playable
-         * everywhere MSE is, and by every player) */
+        /* the MP4 spelling of faststart; pipes get it too via the temp-file
+         * spool above — only its no-temp-file fallback drops to a fragmented
+         * MP4 (playable everywhere MSE is, but not by every old player) */
         av_dict_set(&muxopts, "movflags",
-                    strncmp(out_path, "pipe:", 5)
+                    tmp_out[0] || strncmp(out_path, "pipe:", 5)
                         ? "+faststart"
                         : "+frag_keyframe+empty_moov+default_base_moof", 0);
     } else /* faststart for WebM: put the seek index up front so browsers can
-            * seek without fetching the file tail (skipped on pipes, where the
-            * muxer cannot seek and writes no index at all) */
+            * seek without fetching the file tail (pipes again covered by the
+            * temp-file spool; on its fallback the muxer cannot seek and
+            * writes no index at all) */
         av_dict_set(&muxopts, "cues_to_front", "1", 0);
     ret = avformat_write_header(ofmt, &muxopts);
     av_dict_free(&muxopts);
@@ -2066,6 +2053,12 @@ end:
             avio_closep(&ofmt->pb);
         avformat_free_context(ofmt);
     }
+    if (tmp_out[0]) { /* piped-output spool: hand the finished file over */
+        if (ret >= 0 && (ret = drain_file_to_stdout(tmp_out)) < 0)
+            av_log(NULL, AV_LOG_ERROR, "cannot write output: %s\n",
+                   err2str(ret));
+        unlink(tmp_out);
+    }
     if (ret < 0) {
         av_log(NULL, AV_LOG_ERROR, "transcode failed: %s\n", err2str(ret));
         return 1;
@@ -2106,8 +2099,7 @@ static int usage(FILE *f, int status)
             "                         -q quality target. --fast single-passes\n"
             "                         video and picks quick image settings\n"
             "                         (4-15x faster, ~5-20%% more bytes);\n"
-            "                         --best runs the slowest searches and\n"
-            "                         spools piped video so it can two-pass\n"
+            "                         --best runs the slowest searches\n"
             "                         (~2x slower, 1-7%% fewer bytes); the\n"
             "                         default is the tuned middle ground\n"
             "  -h, --help             show this help\n"

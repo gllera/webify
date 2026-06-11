@@ -1,9 +1,10 @@
 # Video pipeline — VP9/Opus WebM (the default)
 
-Video is encoded in two passes whenever the input can rewind (files, spooled
-stdin) — only with first-pass stats does libvpx use alt-ref frames and plan
-its rate budget ahead, which measured 10-20% smaller files at equal quality.
-The defaults are the equivalent of:
+Video is encoded in two passes — only with first-pass stats does libvpx use
+alt-ref frames and plan its rate budget ahead, which measured 10-20% smaller
+files at equal quality. Piped input is spooled to a temp file so the stats
+pass can rewind it ([doc/piping.md](piping.md)); only `--fast` single-passes,
+by design. The defaults are the equivalent of:
 
 ```
 ffmpeg -i input.mp4 ... -pass 1 -f null - && ffmpeg -i input.mp4 \
@@ -28,7 +29,7 @@ of MP4 faststart — so browsers can seek immediately.
 
 `-q` is mapped linearly onto VP9 CRF (`crf = (10−q)·6.3`). With no `-q`,
 two-pass video targets crf 36 — measured slightly *better* SSIM/PSNR than
-the old single-pass crf 33 at 8-20% fewer bytes; single-pass (piped input)
+the old single-pass crf 33 at 8-20% fewer bytes; single-pass (`--fast`)
 keeps crf 33 (= `-q 4.8`).
 
 ## Audio
@@ -37,7 +38,10 @@ Audio is Opus 64k stereo; mono sources stay mono at 48k instead of being
 upmixed. The Opus bitrate scales with `-q` (64k stereo / 48k mono at the
 default, half that at `-q 0`, ~1.5× at `-q 10`), and a lossy source's own
 audio rate caps the Opus rate (Opus loses nothing at the rate a weaker
-codec managed; lossless/PCM sources stay uncapped).
+codec managed; lossless/PCM sources stay uncapped). The source rate is
+*measured* during the stats pass when one runs (see Rate caps below) —
+containers like MKV/WebM declare no per-stream rates, and with only the
+header to go on this cap used to silently no-op there.
 Subtitle/data/cover-art streams are ignored.
 
 ## Rate caps
@@ -60,6 +64,31 @@ downscaling or dropping frames — those only discard source information, so
 the full source rate stays a valid, conservative ceiling for any smaller
 rendition.
 
+The source rates themselves are **measured, not trusted**: whenever a
+stats pass runs (the default and `--next` tiers), it counts every video
+and audio packet it reads anyway, and those exact rates drive the caps in
+the final pass. Container headers lie or say nothing — MKV/WebM declare
+no per-stream rates at all, where the old fallback (container average
+minus the other streams' declared rates) over-allocated everything to the
+video and left the audio cap inert. `--fast` and `--legacy` have no stats
+pass and keep the header-based caps. (Pass 1 itself still runs on the
+header-based cap — the measurement happens during it; libvpx's first pass
+collects content statistics, not rate plans, so the mismatch is
+harmless.)
+
+## Deinterlacing
+
+Interlaced sources (DV camcorder tapes, DVDs, 1080i broadcast captures)
+are deinterlaced — combing both looks bad and wastes bits on
+high-frequency detail no viewer wants. `bwdif` sits permanently at the
+head of the video chain in its flag-driven mode
+(`mode=send_frame:deint=interlaced`): frames the decoder flags interlaced
+are rebuilt, progressive frames pass through untouched (a zero-copy ref
+forward), so there is no detection heuristic to get wrong and
+mixed/telecined streams are handled per frame. It runs before the
+rotation (a transpose would turn fields into columns) and before scaling
+(fields are interleaved source lines), and keeps the source frame rate.
+
 ## HDR
 
 HDR sources (PQ/HLG transfer) are tonemapped to SDR bt709 — without that
@@ -70,6 +99,9 @@ FFmpeg 8's zscale strips the HDR metadata before `tonemap` can read it, so
 webify extracts it from the input itself: in-stream SEI (peeked from the
 first decoded frame when the input can rewind), container metadata, or a
 1000-nit assumption as the last resort. The output is tagged bt709/tv.
+The final float → 8-bit quantization is error-diffusion dithered
+(zscale's default is no dithering): tonemapping produces smooth gradients
+that would otherwise band visibly in skies and dark scenes.
 
 ## Effort tiers (`--fast` / `--best`)
 
@@ -82,7 +114,5 @@ in no tier).
 - `--fast`: a single pass at `-cpu-used 4` — the classic single-pass crf-33
   look, ~4× faster than the default end to end.
 - `--best`: the final pass runs at `-cpu-used 0` with longer alt-ref noise
-  reduction (`-arnr-maxframes 15`), and piped video is spooled to a temp
-  file so the stats pass can always run — measured 1-7% smaller than the
-  default at equal-or-better SSIM for ~75% more encode time (and 10-20%
-  smaller for piped inputs that could not two-pass before).
+  reduction (`-arnr-maxframes 15`) — measured 1-7% smaller than the
+  default at equal-or-better SSIM for ~75% more encode time.

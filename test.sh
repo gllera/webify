@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Smoke test for dist/webify: exercises the externally observable claims
 # (CLI contract, cwebp byte-identity, -q size ordering, --max scaling,
-# rotation baking, mono audio, VP9/Opus codecs, faststart cues, stdin/stdout,
+# rotation baking, mono audio, VP9/Opus codecs, faststart cues,
+# stdin/stdout byte-identical to file i/o, interlaced sources deinterlaced,
 # --next: AV1/Opus WebM video, AVIF images w/ alpha + animated GIF -> AVIF,
-# --legacy: H.264/AAC MP4 video w/ faststart, lossless PNG images w/ alpha +
-# animated GIF -> APNG).
+# everything 4:2:0 = AV1 Main profile,
+# --legacy: H.264/AAC MP4 video w/ faststart (piped output too), lossless
+# PNG images w/ alpha + animated GIF -> APNG).
 # Fixtures are generated on the host: needs ffmpeg, ffprobe, cwebp, python3.
 #
 #   ./build.sh && ./test.sh
@@ -38,6 +40,12 @@ channels() { ffprobe -v error -select_streams a:0 -show_entries stream=channels 
 trc()      { ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1"; }
 pixfmt()   { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1"; }
 size()     { stat -c%s "$1"; }
+stream_bytes() { # summed packet payload of one stream: <file> <v:0|a:0>
+    # csv rows can carry a trailing comma (webm/opus packets), split it off
+    ffprobe -v error -select_streams "$2" -show_entries packet=size \
+            -of csv=p=0 "$1" | python3 -c 'import sys
+print(sum(int(l.split(",")[0]) for l in sys.stdin if l.strip(",\n")))'
+}
 # Matroska Cues (1C53BB6B) must precede the first Cluster (1F43B675),
 # walking real EBML elements — a flat byte search always "finds" the Cues
 # at the head, inside the SeekHead's SeekID, which stores that same ID
@@ -77,17 +85,47 @@ same_pixels() {
     md() { ffmpeg -v error -i "$1" -f framemd5 - | tail -1; }
     [ "$(md "$1")" = "$(md "$2")" ]
 }
+# combing metric of the first decoded frame, x1000: adjacent-row luma
+# differences over two-rows-apart ones — interleaved fields from different
+# moments push it well above 1000, clean progressive frames sit below
+comb() {
+    python3 - "$1" <<'EOF'
+import subprocess as sp, sys
+path = sys.argv[1]
+line = sp.run(                          # first line only: mpegts containers
+    ["ffprobe", "-v", "error",          # list the stream again per program
+     "-select_streams", "v:0",
+     "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
+    capture_output=True, text=True).stdout.strip().splitlines()[0]
+w, h = map(int, line.split(",")[:2])
+px = sp.run(
+    ["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1",
+     "-vf", "format=gray", "-f", "rawvideo", "-"],
+    capture_output=True).stdout
+def diff(step):
+    s = 0
+    for y in range(0, h - step - 1, 2):
+        a, b = px[y*w:(y+1)*w], px[(y+step)*w:(y+step+1)*w]
+        s += sum(abs(p - q) for p, q in zip(a, b))
+    return s or 1
+print(diff(1) * 1000 // diff(2))
+EOF
+}
 
 # --- fixtures ----------------------------------------------------------------
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 photo.png
 ff -f lavfi -i "testsrc2=size=1280x720:duration=2:rate=30" \
    -f lavfi -i "sine=frequency=440:duration=2" \
    -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
-ff -i tv.mp4 -c copy tv.mkv                       # mkv streams when piped (mp4 would spool)
+ff -i tv.mp4 -c copy tv.mkv                       # mkv: declares no per-stream rates
 ff -display_rotation 90 -i tv.mp4 -c copy rot.mp4 # portrait via display matrix
+ff -f lavfi -i "testsrc2=size=320x240:duration=8:rate=30" \
+   -f lavfi -i "sine=frequency=440:duration=8" \
+   -c:v libx264 -pix_fmt yuv420p -b:v 60k -c:a aac -b:a 24k -shortest \
+   lowrate.mkv                                    # low-rate mkv: caps must come from the stats-pass measurement
 ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
    -c:v libx264 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
-python3 - > evil.mp4 <<'EOF'                      # 64-bit atom size that would wrap the moov scan
+python3 - > evil.mp4 <<'EOF'                      # crafted 64-bit atom size: garbage in must not hang
 import struct, sys
 out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
 out += b"\x00\x00\x00\x01free" + struct.pack(">Q", (1 << 64) - 8)
@@ -106,6 +144,9 @@ ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alp
 ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" -c:v libx264 -pix_fmt yuv420p \
    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4 # PQ-tagged HDR
+ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=50" \
+   -vf "tinterlace=mode=interleave_top,setparams=field_mode=tff" \
+   -c:v mpeg2video -flags +ildct+ilme -q:v 3 ilace.ts # truly interlaced 25i (fields 20ms apart)
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
 python3 - <<'EOF'                                 # plain.jpg + EXIF Orientation=6 -> exif.jpg
 import struct
@@ -158,10 +199,14 @@ t "image: EXIF orientation baked in (-> 480x640)"     eq "$(dims exif.webp)" "48
 "$WEBIFY" -q 2 tv.mp4 v_q2.webm
 "$WEBIFY" -q 9 tv.mp4 v_q9.webm
 "$WEBIFY" rot.mp4 v_rot.webm
+"$WEBIFY" tv.mkv v_file.webm
 "$WEBIFY" - - < tv.mkv > v_piped.webm
+"$WEBIFY" lowrate.mkv v_lowrate.webm
+"$WEBIFY" --fast lowrate.mkv v_lowrate_fast.webm  # no stats pass: header caps only
 "$WEBIFY" frag.mp4 v_frag.webm
 "$WEBIFY" stereo.mp4 v_stereo.webm
 "$WEBIFY" hdr.mp4 v_hdr.webm
+"$WEBIFY" ilace.ts v_ilace.webm
 "$WEBIFY" --fast tiny.mp4 v_fast.webm
 "$WEBIFY" --best tiny.mp4 v_best.webm
 
@@ -170,19 +215,30 @@ t "video: 720p source fits the default 480 box"       eq "$(dims v_def.webm)" "8
 t "video: mono source stays mono"                     eq "$(channels v_def.webm)" "1"
 t "video: stereo source stays stereo"                 eq "$(channels v_stereo.webm)" "2"
 t "video: HDR (PQ) tonemapped to SDR bt709"           eq "$(trc v_hdr.webm)" "bt709"
+t "video: interlaced fixture really combs"            bash -c "[ $(comb ilace.ts) -gt 1100 ]"
+t "video: interlaced source deinterlaced (bwdif)"     bash -c "[ $(comb v_ilace.webm) -lt 1000 ]"
 t "video: --fast tier produces VP9+Opus"              eq "$(codecs v_fast.webm)" "vp9+opus"
 t "video: --best tier produces VP9+Opus"              eq "$(codecs v_best.webm)" "vp9+opus"
 t "video: -q 2 smaller than -q 9"                     lt "$(size v_q2.webm)" "$(size v_q9.webm)"
 t "video: display-matrix rotation baked in"           eq "$(dims v_rot.webm)" "270,480"
 t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
-t "video: stdin -> stdout pipe (single-pass) works"   eq "$(codecs v_piped.webm)" "vp9+opus"
+t "video: piped i/o byte-identical to file i/o"       cmp -s v_file.webm v_piped.webm
+t "video: piped output keeps cues at the head"        cues_at_head v_piped.webm
+# mkv declares no stream rates, so only the stats-pass measurement can cap:
+# the video budget becomes the measured rate x0.8 (h264 codec weight), under
+# the source's own spend; the audio cap is asserted against the uncapped
+# --fast run (libopus treats bit_rate as a hint — VBR ran ~50% over the 24k
+# cap on this fixture, so an absolute threshold would be fragile)
+t "video: measured video rate caps an unmarked mkv"   lt "$(stream_bytes v_lowrate.webm v:0)" "$(stream_bytes lowrate.mkv v:0)"
+t "video: measured audio rate caps an unmarked mkv"   lt "$(stream_bytes v_lowrate.webm a:0)" "$(stream_bytes v_lowrate_fast.webm a:0)"
 t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.webm)" "vp9"
-t "video: crafted mp4 prefix does not hang the probe" bash -c "timeout 5 '$WEBIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
+t "video: crafted mp4 input does not hang"            bash -c "timeout 5 '$WEBIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
 
 # --- --next: AV1/Opus WebM video, AVIF still images -------------------------------
 "$WEBIFY" --next tv.mp4 a_tv.webm
 "$WEBIFY" --next hdr.mp4 a_hdr.webm
 "$WEBIFY" --next anim.gif a_anim.avif
+"$WEBIFY" --next tv.mkv a_file.webm
 "$WEBIFY" --next - - < tv.mkv > a_piped.webm
 "$WEBIFY" --next --fast tiny.mp4 a_fast.webm
 "$WEBIFY" --next --best tiny.mp4 a_best.webm
@@ -200,7 +256,7 @@ t "next: smaller than the VP9 default at the same -q"  lt "$(size a_tv.webm)" "$
 t "next: seek cues at the head (faststart)"            cues_at_head a_tv.webm
 t "next: HDR (PQ) tonemapped to SDR bt709"             eq "$(trc a_hdr.webm)" "bt709"
 t "next: animated gif -> animated AVIF (avis brand)"   grep -aq ftypavis a_anim.avif
-t "next: stdin -> stdout video pipe works"             eq "$(codecs a_piped.webm)" "av1+opus"
+t "next: piped i/o byte-identical to file i/o"         cmp -s a_file.webm a_piped.webm
 t "next: --fast tier produces AV1+Opus"                eq "$(codecs a_fast.webm)" "av1+opus"
 t "next: --best tier produces AV1+Opus"                eq "$(codecs a_best.webm)" "av1+opus"
 t "next: still image -> AVIF (ftyp brand)"             grep -aq ftypavif a_q.avif
@@ -210,7 +266,7 @@ t "next: alpha kept (auxiliary alpha stream)"          grep -aq "auxiliary:alpha
 t "next: fully opaque alpha channel dropped"           bash -c "! grep -aq 'auxiliary:alpha' a_opaque.avif"
 t "next: stdin -> stdout still is a valid AVIF"        grep -aq ftypavif a_piped.avif
 t "next: default still stays 4:2:0"                    eq "$(pixfmt a_q.avif)" "yuv420p"
-t "next: premium -q RGB graphics race to 4:4:4"        eq "$(pixfmt a_q9.avif)" "yuv444p"
+t "next: premium -q still stays 4:2:0 (Main profile)"  eq "$(pixfmt a_q9.avif)" "yuv420p"
 t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" "$(size anim.webp)"
 
 # --- --legacy: H.264/AAC MP4 video, PNG/APNG images ----------------------------
@@ -219,6 +275,7 @@ t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" 
 "$WEBIFY" --legacy -q 9 tv.mp4 l_q9.mp4
 "$WEBIFY" --legacy rot.mp4 l_rot.mp4
 "$WEBIFY" --legacy hdr.mp4 l_hdr.mp4
+"$WEBIFY" --legacy tv.mkv l_file.mp4
 "$WEBIFY" --legacy - - < tv.mkv > l_piped.mp4
 "$WEBIFY" --legacy --fast tiny.mp4 l_fast.mp4
 "$WEBIFY" --legacy --best tiny.mp4 l_best.mp4
@@ -240,7 +297,8 @@ t "legacy: moov at the head (faststart)"               moov_at_head l_tv.mp4
 t "legacy: -q 2 smaller than -q 9"                     lt "$(size l_q2.mp4)" "$(size l_q9.mp4)"
 t "legacy: display-matrix rotation baked in"           eq "$(dims l_rot.mp4)" "270,480"
 t "legacy: HDR (PQ) tonemapped to SDR bt709"           eq "$(trc l_hdr.mp4)" "bt709"
-t "legacy: stdin -> stdout video pipe (fragmented)"    eq "$(codecs l_piped.mp4)" "h264+aac"
+t "legacy: piped i/o byte-identical to file i/o"       cmp -s l_file.mp4 l_piped.mp4
+t "legacy: piped mp4 keeps moov at the head"           moov_at_head l_piped.mp4
 t "legacy: --fast tier produces H.264+AAC"             eq "$(codecs l_fast.mp4)" "h264+aac"
 t "legacy: --best tier produces H.264+AAC"             eq "$(codecs l_best.mp4)" "h264+aac"
 t "legacy: still image -> PNG"                         eq "$(codecs l_q.png)" "png"

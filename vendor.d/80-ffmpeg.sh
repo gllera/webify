@@ -11,7 +11,7 @@
 #     muxer) + png/apng for --legacy
 #   - the filters used by the fixed pipeline (scale, format, aformat, aresample,
 #     transpose/hflip/vflip for phone-rotation metadata, zscale/tonemap for
-#     HDR -> SDR conversion)
+#     HDR -> SDR conversion, bwdif for interlaced sources)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
@@ -56,6 +56,6 @@ echo "==> building ffmpeg"
         --enable-parser=h264,hevc,mpeg4video,mpegvideo,vp8,vp9,av1,vc1,mjpeg,aac,aac_latm,ac3,mpegaudio,opus,vorbis,flac,dca \
         --enable-parser=png,bmp,gif,webp \
         --enable-bsf=extract_extradata,vp9_superframe \
-        --enable-filter=buffer,buffersink,abuffer,abuffersink,scale,format,aformat,aresample,transpose,hflip,vflip,setsar,anull,null,zscale,tonemap && \
+        --enable-filter=buffer,buffersink,abuffer,abuffersink,scale,format,aformat,aresample,transpose,hflip,vflip,setsar,anull,null,zscale,tonemap,bwdif && \
     make -j"$JOBS" && make install)
 mark ffmpeg

@@ -51,7 +51,9 @@ file arguments):
   instead. `-q` buys the *same look* as the default formats — every
   mapping is an equal-SSIM fit — so `--next` only changes the file size:
   measured at the defaults, video −28%, stills −26%, animated GIFs −96%,
-  all within ±0.005 SSIM. Details and caveats: [doc/next.md](doc/next.md).
+  all within ±0.005 SSIM. Everything stays 8-bit 4:2:0, i.e. AV1 Main
+  profile end-to-end — the one profile hardware decoders reliably
+  implement. Details and caveats: [doc/next.md](doc/next.md).
 - `--legacy` — output H.264/AAC MP4 (real `+faststart`) and lossless
   PNG/APNG instead, again at the same visual target as the default
   pipeline (`-q` steers video only — PNG is lossless by definition).
@@ -64,9 +66,10 @@ Exit status: 0 on success, 1 when a conversion fails, 2 for usage errors.
 When stderr is a terminal and the input declares a duration, video
 conversions print pass/percentage progress.
 
-Every supported format works from stdin/stdout (`-`), including formats
-whose containers need seekable files — see [doc/piping.md](doc/piping.md)
-for how each case is handled.
+Every supported format works from stdin/stdout (`-`), and piping never
+changes the result: the bytes are identical to file i/o, with formats that
+need seeking spooled through a temporary file — see
+[doc/piping.md](doc/piping.md) for how each case is handled.
 
 ## Getting it
 
