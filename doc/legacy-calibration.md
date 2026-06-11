@@ -19,12 +19,21 @@ toward the lower-quality side.
 
 - `vid1`/`vid2`: 6 s 720p x264-crf12 masters of mandelbrot / testsrc2
   (noise / sharp synthetic graphics), as in next-calibration.md.
-- `vid3`: 6 s of Big Buck Bunny (320x240), re-mastered at crf 12 so the
-  source-rate cap never binds — **real content**. Added after a two-fixture
+- `vid3`: 6 s of Big Buck Bunny, re-mastered at crf 12 so the
+  source-rate cap never binds — **real content**. (Source swapped
+  2026-06-11 from a 320x240 archive.org derivative to the pinned
+  `fixtures/bbb.mp4` (fixtures-v1 release asset; fetched by
+  `./fixtures.sh`), 320x180 from download.blender.org — the vid3
+  numbers below predate the swap; judgments are within-run anyway.)
+  Added after a two-fixture
   fit validated fine on vid1/vid2 and then missed real content by −.03 SSIM
   at `-q 7` and +.02 at `-q 3`: mandelbrot and testsrc2 bracket the
   difficulty range but real video does not interpolate between them.
   Diversity matters even more here than for `--next`.
+- `vid5`: 6 s live-action Tears of Steel segment (`fixtures/tos.mp4`,
+  a fixtures-v1 release asset) re-mastered at crf 12 — a second real-content
+  fixture (faces, low light, film grain) added 2026-06-11 via
+  `calibrate.sh`; not part of the original 2026-06-10 fit.
 
 Two procedural lessons, both worth keeping:
 
@@ -129,6 +138,12 @@ vs 28.5 from the default curve. Shipped **+1** (lands −.003 below the
 vpx-fast look; +0 would land above, paying bytes for quality the fast
 tier never promises).
 
+Preset `faster` as the fast tier was measured with the shipped binary
+(2026-06-11): 1.2x faster than preset fast and −14% bytes at the same CRF,
+but −.003…−.012 SSIM — re-fitting the offset down to hold the vpx-fast
+look returns the bytes, so the net is ~1.2x speed on the product's already
+fastest path for a wider quality spread. Kept preset fast.
+
 ## Images: PNG / APNG effort
 
 Lossless, so only deflate effort was measured (640x480 graphics, 720p
@@ -178,6 +193,8 @@ ffmpeg at preset veryslow.
 
 `calibrate.sh` (repo root) automates the validation side: parallel
 baseline/`--next`/`--legacy` encode matrix through the shipped binary
-(thread counts therefore always correct), RGB-SSIM referee, parity report.
+(thread counts therefore always correct), at all three effort tiers by
+default (`TIERS` knob — the `--fast` +1 offset above is judged against the
+vp9-fast baseline), RGB-SSIM referee, parity report.
 See the note in doc/next-calibration.md about fixture equivalence before
 comparing against this file's absolute numbers.

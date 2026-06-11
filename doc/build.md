@@ -70,6 +70,10 @@ image-sequence inputs.
 `.github/workflows/build.yml` builds amd64 + arm64 on native runners
 (ubuntu-24.04 / ubuntu-24.04-arm), with the BuildKit layer cache persisted
 in the GitHub Actions cache per arch — one Docker stage per vendored
-library means bumping one library's pin recompiles only that library. Tag
-builds additionally publish a GitHub Release with both binary tarballs
-attached (see "Keeping pins current" above for the tag scheme).
+library means bumping one library's pin recompiles only that library.
+Version-tag builds (tags matching `[0-9]*` — see "Keeping pins current"
+above for the scheme) additionally publish a GitHub Release with both
+binary tarballs attached. Other tags do not trigger builds: the
+`fixtures-v*` releases on the releases page carry no binaries — they host
+the sha256-pinned calibration fixtures fetched by `./fixtures.sh` (see
+`doc/next-calibration.md`).

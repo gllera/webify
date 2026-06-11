@@ -23,13 +23,31 @@
 #                decide the quality)
 #   SQS="..."    still -q points (default "def 9.5")
 #   AQS="..."    animation -q points (default "def")
-#   BBB=...      Big Buck Bunny source for the real-content fixture vid3
-#                (default dist/BigBuckBunny_512kb.mp4; vid3 is skipped with a
-#                warning if missing — real content is mandatory for a re-fit,
-#                two synthetic fixtures alone mis-fit by whole CRF steps)
+#   TIERS="..."  effort tiers to sweep (default "def fast best"). The tiers
+#                carry their own calibrated offsets (--next --fast crf+4,
+#                --legacy --fast crf+1) and their own encoder paths, so each
+#                tier is parity-checked against the baseline at the SAME
+#                tier (vp9f vs av1f/x264f, ...). Set TIERS=def for dense
+#                re-fit ladders — tier offsets are validated, not re-fit
+#   BBB=...      Big Buck Bunny clip (>= 6 s) for the real-content fixture
+#                vid3 (default: fixtures/bbb.mp4, a 6 s 320x180 segment of
+#                the original render — keeps vid3 in the narrow 2-thread
+#                encode regime; vid3 is skipped with a warning if missing —
+#                real content is mandatory for a re-fit, two synthetic
+#                fixtures alone mis-fit by whole CRF steps)
+#   TOS=...      live-action source for fixture vid5 + the real-content GIF
+#                vid5.gif (default: fixtures/tos.mp4, a 6 s Tears of Steel
+#                segment — faces and film grain, the content class the
+#                synthetic fixtures miss; skipped with a warning if absent)
 #   PHOTOS="a b" two photographic stills for photo1d/photo2d (2x lanczos-
-#                downscaled so source artifacts wash out); skipped with a
-#                warning if unset — supply real photos for a stills re-fit
+#                downscaled so source artifacts wash out). Defaults to the
+#                Kodak True Color pair in fixtures/ (kodim23 parrots,
+#                kodim04 portrait); skipped with a warning if neither the
+#                override nor the default pair is present
+#
+# The fixtures/ defaults are sha256-pinned assets of the `fixtures-v1`
+# GitHub Release; ./fixtures.sh (run automatically) fetches what is missing
+# — see its header for provenance and the immutability rule.
 #
 # To sweep a CRF ladder for a curve re-fit instead of validating the shipped
 # points, pass a dense QS and invert each -q -> CRF formula (the "-q inversion
@@ -56,45 +74,59 @@ J=${J:-$(nproc)}
 QS=${QS:-"def 1 3 4.8 7 9"}
 SQS=${SQS:-"def 9.5"}
 AQS=${AQS:-"def"}
-BBB=${BBB:-dist/BigBuckBunny_512kb.mp4}
+TIERS=${TIERS:-"def fast best"}
+BBB=${BBB:-fixtures/bbb.mp4}
+TOS=${TOS:-fixtures/tos.mp4}
 PHOTOS=${PHOTOS:-}
 
-case "$MODE" in next|legacy|all) ;; *)
-    echo "usage: $0 [next|legacy|all]" >&2; exit 2;;
-esac
+# the real-content fixtures are sha256-pinned assets of the fixtures-v1
+# GitHub Release — fetch whatever is missing (not in the __measure children;
+# offline runs degrade to the per-fixture skip warnings below)
+[ "${1:-}" = __measure ] || ./fixtures.sh ||
+    echo "WARNING: fixture fetch failed — missing fixtures will be skipped" >&2
+
+[ -z "$PHOTOS" ] && [ -s fixtures/kodim23.png ] && [ -s fixtures/kodim04.png ] &&
+    PHOTOS="fixtures/kodim23.png fixtures/kodim04.png"
 
 # ---------------------------------------------------------------- internal
-# measure one output: RGB-SSIM it against its master, cache as <output>.ssim
-if [ "${2:-}" = __measure ]; then
-    o=$3; base=$(basename "$o"); fix=${base%%_*}
+# measure one output (the referee's child re-invocation): RGB-SSIM it
+# against its master, cache as <output>.ssim
+if [ "${1:-}" = __measure ]; then
+    o=$2; base=$(basename "$o"); fix=${base%%_*}
+    ssim_of() { # ffmpeg input/filter args -> the run's "All:" SSIM figure
+        ffmpeg -hide_banner -nostdin "$@" -f null - 2>&1 |
+            grep -oP 'All:\K[0-9.]+' | tail -1 || true
+    }
     ssim() { # $1 distorted, $2 reference master
         local ow oh
         read -r ow oh < <(ffprobe -v error -select_streams v:0 \
             -show_entries stream=width,height -of csv=p=0 "$1" | head -1 | tr ',' ' ')
-        ffmpeg -hide_banner -nostdin -i "$1" -i "$2" -lavfi \
-            "[0:v]format=gbrp[a];[1:v]scale=${ow}:${oh}:flags=lanczos,format=gbrp[b];[a][b]ssim" \
-            -f null - 2>&1 | grep -oP 'All:\K[0-9.]+' | tail -1 || true
+        ssim_of -i "$1" -i "$2" -lavfi \
+            "[0:v]format=gbrp[a];[1:v]scale=${ow}:${oh}:flags=lanczos,format=gbrp[b];[a][b]ssim"
     }
-    case "$base" in
-        *_animwebp_*) # host ffmpeg can't decode animated WebP: ImageMagick referees
+    case "$base" in # codec tags carry an f/b suffix for the --fast/--best tiers
+        *_animwebp*_*) # host ffmpeg can't decode animated WebP: ImageMagick referees
             s=NA
             if command -v convert >/dev/null; then
                 d=$(mktemp -d)
                 if convert "$o" -coalesce "$d/f_%03d.png" 2>/dev/null; then
-                    s=$(ffmpeg -hide_banner -nostdin -framerate 10 -i "$d/f_%03d.png" \
+                    s=$(ssim_of -framerate 10 -i "$d/f_%03d.png" \
                         -i "$DIR/$fix.gif" -lavfi \
-                        "[0:v]format=gbrp[a];[1:v]format=gbrp[b];[a][b]ssim" \
-                        -f null - 2>&1 | grep -oP 'All:\K[0-9.]+' | tail -1 || true)
+                        "[0:v]format=gbrp[a];[1:v]format=gbrp[b];[a][b]ssim")
                 fi
                 rm -rf "$d"
             fi;;
-        *_animavif_*) s=$(ssim "$o" "$DIR/$fix.gif");;
+        *_animavif*_*) s=$(ssim "$o" "$DIR/$fix.gif");;
         *.webm|*.mp4) s=$(ssim "$o" "$DIR/$fix.mp4");;
         *.avif|*.webp) s=$(ssim "$o" "$DIR/$fix.png");;
     esac
     echo "${s:-NA}" > "$o.ssim"
     exit 0
 fi
+
+case "$MODE" in next|legacy|all) ;; *)
+    echo "usage: $0 [next|legacy|all]" >&2; exit 2;;
+esac
 
 for t in ffmpeg ffprobe "$WEBIFY"; do
     command -v "$t" >/dev/null || { echo "missing: $t" >&2; exit 1; }
@@ -105,25 +137,32 @@ mkdir -p "$DIR/out"
 echo "== fixtures ($DIR)"
 gen() { local f=$1; shift; [ -s "$DIR/$f" ] || ffmpeg -hide_banner -loglevel error \
             "$@" -y "$DIR/$f"; }
-gen vid1.mp4 -t 6 -f lavfi -i mandelbrot=size=1280x720 \
-    -c:v libx264 -crf 12 -pix_fmt yuv420p &
-gen vid2.mp4 -t 6 -f lavfi -i testsrc2=size=1280x720 \
-    -c:v libx264 -crf 12 -pix_fmt yuv420p &
-gen vid1.gif -t 3 -f lavfi -i mandelbrot=size=320x240 -filter_complex \
-    "[0:v]fps=10,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a" &
-gen vid2.gif -t 3 -f lavfi -i testsrc2=size=320x240 -filter_complex \
-    "[0:v]fps=10,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a" &
-gen vid4.gif -t 3 -f lavfi -i smptebars=size=320x240 -filter_complex \
-    "[0:v]fps=10,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a" &
+# every video master is near-lossless x264; every GIF master is the same
+# 10fps dithered-palette pipeline
+MASTER="-c:v libx264 -crf 12 -pix_fmt yuv420p"
+GIFPAL="[0:v]fps=10,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a"
+gen vid1.mp4 -t 6 -f lavfi -i mandelbrot=size=1280x720 $MASTER &
+gen vid2.mp4 -t 6 -f lavfi -i testsrc2=size=1280x720 $MASTER &
+gen vid1.gif -t 3 -f lavfi -i mandelbrot=size=320x240 -filter_complex "$GIFPAL" &
+gen vid2.gif -t 3 -f lavfi -i testsrc2=size=320x240 -filter_complex "$GIFPAL" &
+gen vid4.gif -t 3 -f lavfi -i smptebars=size=320x240 -filter_complex "$GIFPAL" &
 gen mandel.png -f lavfi -i mandelbrot=size=1280x720 -frames:v 1 &
 gen chart.png -f lavfi -i testsrc2=size=1280x720 -frames:v 1 &
 gen grad.png -f lavfi -i gradients=size=1280x720:nb_colors=4 -frames:v 1 &
 gen graphic.png -f lavfi -i color=c=red:size=256x256 -frames:v 1 &
-if [ -s "$BBB" ]; then # pinned segment so re-runs measure the same content
-    gen vid3.mp4 -ss 60 -t 6 -i "$BBB" -an -c:v libx264 -crf 12 -pix_fmt yuv420p &
+if [ -s "$BBB" ]; then # committed segment so re-runs measure the same content
+    gen vid3.mp4 -t 6 -i "$BBB" -an $MASTER &
 else
     echo "WARNING: no Big Buck Bunny source ($BBB): skipping vid3 — synthetic" \
          "fixtures alone mis-fit real content by whole CRF steps" >&2
+fi
+if [ -s "$TOS" ]; then
+    gen vid5.mp4 -t 6 -i "$TOS" -an $MASTER &
+    gen vid5.gif -t 3 -i "$TOS" -filter_complex \
+        "[0:v]scale=320:-2,fps=10,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a" &
+else
+    echo "WARNING: no live-action source ($TOS): skipping vid5/vid5.gif —" \
+         "synthetic fixtures alone mis-fit real content by whole CRF steps" >&2
 fi
 if [ -n "$PHOTOS" ]; then
     set -- $PHOTOS
@@ -141,6 +180,8 @@ wait
 # one job per line, heaviest first so the pool never drains into a long tail;
 # existing outputs are skipped (the cache)
 vids="vid1 vid2"; [ -s "$DIR/vid3.mp4" ] && vids="$vids vid3"
+[ -s "$DIR/vid5.mp4" ] && vids="$vids vid5"
+anims="vid1 vid2 vid4"; [ -s "$DIR/vid5.gif" ] && anims="$anims vid5"
 stills="mandel chart grad graphic"
 [ -s "$DIR/photo1d.png" ] && stills="photo1d photo2d alphagrad $stills"
 job() { # $1 output basename, rest = webify args
@@ -148,25 +189,29 @@ job() { # $1 output basename, rest = webify args
     [ -s "$o" ] || printf '%s %s %s\n' "$WEBIFY" "$*" "$o" >> "$DIR/joblist"
 }
 qarg() { [ "$1" = def ] && echo "" || echo "-q $1"; }
+targ() { [ "$1" = def ] && echo "" || echo "--$1"; }     # tier flag
+tsuf() { [ "$1" = def ] && echo "" || echo "${1:0:1}"; } # codec tag suffix: f/b
 : > "$DIR/joblist"
-for f in $vids; do for q in $QS; do
-    [ "$MODE" = legacy ] || job "${f}_av1_${q}.webm" --next $(qarg "$q") "$DIR/$f.mp4"
-done; done
-for f in $vids; do for q in $QS; do
-    job "${f}_vp9_${q}.webm" $(qarg "$q") "$DIR/$f.mp4"
-done; done
-for f in $vids; do for q in $QS; do
-    [ "$MODE" = next ] || job "${f}_x264_${q}.mp4" --legacy $(qarg "$q") "$DIR/$f.mp4"
-done; done
+for f in $vids; do for q in $QS; do for t in $TIERS; do
+    [ "$MODE" = legacy ] || job "${f}_av1$(tsuf "$t")_${q}.webm" \
+        --next $(targ "$t") $(qarg "$q") "$DIR/$f.mp4"
+done; done; done
+for f in $vids; do for q in $QS; do for t in $TIERS; do
+    job "${f}_vp9$(tsuf "$t")_${q}.webm" $(targ "$t") $(qarg "$q") "$DIR/$f.mp4"
+done; done; done
+for f in $vids; do for q in $QS; do for t in $TIERS; do
+    [ "$MODE" = next ] || job "${f}_x264$(tsuf "$t")_${q}.mp4" \
+        --legacy $(targ "$t") $(qarg "$q") "$DIR/$f.mp4"
+done; done; done
 if [ "$MODE" != legacy ]; then
-    for f in vid1 vid2 vid4; do for q in $AQS; do
-        job "${f}_animwebp_${q}.webp" $(qarg "$q") "$DIR/$f.gif"
-        job "${f}_animavif_${q}.avif" --next $(qarg "$q") "$DIR/$f.gif"
-    done; done
-    for i in $stills; do for q in $SQS; do
-        job "${i}_webp_${q}.webp" $(qarg "$q") "$DIR/$i.png"
-        job "${i}_avif_${q}.avif" --next $(qarg "$q") "$DIR/$i.png"
-    done; done
+    for f in $anims; do for q in $AQS; do for t in $TIERS; do
+        job "${f}_animwebp$(tsuf "$t")_${q}.webp" $(targ "$t") $(qarg "$q") "$DIR/$f.gif"
+        job "${f}_animavif$(tsuf "$t")_${q}.avif" --next $(targ "$t") $(qarg "$q") "$DIR/$f.gif"
+    done; done; done
+    for i in $stills; do for q in $SQS; do for t in $TIERS; do
+        job "${i}_webp$(tsuf "$t")_${q}.webp" $(targ "$t") $(qarg "$q") "$DIR/$i.png"
+        job "${i}_avif$(tsuf "$t")_${q}.avif" --next $(targ "$t") $(qarg "$q") "$DIR/$i.png"
+    done; done; done
 fi
 echo "== encoding $(wc -l < "$DIR/joblist") missing outputs, $J-way parallel"
 xargs -P "$J" -d '\n' -r -I CMD bash -c CMD < "$DIR/joblist"
@@ -177,7 +222,7 @@ for o in "$DIR"/out/*.webm "$DIR"/out/*.mp4 "$DIR"/out/*.avif "$DIR"/out/*.webp;
     [ -e "$o" ] && [ ! -s "$o.ssim" ] && echo "$o" >> "$DIR/measlist"
 done
 echo "== measuring $(wc -l < "$DIR/measlist") outputs"
-xargs -P $(( J * 2 )) -d '\n' -r -I OUT "$0" "$MODE" __measure OUT < "$DIR/measlist"
+xargs -P $(( J * 2 )) -d '\n' -r -I OUT "$0" __measure OUT < "$DIR/measlist"
 
 : > "$DIR/results.csv"
 for o in "$DIR"/out/*.ssim; do
@@ -214,8 +259,8 @@ def table(title, base, others):
             line += f" | {c} {'NA     ' if d is None else f'{d:+.4f}'} {r:5.2f}x"
             if d is not None: deltas[c].append(d)
             ratios[c].append(r)
-    # means as a one-line summary per codec
         print(line)
+    # means as a one-line summary per codec
     for c in others:
         if ratios[c]:
             ds = deltas[c]
@@ -223,7 +268,11 @@ def table(title, base, others):
                   f"  mean {c}: delta NA", end='')
             print(f", size {sum(ratios[c])/len(ratios[c]):.2f}x of {base}")
 
-table('video', 'vp9', ['av1', 'x264'])
-table('stills', 'webp', ['avif'])
-table('animations', 'animwebp', ['animavif'])
+# one table per content type and tier; a tier's table only appears when its
+# baseline was encoded (TIERS knob), since table() skips empty key sets
+for base, others, title in [('vp9', ['av1', 'x264'], 'video'),
+                            ('webp', ['avif'], 'stills'),
+                            ('animwebp', ['animavif'], 'animations')]:
+    for suf, tier in [('', ''), ('f', ' --fast'), ('b', ' --best')]:
+        table(title + tier, base + suf, [c + suf for c in others])
 EOF

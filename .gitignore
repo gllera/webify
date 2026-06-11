@@ -2,3 +2,4 @@
 /vendor
 /.claude/*
 !/.claude/skills/
+/fixtures
