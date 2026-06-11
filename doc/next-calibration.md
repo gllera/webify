@@ -199,3 +199,14 @@ equal-SSIM sweep at q 30/50/80/95 on the photo + chart fixtures at least;
 the curves above only hold for the pinned versions. The `-q`-inversion
 trick reaches any CRF in [16,63] for stills (factor 0.75) and the full
 range for video; below stills-crf 16 use a scratch build with factor 1.0.
+
+`calibrate.sh` (repo root) automates the whole sweep: it regenerates the
+fixture matrix (including the documented content extremes), encodes
+baseline + `--next` + `--legacy` through the shipped binary in parallel
+with caching, referees everything with RGB SSIM, and prints the parity
+tables. Supply real photos via `PHOTOS=` — the synthetic fixtures alone do
+not represent photographic content. Note the fixtures it generates are
+*equivalent*, not byte-identical, to the 2026-06-10 originals (the GIF and
+chart masters measurably differ), so compare its output against a baseline
+run recorded with the same fixtures, not against the absolute numbers in
+this file.

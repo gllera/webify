@@ -175,3 +175,9 @@ thread counts and VBV settings** (see the procedural lessons above) — at
 host-default threads the cap-bound points are wrong by whole CRF steps.
 The `-q` inversion reaches any vp9-scale CRF; the x264 side is plain host
 ffmpeg at preset veryslow.
+
+`calibrate.sh` (repo root) automates the validation side: parallel
+baseline/`--next`/`--legacy` encode matrix through the shipped binary
+(thread counts therefore always correct), RGB-SSIM referee, parity report.
+See the note in doc/next-calibration.md about fixture equivalence before
+comparing against this file's absolute numbers.

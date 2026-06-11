@@ -1,3 +1,4 @@
 /dist
 /vendor
-/.claude
+/.claude/*
+!/.claude/skills/
