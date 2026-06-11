@@ -113,6 +113,8 @@ Details — vendoring, the update workflow, the full format lists, CI:
   lossless race, animations
 - [doc/next.md](doc/next.md) — `--next` (AV1/AVIF) in depth
 - [doc/legacy.md](doc/legacy.md) — `--legacy` (H.264/PNG) in depth
+- [doc/sizes.md](doc/sizes.md) — size and encode-time charts across all
+  codecs, quality points and effort tiers, at the same visual quality
 - [doc/piping.md](doc/piping.md) — stdin/stdout behavior
 - [doc/build.md](doc/build.md) — building, vendoring, CI, releases
 - [doc/next-calibration.md](doc/next-calibration.md),

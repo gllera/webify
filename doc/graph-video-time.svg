@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 420" width="720" height="420" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+<text x="360.0" y="22" text-anchor="middle" fill="#8b949e" font-size="15" font-weight="600">Video, live action (vid5, 6 s): encode time by tier, default -q</text>
+<line x1="86" y1="368.0" x2="704" y2="368.0" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="372.0" text-anchor="end" fill="#8b949e" font-size="12">0s</text>
+<line x1="86" y1="321.7" x2="704" y2="321.7" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="325.7142857142857" text-anchor="end" fill="#8b949e" font-size="12">5s</text>
+<line x1="86" y1="275.4" x2="704" y2="275.4" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="279.42857142857144" text-anchor="end" fill="#8b949e" font-size="12">10s</text>
+<line x1="86" y1="229.1" x2="704" y2="229.1" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="233.14285714285714" text-anchor="end" fill="#8b949e" font-size="12">15s</text>
+<line x1="86" y1="182.9" x2="704" y2="182.9" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="186.85714285714286" text-anchor="end" fill="#8b949e" font-size="12">20s</text>
+<line x1="86" y1="136.6" x2="704" y2="136.6" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="140.57142857142856" text-anchor="end" fill="#8b949e" font-size="12">25s</text>
+<line x1="86" y1="90.3" x2="704" y2="90.3" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="94.2857142857143" text-anchor="end" fill="#8b949e" font-size="12">30s</text>
+<line x1="86" y1="44.0" x2="704" y2="44.0" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="48.0" text-anchor="end" fill="#8b949e" font-size="12">35s</text>
+<text x="189.0" y="388" text-anchor="middle" fill="#8b949e" font-size="13">VP9</text>
+<rect x="134.0" y="277.1" width="34" height="90.9" fill="#2f81f7" rx="2"/>
+<text x="151.0" y="272.06708571428567" text-anchor="middle" fill="#8b949e" font-size="11">9.8s</text>
+<rect x="172.0" y="347.6" width="34" height="20.4" fill="#e8793a" rx="2"/>
+<text x="189.0" y="342.6250285714286" text-anchor="middle" fill="#8b949e" font-size="11">2.2s</text>
+<rect x="210.0" y="209.5" width="34" height="158.5" fill="#3fb950" rx="2"/>
+<text x="227.0" y="204.5177142857143" text-anchor="middle" fill="#8b949e" font-size="11">17s</text>
+<text x="395.0" y="388" text-anchor="middle" fill="#8b949e" font-size="13">AV1 (--next)</text>
+<rect x="340.0" y="132.3" width="34" height="235.7" fill="#2f81f7" rx="2"/>
+<text x="357.0" y="127.30388571428574" text-anchor="middle" fill="#8b949e" font-size="11">25s</text>
+<rect x="378.0" y="288.0" width="34" height="80.0" fill="#e8793a" rx="2"/>
+<text x="395.0" y="282.9534857142857" text-anchor="middle" fill="#8b949e" font-size="11">8.6s</text>
+<rect x="416.0" y="135.1" width="34" height="232.9" fill="#3fb950" rx="2"/>
+<text x="433.0" y="130.1088" text-anchor="middle" fill="#8b949e" font-size="11">25s</text>
+<text x="601.0" y="388" text-anchor="middle" fill="#8b949e" font-size="13">H.264 (--legacy)</text>
+<rect x="546.0" y="334.9" width="34" height="33.1" fill="#2f81f7" rx="2"/>
+<text x="563.0" y="329.85017142857146" text-anchor="middle" fill="#8b949e" font-size="11">3.6s</text>
+<rect x="584.0" y="361.2" width="34" height="6.8" fill="#e8793a" rx="2"/>
+<text x="601.0" y="356.19599999999997" text-anchor="middle" fill="#8b949e" font-size="11">0.73s</text>
+<rect x="622.0" y="334.6" width="34" height="33.4" fill="#3fb950" rx="2"/>
+<text x="639.0" y="329.57245714285716" text-anchor="middle" fill="#8b949e" font-size="11">3.6s</text>
+<rect x="96" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
+<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">default</text>
+<rect x="206" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
+<text x="224" y="42" text-anchor="start" fill="#8b949e" font-size="12">--fast</text>
+<rect x="316" y="32" width="12" height="12" fill="#3fb950" rx="2"/>
+<text x="334" y="42" text-anchor="start" fill="#8b949e" font-size="12">--best</text>
+</svg>

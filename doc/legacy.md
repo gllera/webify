@@ -37,7 +37,8 @@ input loses nothing.
 At equal look the size varies by content more than folklore suggests —
 measured 0.4–1.2× the VP9 bytes at the default `-q` (synthetic graphics far
 smaller, real content slightly bigger): the compatibility tax is mostly the
-encode time the veryslow default spends.
+encode time the veryslow default spends. [sizes.md](sizes.md) charts size
+and encode time across the `-q` range and the effort tiers.
 
 ## Audio
 

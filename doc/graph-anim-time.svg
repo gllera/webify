@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 420" width="720" height="420" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">
+<text x="360.0" y="22" text-anchor="middle" fill="#8b949e" font-size="15" font-weight="600">Animated GIF, live action (vid5.gif, 3 s): encode time by tier, default -q</text>
+<line x1="86" y1="368.0" x2="704" y2="368.0" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="372.0" text-anchor="end" fill="#8b949e" font-size="12">0s</text>
+<line x1="86" y1="303.2" x2="704" y2="303.2" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="307.2" text-anchor="end" fill="#8b949e" font-size="12">1s</text>
+<line x1="86" y1="238.4" x2="704" y2="238.4" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="242.4" text-anchor="end" fill="#8b949e" font-size="12">2s</text>
+<line x1="86" y1="173.6" x2="704" y2="173.6" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="177.6" text-anchor="end" fill="#8b949e" font-size="12">3s</text>
+<line x1="86" y1="108.8" x2="704" y2="108.8" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="112.79999999999998" text-anchor="end" fill="#8b949e" font-size="12">4s</text>
+<line x1="86" y1="44.0" x2="704" y2="44.0" stroke="#8b949e" stroke-opacity="0.25"/>
+<text x="78" y="48.0" text-anchor="end" fill="#8b949e" font-size="12">5s</text>
+<text x="240.5" y="388" text-anchor="middle" fill="#8b949e" font-size="13">animated WebP</text>
+<rect x="185.5" y="100.8" width="34" height="267.2" fill="#2f81f7" rx="2"/>
+<text x="202.5" y="95.76480000000001" text-anchor="middle" fill="#8b949e" font-size="11">4.1s</text>
+<rect x="223.5" y="356.8" width="34" height="11.2" fill="#e8793a" rx="2"/>
+<text x="240.5" y="351.7896" text-anchor="middle" fill="#8b949e" font-size="11">0.17s</text>
+<rect x="261.5" y="102.9" width="34" height="265.1" fill="#3fb950" rx="2"/>
+<text x="278.5" y="97.90319999999998" text-anchor="middle" fill="#8b949e" font-size="11">4.1s</text>
+<text x="549.5" y="388" text-anchor="middle" fill="#8b949e" font-size="13">animated AVIF (--next)</text>
+<rect x="494.5" y="236.3" width="34" height="131.7" fill="#2f81f7" rx="2"/>
+<text x="511.5" y="231.3264" text-anchor="middle" fill="#8b949e" font-size="11">2s</text>
+<rect x="532.5" y="286.4" width="34" height="81.6" fill="#e8793a" rx="2"/>
+<text x="549.5" y="281.41679999999997" text-anchor="middle" fill="#8b949e" font-size="11">1.3s</text>
+<rect x="570.5" y="236.4" width="34" height="131.6" fill="#3fb950" rx="2"/>
+<text x="587.5" y="231.3912" text-anchor="middle" fill="#8b949e" font-size="11">2s</text>
+<rect x="96" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
+<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">default</text>
+<rect x="206" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
+<text x="224" y="42" text-anchor="start" fill="#8b949e" font-size="12">--fast</text>
+<rect x="316" y="32" width="12" height="12" fill="#3fb950" rx="2"/>
+<text x="334" y="42" text-anchor="start" fill="#8b949e" font-size="12">--best</text>
+</svg>

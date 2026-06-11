@@ -34,7 +34,8 @@ the data and method):
 Measured at the defaults: video −28% bytes at equal SSIM (low `-q` reaches
 −60%), stills −26%, and animated GIFs −86% on live action (synthetic and
 graphic anims −79…−92%, riding above parity) — all within ±0.005 SSIM of
-their VP9/WebP counterpart on real content.
+their VP9/WebP counterpart on real content. [sizes.md](sizes.md) charts
+size and encode time across the whole `-q` range and the effort tiers.
 
 ## Alpha and chroma
 
