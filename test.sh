@@ -31,14 +31,30 @@ t() { # <description> <command...> — command's exit code decides pass/fail
 }
 eq()     { [ "$1" = "$2" ]; }
 lt()     { [ "$1" -lt "$2" ]; }
-rejects() { ! "$WEBIFY" "$@" in out 2>/dev/null; }
+rejects() { ! "$WEBIFY" "$@" 2>/dev/null; }
+
+# The ~50 encodes dominate the suite's wall time and are all independent
+# (distinct outputs, fixture inputs only), while each webify run uses just
+# its own small thread count — so all sections queue their encodes with
+# enc into one $(nproc)-way pool, drained once before the first assert
+# that reads an output: wall time is the longest single encode, not the
+# sum of per-section maxima. Outputs are deterministic (bitexact muxing),
+# so parallel runs change no bytes.
+W=$(printf '%q' "$WEBIFY")
+JOBS=()
+enc()   { JOBS+=("$1"); } # queue one encode command line (runs via bash -c)
+drain() {
+    printf '%s\n' "${JOBS[@]}" | xargs -P "$(nproc)" -d '\n' -r -I CMD bash -c CMD
+    JOBS=()
+}
 
 ff()       { ffmpeg -hide_banner -loglevel error -y "$@"; }
-dims()     { ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1" | head -1; } # first line only: mpegts lists the stream once per program
-codecs()   { ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$1" | paste -sd+; }
-channels() { ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$1"; }
-trc()      { ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1"; }
-pixfmt()   { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1"; }
+probe()    { ffprobe -v error -select_streams "$1" -show_entries "stream=$2" -of csv=p=0 "$3"; }
+dims()     { probe v:0 width,height "$1" | head -1; } # first line only: mpegts lists the stream once per program
+codecs()   { ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$1" | paste -sd+; } # all streams, so no -select_streams
+channels() { probe a:0 channels "$1"; }
+trc()      { probe v:0 color_transfer "$1"; }
+pixfmt()   { probe v:0 pix_fmt "$1"; }
 size()     { stat -c%s "$1"; }
 stream_bytes() { # summed packet payload of one stream: <file> <v:0|a:0>
     # csv rows can carry a trailing comma (webm/opus packets), split it off
@@ -155,28 +171,78 @@ open("exif.jpg", "wb").write(jpg[:2] + b"\xff\xe1" +
 EOF
 
 # --- CLI contract --------------------------------------------------------------
-t "--help exits 0 and prints usage"        bash -c "'$WEBIFY' --help | grep -q usage"
-t "--version names webify and FFmpeg"     bash -c "'$WEBIFY' --version | grep -q 'webify .*FFmpeg'"
-t "-q 11 (out of range) rejected"          rejects -q 11
-t "-q 60 (old 0-100 scale) rejected"       rejects -q 60
-t "--max bogus rejected"                   rejects --max bogus
-t "--fast with --best rejected"            rejects --fast --best
-t "audio-only input rejected"              bash -c "! '$WEBIFY' audio.wav x.webm 2>/dev/null"
+t "--help exits 0 and prints usage"        bash -c "$W --help | grep -q usage"
+t "--version names webify and FFmpeg"     bash -c "$W --version | grep -q 'webify .*FFmpeg'"
+t "-q 11 (out of range) rejected"          rejects -q 11 in out
+t "-q 60 (old 0-100 scale) rejected"       rejects -q 60 in out
+t "--max bogus rejected"                   rejects --max bogus in out
+t "--fast with --best rejected"            rejects --fast --best in out
+t "audio-only input rejected"              rejects audio.wav x.webm
+
+# --- encodes (all sections; the assert blocks below only read the outputs) -----
+# images
+enc "$W photo.png  q_def.webp"
+enc "$W -q 8   photo.png q8.webp"
+enc "$W -q 2   photo.png q2.webp"
+enc "$W -q 9.5 photo.png q95.webp"
+enc "$W -m 240  photo.png m240.webp"
+enc "$W -m 2000 photo.png m2000.webp"
+enc "$W - - < photo.png > piped.webp"
+enc "$W --fast photo.png q_fast.webp"
+enc "$W flat.png flat.webp"
+enc "$W anim.gif anim.webp"
+enc "$W exif.jpg exif.webp"
+enc "cwebp -quiet -q 80 -m 6 -sharp_yuv photo.png -o ref80.webp"
+# video
+enc "$W tv.mp4 v_def.webm"
+enc "$W -q 2 tv.mp4 v_q2.webm"
+enc "$W -q 9 tv.mp4 v_q9.webm"
+enc "$W rot.mp4 v_rot.webm"
+enc "$W tv.mkv v_file.webm"      # identity pair on mkv: also covers piping a container with no header rates
+enc "$W - - < tv.mkv > v_piped.webm"
+enc "$W lowrate.mkv v_lowrate.webm"
+enc "$W --fast lowrate.mkv v_lowrate_fast.webm"   # no stats pass: header caps only
+enc "$W frag.mp4 v_frag.webm"
+enc "$W stereo.mp4 v_stereo.webm"
+enc "$W hdr.mp4 v_hdr.webm"
+enc "$W ilace.ts v_ilace.webm"
+enc "$W --fast tiny.mp4 v_fast.webm"
+enc "$W --best tiny.mp4 v_best.webm"
+# --next
+enc "$W --next tv.mp4 a_tv.webm"
+enc "$W --next hdr.mp4 a_hdr.webm"
+enc "$W --next anim.gif a_anim.avif"
+enc "$W --next - - < tv.mp4 > a_piped.webm"    # file-run reference: a_tv.webm above
+enc "$W --next --fast tiny.mp4 a_fast.webm"
+enc "$W --next --best tiny.mp4 a_best.webm"
+enc "$W --next photo.png a_q.avif"
+enc "$W --next -q 2 photo.png a_q2.avif"
+enc "$W --next -q 9 photo.png a_q9.avif"
+enc "$W --next alpha.png a_alpha.avif"
+enc "$W --next opaque.png a_opaque.avif"
+enc "$W --next exif.jpg a_exif.avif"
+enc "$W --next - - < photo.png > a_piped.avif"
+# --legacy
+enc "$W --legacy tv.mp4 l_tv.mp4"
+enc "$W --legacy -q 2 tv.mp4 l_q2.mp4"
+enc "$W --legacy -q 9 tv.mp4 l_q9.mp4"
+enc "$W --legacy rot.mp4 l_rot.mp4"
+enc "$W --legacy hdr.mp4 l_hdr.mp4"
+enc "$W --legacy - - < tv.mp4 > l_piped.mp4"   # file-run reference: l_tv.mp4 above
+enc "$W --legacy --fast tiny.mp4 l_fast.mp4"
+enc "$W --legacy --best tiny.mp4 l_best.mp4"
+enc "$W --legacy photo.png l_q.png"
+enc "$W --legacy -q 2 photo.png l_q2.png"
+enc "$W --legacy plain.jpg l_jpg.png"
+enc "$W --legacy alpha.png l_alpha.png"
+enc "$W --legacy opaque.png l_opaque.png"
+enc "$W --legacy exif.jpg l_exif.png"
+enc "$W --legacy anim.gif l_anim.png"
+enc "$W --legacy - - < photo.png > l_piped.png"
+enc "$W --legacy - - < anim.gif > l_piped_anim.png"
+drain
 
 # --- images --------------------------------------------------------------------
-"$WEBIFY" photo.png  q_def.webp
-"$WEBIFY" -q 8   photo.png q8.webp
-"$WEBIFY" -q 2   photo.png q2.webp
-"$WEBIFY" -q 9.5 photo.png q95.webp
-"$WEBIFY" -m 240  photo.png m240.webp
-"$WEBIFY" -m 2000 photo.png m2000.webp
-"$WEBIFY" - - < photo.png > piped.webp
-"$WEBIFY" --fast photo.png q_fast.webp
-"$WEBIFY" flat.png flat.webp
-"$WEBIFY" anim.gif anim.webp
-"$WEBIFY" exif.jpg exif.webp
-cwebp -quiet -q 80 -m 6 -sharp_yuv photo.png -o ref80.webp
-
 t "image: default == -q 8 byte-identical"             cmp -s q_def.webp q8.webp
 t "image: -q 8 == cwebp -q 80 -m 6 -sharp_yuv"        cmp -s q8.webp ref80.webp
 t "image: -q 2 smaller than -q 8"                     lt "$(size q2.webp)" "$(size q8.webp)"
@@ -190,21 +256,6 @@ t "image: animated gif -> animated WebP (ANIM chunk)" grep -aq ANIM anim.webp
 t "image: EXIF orientation baked in (-> 480x640)"     eq "$(dims exif.webp)" "480,640"
 
 # --- video ---------------------------------------------------------------------
-"$WEBIFY" tv.mp4 v_def.webm
-"$WEBIFY" -q 2 tv.mp4 v_q2.webm
-"$WEBIFY" -q 9 tv.mp4 v_q9.webm
-"$WEBIFY" rot.mp4 v_rot.webm
-"$WEBIFY" tv.mkv v_file.webm     # identity pair on mkv: also covers piping a container with no header rates
-"$WEBIFY" - - < tv.mkv > v_piped.webm
-"$WEBIFY" lowrate.mkv v_lowrate.webm
-"$WEBIFY" --fast lowrate.mkv v_lowrate_fast.webm  # no stats pass: header caps only
-"$WEBIFY" frag.mp4 v_frag.webm
-"$WEBIFY" stereo.mp4 v_stereo.webm
-"$WEBIFY" hdr.mp4 v_hdr.webm
-"$WEBIFY" ilace.ts v_ilace.webm
-"$WEBIFY" --fast tiny.mp4 v_fast.webm
-"$WEBIFY" --best tiny.mp4 v_best.webm
-
 t "video: VP9 + Opus"                                 eq "$(codecs v_def.webm)" "vp9+opus"
 t "video: 720p source fits the default 480 box"       eq "$(dims v_def.webm)" "854,480"
 t "video: mono source stays mono"                     eq "$(channels v_def.webm)" "1"
@@ -227,23 +278,9 @@ t "video: piped output keeps cues at the head"        cues_at_head v_piped.webm
 t "video: measured video rate caps an unmarked mkv"   lt "$(stream_bytes v_lowrate.webm v:0)" "$(stream_bytes lowrate.mkv v:0)"
 t "video: measured audio rate caps an unmarked mkv"   lt "$(stream_bytes v_lowrate.webm a:0)" "$(stream_bytes v_lowrate_fast.webm a:0)"
 t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.webm)" "vp9"
-t "video: crafted mp4 input does not hang"            bash -c "timeout 5 '$WEBIFY' - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
+t "video: crafted mp4 input does not hang"            bash -c "timeout 5 $W - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
 
 # --- --next: AV1/Opus WebM video, AVIF still images -------------------------------
-"$WEBIFY" --next tv.mp4 a_tv.webm
-"$WEBIFY" --next hdr.mp4 a_hdr.webm
-"$WEBIFY" --next anim.gif a_anim.avif
-"$WEBIFY" --next - - < tv.mp4 > a_piped.webm   # file-run reference: a_tv.webm above
-"$WEBIFY" --next --fast tiny.mp4 a_fast.webm
-"$WEBIFY" --next --best tiny.mp4 a_best.webm
-"$WEBIFY" --next photo.png a_q.avif
-"$WEBIFY" --next -q 2 photo.png a_q2.avif
-"$WEBIFY" --next -q 9 photo.png a_q9.avif
-"$WEBIFY" --next alpha.png a_alpha.avif
-"$WEBIFY" --next opaque.png a_opaque.avif
-"$WEBIFY" --next exif.jpg a_exif.avif
-"$WEBIFY" --next - - < photo.png > a_piped.avif
-
 t "next: video becomes AV1 + Opus"                     eq "$(codecs a_tv.webm)" "av1+opus"
 t "next: 720p source fits the default 480 box"         eq "$(dims a_tv.webm)" "854,480"
 t "next: smaller than the VP9 default at the same -q"  lt "$(size a_tv.webm)" "$(size v_def.webm)"
@@ -264,25 +301,7 @@ t "next: premium -q still stays 4:2:0 (Main profile)"  eq "$(pixfmt a_q9.avif)" 
 t "next: animated AVIF smaller than animated WebP"     lt "$(size a_anim.avif)" "$(size anim.webp)"
 
 # --- --legacy: H.264/AAC MP4 video, PNG/APNG images ----------------------------
-"$WEBIFY" --legacy tv.mp4 l_tv.mp4
-"$WEBIFY" --legacy -q 2 tv.mp4 l_q2.mp4
-"$WEBIFY" --legacy -q 9 tv.mp4 l_q9.mp4
-"$WEBIFY" --legacy rot.mp4 l_rot.mp4
-"$WEBIFY" --legacy hdr.mp4 l_hdr.mp4
-"$WEBIFY" --legacy - - < tv.mp4 > l_piped.mp4  # file-run reference: l_tv.mp4 above
-"$WEBIFY" --legacy --fast tiny.mp4 l_fast.mp4
-"$WEBIFY" --legacy --best tiny.mp4 l_best.mp4
-"$WEBIFY" --legacy photo.png l_q.png
-"$WEBIFY" --legacy -q 2 photo.png l_q2.png
-"$WEBIFY" --legacy plain.jpg l_jpg.png
-"$WEBIFY" --legacy alpha.png l_alpha.png
-"$WEBIFY" --legacy opaque.png l_opaque.png
-"$WEBIFY" --legacy exif.jpg l_exif.png
-"$WEBIFY" --legacy anim.gif l_anim.png
-"$WEBIFY" --legacy - - < photo.png > l_piped.png
-"$WEBIFY" --legacy - - < anim.gif > l_piped_anim.png
-
-t "legacy: --next with --legacy rejected"              rejects --next --legacy
+t "legacy: --next with --legacy rejected"              rejects --next --legacy in out
 t "legacy: video becomes H.264 + AAC"                  eq "$(codecs l_tv.mp4)" "h264+aac"
 t "legacy: 720p source fits the default 480 box"       eq "$(dims l_tv.mp4)" "854,480"
 t "legacy: mono source stays mono"                     eq "$(channels l_tv.mp4)" "1"
