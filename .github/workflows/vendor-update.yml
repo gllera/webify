@@ -39,12 +39,21 @@ jobs:
               commit -am 'vendor: bump pins to latest upstream releases' \
               -m "$(grep '^bump' /tmp/vendor-update.txt)"
           git push -f origin HEAD:vendor-updates
+          # tag the bumped vendor state as <ffmpeg-version>-<utc-date>, e.g.
+          # 8.1.1-20260115 (ffmpeg's version after the update, whether or not
+          # ffmpeg itself was among the bumps); -f so a same-day rerun moves
+          # the tag to the newest bump commit instead of failing
+          tag="$(sed -n 's/^FFMPEG_VERSION=//p' vendor.d/80-ffmpeg.sh)-$(date -u +%Y%m%d)"
+          git tag -f "$tag"
+          git push -f origin "refs/tags/$tag"
           {
             echo 'Automated monthly vendor version check (`update-vendor.sh`):'
             echo
             echo '```'
             cat /tmp/vendor-update.txt
             echo '```'
+            echo
+            echo "Vendor state tagged \`$tag\`."
             echo
             echo 'CI was dispatched on this branch — merge only when both arches are green.'
           } > /tmp/pr-body.md
