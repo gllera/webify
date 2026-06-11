@@ -26,9 +26,9 @@ jobs:
             runner: ubuntu-24.04-arm # native arm64 — no qemu emulation
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Same build as ./build.sh, with the BuildKit layer cache persisted in
       # the GitHub Actions cache. Every vendored library has its own Docker
@@ -36,7 +36,7 @@ jobs:
       # one library's version/sha256 recompiles only that library (plus the
       # ffmpeg stage that links it); every other library restores from cache.
       - name: Build static binary
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: dist
@@ -55,7 +55,7 @@ jobs:
         run: tar -C dist -czf webify-linux-${{ matrix.arch }}.tar.gz webify
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: webify-linux-${{ matrix.arch }}
           path: webify-linux-${{ matrix.arch }}.tar.gz
@@ -72,7 +72,7 @@ jobs:
     permissions:
       contents: write # create the release and upload its assets
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: webify-linux-*
           merge-multiple: true
