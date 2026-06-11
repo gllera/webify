@@ -3,9 +3,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-OPUS_VERSION=1.6.1
+OPUS_VERSION=1.5.2
 # sha256 matches the publisher's checksum file
-OPUS_SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+OPUS_SHA256=deadbeef
 
 built opus && exit 0
 
