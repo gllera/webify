@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['*'] # a tag build also publishes a GitHub Release (see release job)
   pull_request:
   workflow_dispatch:
 
@@ -59,3 +60,30 @@ jobs:
           name: webify-linux-${{ matrix.arch }}
           path: webify-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
+
+  # On tag builds (pushed tags, or the vendor-update workflow dispatching on
+  # the tag it created — GITHUB_TOKEN-pushed tags never fire on:push), attach
+  # both arch binaries to a GitHub Release for the tag. needs waits for the
+  # whole matrix, so a release only ever ships when both arches built.
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: webify-linux-*
+          merge-multiple: true
+
+      - name: Create release and attach binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' -R '${{ github.repository }}' \
+              --verify-tag --title '${{ github.ref_name }}' \
+              --notes 'Static `webify` binaries (linux amd64 + arm64), vendor state `${{ github.ref_name }}`.' \
+            || echo 'release already exists — refreshing assets'
+          gh release upload '${{ github.ref_name }}' -R '${{ github.repository }}' --clobber \
+              webify-linux-amd64.tar.gz webify-linux-arm64.tar.gz

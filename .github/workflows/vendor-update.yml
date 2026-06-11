@@ -56,13 +56,17 @@ jobs:
             echo
             echo "Vendor state tagged \`$tag\`."
             echo
-            echo 'CI was dispatched on this branch — merge only when both arches are green.'
+            echo 'CI was dispatched on the tag (same commit as this branch): green on'
+            echo 'both arches publishes the release with the binaries attached — merge'
+            echo 'only when it is.'
           } > /tmp/pr-body.md
           gh pr create --head vendor-updates \
               --title 'vendor: bump pins to latest upstream releases' \
               --body-file /tmp/pr-body.md \
             || gh pr edit vendor-updates --body-file /tmp/pr-body.md
-          gh workflow run build.yml --ref vendor-updates
+          # dispatched on the tag ref so build.yml's release job attaches the
+          # binaries (a GITHUB_TOKEN tag push can't fire on:push by itself)
+          gh workflow run build.yml --ref "refs/tags/$tag"
 
       - name: Surface probe failures
         if: steps.check.outcome == 'failure'
