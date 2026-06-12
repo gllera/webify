@@ -24,28 +24,28 @@
 <text x="549.5" y="388" text-anchor="middle" fill="#8b949e" font-size="12">7</text>
 <text x="704.0" y="388" text-anchor="middle" fill="#8b949e" font-size="12">9</text>
 <text x="395.0" y="408" text-anchor="middle" fill="#8b949e" font-size="12">-q  (equal visual quality per point)</text>
-<polyline points="86.0,302.9 240.5,226.4 379.6,161.4 549.5,85.0 704.0,63.9" fill="none" stroke="#8b949e" stroke-width="2.5"/>
-<circle cx="86.0" cy="302.9" r="3.5" fill="#8b949e"/>
-<circle cx="240.5" cy="226.4" r="3.5" fill="#8b949e"/>
-<circle cx="379.6" cy="161.4" r="3.5" fill="#8b949e"/>
-<circle cx="549.5" cy="85.0" r="3.5" fill="#8b949e"/>
-<circle cx="704.0" cy="63.9" r="3.5" fill="#8b949e"/>
-<rect x="96" y="32" width="12" height="12" fill="#8b949e" rx="2"/>
-<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">VP9 (default)</text>
-<polyline points="86.0,331.9 240.5,264.8 379.6,213.2 549.5,158.4 704.0,80.8" fill="none" stroke="#2f81f7" stroke-width="2.5"/>
-<circle cx="86.0" cy="331.9" r="3.5" fill="#2f81f7"/>
-<circle cx="240.5" cy="264.8" r="3.5" fill="#2f81f7"/>
-<circle cx="379.6" cy="213.2" r="3.5" fill="#2f81f7"/>
-<circle cx="549.5" cy="158.4" r="3.5" fill="#2f81f7"/>
-<circle cx="704.0" cy="80.8" r="3.5" fill="#2f81f7"/>
-<rect x="225.60000000000002" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
-<text x="243.60000000000002" y="42" text-anchor="start" fill="#8b949e" font-size="12">AV1 (--next)</text>
 <polyline points="86.0,265.8 240.5,223.1 379.6,203.7 549.5,168.5 704.0,135.7" fill="none" stroke="#e8793a" stroke-width="2.5"/>
 <circle cx="86.0" cy="265.8" r="3.5" fill="#e8793a"/>
 <circle cx="240.5" cy="223.1" r="3.5" fill="#e8793a"/>
 <circle cx="379.6" cy="203.7" r="3.5" fill="#e8793a"/>
 <circle cx="549.5" cy="168.5" r="3.5" fill="#e8793a"/>
 <circle cx="704.0" cy="135.7" r="3.5" fill="#e8793a"/>
-<rect x="348.0" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
-<text x="366.0" y="42" text-anchor="start" fill="#8b949e" font-size="12">H.264 (--legacy)</text>
+<rect x="96" y="32" width="12" height="12" fill="#e8793a" rx="2"/>
+<text x="114" y="42" text-anchor="start" fill="#8b949e" font-size="12">H.264 (--legacy)</text>
+<polyline points="86.0,302.9 240.5,226.4 379.6,161.4 549.5,85.0 704.0,63.9" fill="none" stroke="#8b949e" stroke-width="2.5"/>
+<circle cx="86.0" cy="302.9" r="3.5" fill="#8b949e"/>
+<circle cx="240.5" cy="226.4" r="3.5" fill="#8b949e"/>
+<circle cx="379.6" cy="161.4" r="3.5" fill="#8b949e"/>
+<circle cx="549.5" cy="85.0" r="3.5" fill="#8b949e"/>
+<circle cx="704.0" cy="63.9" r="3.5" fill="#8b949e"/>
+<rect x="247.2" y="32" width="12" height="12" fill="#8b949e" rx="2"/>
+<text x="265.2" y="42" text-anchor="start" fill="#8b949e" font-size="12">VP9 (default)</text>
+<polyline points="86.0,331.9 240.5,264.8 379.6,213.2 549.5,158.4 704.0,80.8" fill="none" stroke="#2f81f7" stroke-width="2.5"/>
+<circle cx="86.0" cy="331.9" r="3.5" fill="#2f81f7"/>
+<circle cx="240.5" cy="264.8" r="3.5" fill="#2f81f7"/>
+<circle cx="379.6" cy="213.2" r="3.5" fill="#2f81f7"/>
+<circle cx="549.5" cy="158.4" r="3.5" fill="#2f81f7"/>
+<circle cx="704.0" cy="80.8" r="3.5" fill="#2f81f7"/>
+<rect x="376.8" y="32" width="12" height="12" fill="#2f81f7" rx="2"/>
+<text x="394.8" y="42" text-anchor="start" fill="#8b949e" font-size="12">AV1 (--next)</text>
 </svg>

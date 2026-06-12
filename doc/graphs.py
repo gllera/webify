@@ -204,19 +204,19 @@ def photo_mean(codec, q):
 # video: same look per -q, who pays how many bytes (default tier)
 line_chart(os.path.join(DIR, 'graph-video-q.svg'),
            'Video, live action (vid5): size at the same look, default tier',
-           [('VP9 (default)', GRAY, pts('vid5', 'vp9', QV)),
-            ('AV1 (--next)', BLUE, pts('vid5', 'av1', QV)),
-            ('H.264 (--legacy)', ORANGE, pts('vid5', 'x264', QV))],
+           [('H.264 (--legacy)', ORANGE, pts('vid5', 'x264', QV)),
+            ('VP9 (default)', GRAY, pts('vid5', 'vp9', QV)),
+            ('AV1 (--next)', BLUE, pts('vid5', 'av1', QV))],
            '-q  (equal visual quality per point)', log2y=True)
 
 # video: what each effort tier costs in bytes at the default -q
 bar_chart(os.path.join(DIR, 'graph-video-tiers.svg'),
           'Video, live action (vid5): size by effort tier, default -q (KB)',
-          [('VP9', {t: rows[('vid5', 'vp9' + s, 'def')]
+          [('H.264 (--legacy)', {t: rows[('vid5', 'x264' + s, 'def')]
+                    for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))}),
+           ('VP9', {t: rows[('vid5', 'vp9' + s, 'def')]
                     for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))}),
            ('AV1 (--next)', {t: rows[('vid5', 'av1' + s, 'def')]
-                    for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))}),
-           ('H.264 (--legacy)', {t: rows[('vid5', 'x264' + s, 'def')]
                     for t, s in (('default', ''), ('--fast', 'f'), ('--best', 'b'))})],
           [('--fast', ORANGE), ('default', BLUE), ('--best', GREEN)])
 
@@ -258,8 +258,8 @@ if os.path.exists(tcsv):
     for out, title, groups in (
         ('graph-video-time.svg',
          'Video, live action (vid5, 6 s): encode time by tier, default -q',
-         [('VP9', tierd('vid5', 'vp9')), ('AV1 (--next)', tierd('vid5', 'av1')),
-          ('H.264 (--legacy)', tierd('vid5', 'x264'))]),
+         [('H.264 (--legacy)', tierd('vid5', 'x264')), ('VP9', tierd('vid5', 'vp9')),
+          ('AV1 (--next)', tierd('vid5', 'av1'))]),
         ('graph-stills-time.svg',
          'Stills, photo (256x384): encode time by tier, default -q',
          [('WebP', tierd('photo2d', 'webp')),
