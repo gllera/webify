@@ -17,6 +17,13 @@ WEBIFY="${WEBIFY:-$PWD/dist/webify}"
 for tool in ffmpeg ffprobe cwebp python3; do
     command -v "$tool" >/dev/null || { echo "missing host tool: $tool"; exit 1; }
 done
+# the fixture recipes need host ffmpeg >= 6 (-display_rotation is a 6.0
+# option); git/master builds report no leading number and skip the check
+ffv=$(ffmpeg -version | sed -n '1s/^ffmpeg version n\{0,1\}\([0-9]\{1,\}\).*/\1/p')
+if [ -n "$ffv" ] && [ "$ffv" -lt 6 ]; then
+    echo "host ffmpeg is too old ($ffv): the fixture recipes need ffmpeg >= 6"
+    exit 1
+fi
 [ -x "$WEBIFY" ] || { echo "missing $WEBIFY — run ./build.sh first"; exit 1; }
 
 TMP="$(mktemp -d)"

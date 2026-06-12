@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2046,SC2086  # targ/qarg/$MASTER/$PHOTOS expand to
+#                                     zero-or-more words: splitting is the point
 # calibrate.sh — parallel equal-SSIM calibration harness for --next/--legacy.
 #
 # Runs the fixture matrix from doc/next-calibration.md / doc/legacy-calibration.md

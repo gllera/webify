@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by the per-library build scripts in this directory (sourced, not
 # executed). Each script pins its own version + tarball sha256 — the build
 # fails loudly if upstream ever serves different bytes.
@@ -8,6 +9,7 @@ PREFIX="$ROOT/vendor/out"
 JOBS="${JOBS:-$(nproc)}"
 
 # -ffunction-sections/-fdata-sections lets the final link drop unused code
+# shellcheck disable=SC2034  # consumed by the sourcing vendor.d/*.sh scripts
 SECTION_CFLAGS="-ffunction-sections -fdata-sections"
 
 export PATH="$PREFIX/bin:$PATH"
