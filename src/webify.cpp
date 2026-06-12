@@ -650,23 +650,6 @@ static int is_hdr_trc(enum AVColorTransferCharacteristic trc)
     return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67;
 }
 
-/* How far a bit goes in the source codec relative to VP9. Reproducing what
- * an older codec stored needs fewer VP9 bits than the source spent (its bits
- * bought less quality); matching AV1 needs more. Used only to *cap* the rate
- * budget, so the tiers can stay coarse. */
-static double codec_weight(enum AVCodecID id)
-{
-    switch (id) {
-    case AV_CODEC_ID_AV1:    return 1.3;
-    case AV_CODEC_ID_VP9:
-    case AV_CODEC_ID_HEVC:   return 1.0;
-    case AV_CODEC_ID_H264:
-    case AV_CODEC_ID_VP8:
-    case AV_CODEC_ID_THEORA: return 0.8;
-    default:                 return 0.6; /* mpeg1/2/4, wmv/vc-1, h.263, ... */
-    }
-}
-
 /* tile-columns log2 follows Google's VOD table by output width; threads run
  * at double the column count, which row-mt keeps busy:
  * <512 -> 0/2, 480p-ish -> 1/4, 720-1080p -> 2/8, 1440p+ -> 3/16 */
@@ -949,33 +932,6 @@ end:
     av_dict_free(&opts);
 }
 
-/* -q with the image pipelines' default applied (cwebp's 80) */
-static double image_quality(void)
-{
-    return opt.quality < 0 ? 80.0 : opt.quality;
-}
-
-/* the calibrated still-image AVIF CRF for a -q: equal-SSIM fit against the
- * WebP pipeline, near-linear to q 80 then diving with cwebp's premium top
- * end (see the mapping comment in init_video and doc/next-calibration.md).
- * --fast rides 4 lower: cwebp's quick settings (-m 4) cost bytes but not
- * quality, while allintra cpu-used 6 drops ~.01-.02 SSIM on photographic
- * detail at the same CRF — the fast look needs the bits back (measured on
- * the Kodak fixtures; synthetic content never showed it). */
-static int avif_still_crf(double q)
-{
-    double c = q <= 80 ? 52.0 - 0.30 * q : 28.0 - 1.10 * (q - 80.0);
-
-    if (opt.effort < 0)
-        c -= 4.0;
-    return (int)lrint(FFMAX(c, 0.0));
-}
-
-/* --legacy maps -q onto the look the *default* pipeline would produce; with
- * no -q that look depends on whether VP9 would have run two passes (crf 36)
- * or one (crf 33) — webify_run records its two-pass decision here */
-static int vp9_ref_twopass;
-
 /* bytes accumulated over a packet-dts span -> bits/s; 0 when the span is
  * missing or too short to be meaningful (1-2 packet streams) */
 static int64_t span_rate(int64_t bytes, const int64_t t[2], AVRational tb)
@@ -983,6 +939,76 @@ static int64_t span_rate(int64_t bytes, const int64_t t[2], AVRational tb)
     double s = t[0] == AV_NOPTS_VALUE ? 0 : (t[1] - t[0]) * av_q2d(tb);
 
     return s >= 0.1 ? (int64_t)(bytes * 8 / s) : 0;
+}
+
+/* ==== Calibration ============================================================
+ * Every constant from here to the end of the section is a measurement, not
+ * a design choice: the --next/--legacy CRF curves are equal-SSIM fits
+ * against the default VP9/Opus/WebP pipeline (method and data in
+ * doc/next-calibration.md and doc/legacy-calibration.md), and the rate-cap
+ * anchors extend Google's published VP9 VOD settings. After bumping a
+ * vendored encoder, changing the filter chains, or touching a --fast/--best
+ * tier setting, re-verify parity with calibrate.sh (./fixtures.sh fetches
+ * the pinned fixtures) and re-fit what drifted — always on real content,
+ * never synthetics alone (every synthetic-only fit here has had to be
+ * redone). Last re-fit: 2026-06-11 (anim curve + fast stills).
+ * ========================================================================== */
+
+/* How far a bit goes in the source codec relative to VP9. Reproducing what
+ * an older codec stored needs fewer VP9 bits than the source spent (its bits
+ * bought less quality); matching AV1 needs more. Caps the rate budget from
+ * above and converts the VP9-anchored budget for --next/--legacy, so the
+ * tiers can stay coarse. */
+static double codec_weight(enum AVCodecID id)
+{
+    switch (id) {
+    case AV_CODEC_ID_AV1:    return 1.3;
+    case AV_CODEC_ID_VP9:
+    case AV_CODEC_ID_HEVC:   return 1.0;
+    case AV_CODEC_ID_H264:
+    case AV_CODEC_ID_VP8:
+    case AV_CODEC_ID_THEORA: return 0.8;
+    default:                 return 0.6; /* mpeg1/2/4, wmv/vc-1, h.263, ... */
+    }
+}
+
+/* -q with the image pipelines' default applied (cwebp's 80) */
+static double image_quality(void)
+{
+    return opt.quality < 0 ? 80.0 : opt.quality;
+}
+
+/* --legacy maps -q onto the look the *default* pipeline would produce; with
+ * no -q that look depends on whether VP9 would have run two passes (crf 36)
+ * or one (crf 33) — webify_run records its two-pass decision here */
+static int vp9_ref_twopass;
+
+/* the VP9 CRF for a -q: 0-10 maps linearly onto CRF 63-0. With no -q,
+ * two-pass defaults to crf 36: measured against the old single-pass crf 33
+ * it is slightly *better* on SSIM/PSNR while ~8-20% smaller, because
+ * two-pass actually reaches its quality target. Single-pass (--fast, or the
+ * rare unspoolable pipe) keeps the classic crf 33 (= -q 4.8). */
+static int vp9_video_crf(int twopass)
+{
+    if (opt.quality < 0)
+        return twopass ? 36 : 33;
+    return (int)lrint((100.0 - opt.quality) * 63.0 / 100.0);
+}
+
+/* the AV1 CRF that buys the same look as a given VP9 CRF: libaom beats
+ * libvpx by a growing margin as CRF rises (equal SSIM measured at +4 around
+ * crf 44, +2 around 33, none at or below 20), so the CRF is nudged up to
+ * return that surplus as bytes instead of quality the VP9 output never had.
+ * The fast tier needs 4 more: single-pass cpu-used 6 loses far less quality
+ * than vpx's fast tier does, measured at equal SSIM against it
+ * (doc/next-calibration.md). */
+static int av1_video_crf(int vp9crf)
+{
+    int c = vp9crf + (vp9crf > 20 ? (vp9crf - 20) / 6 : 0);
+
+    if (opt.effort < 0)
+        c += 4;
+    return FFMIN(c, 63);
 }
 
 /* the calibrated x264 CRF that buys the same look as a given VP9 CRF: a
@@ -1002,6 +1028,116 @@ static int legacy_video_crf(int vp9crf)
     return av_clip(c, 0, 51);
 }
 
+/* the still-image AVIF CRF for a -q: equal-SSIM fit against the WebP
+ * pipeline across photo/noise/graphics fixtures, rounded to the
+ * slightly-lower-quality side so the size win is never paid back as quality
+ * (doc/next-calibration.md has the data). Tracks cwebp's scale: near-linear
+ * up to q 80, then cwebp's top end buys disproportionate quality and the
+ * crf has to dive (q 80 -> crf 28, q 95 -> 12, q 100 -> 6). --fast rides 4
+ * lower: cwebp's quick settings (-m 4) cost bytes but not quality, while
+ * allintra cpu-used 6 drops ~.01-.02 SSIM on photographic detail at the
+ * same CRF — the fast look needs the bits back (measured on the Kodak
+ * fixtures; synthetic content never showed it; re-fit 2026-06-11). */
+static int avif_still_crf(double q)
+{
+    double c = q <= 80 ? 52.0 - 0.30 * q : 28.0 - 1.10 * (q - 80.0);
+
+    if (opt.effort < 0)
+        c -= 4.0;
+    return (int)lrint(FFMAX(c, 0.0));
+}
+
+/* the animated-AVIF CRF for a -q: animated WebP is far weaker than stills
+ * WebP, so the curve sits much higher — but its equal point spreads
+ * enormously by content (q 80: live action crf 33, dithered noise 49,
+ * synthetic graphics 60), so it tracks the *live-action* equal points
+ * (52 at q 50 -> 36 at q 80 -> 18 at q 95, ceiling 63 below q ~29): a mean
+ * fit would pay the size win back as visible loss on faces, while graphics
+ * merely overdeliver at sizes that stay under ~0.2x of animated WebP anyway
+ * (-79..-89% at the default -q, was -96% under the old synthetic-only fit;
+ * re-fit 2026-06-11 on real content). --fast rides 4 CRF lower: cpu-used 6
+ * loses ~.0045 SSIM to the default speed at the same CRF on live action,
+ * but animated WebP's fast tier loses nothing (-m 4 only costs bytes), so
+ * the fast look needs the bits back (-4 measured back in band). Not under
+ * the 63 ceiling though — there the default tier already sits below parity
+ * on purpose. */
+static int avif_anim_crf(double q)
+{
+    int c = (int)lrint(q <= 80 ? FFMIN(63.0, 78.7 - 0.533 * q)
+                               : 36.0 - 1.20 * (q - 80.0));
+
+    if (opt.effort < 0 && c < 63)
+        c = FFMAX(c - 4, 0);
+    return c;
+}
+
+/* The constrained-quality rate caps start from Google's published 480p VOD
+ * numbers (750k avg / 1100k max at 854x480 crf 33) and follow the job: the
+ * output pixel count, the CRF target (VP9 bitrate roughly doubles per 6 CRF
+ * steps), and the output frame rate above 30 (Google's 50-60fps rows run
+ * ~1.7x their 24-30fps ones at the same crf, hence x(fps/30)^0.75).
+ * Google's minrate is dropped on purpose: a rate *floor* can only add bytes
+ * at a fixed quality target (measured 0-2% smaller, SSIM unchanged). The
+ * source stream's own bitrate, weighted by its codec's efficiency vs VP9,
+ * caps the budget from above: past the source's own spend, bits only
+ * reproduce its artifacts more faithfully (measured 27% smaller on a
+ * 400kbps input, SSIM vs that source -0.0025). The ceiling is deliberately
+ * NOT rescaled when downscaling or dropping frames — those only discard
+ * source information (and downscaling washes artifacts out), so the full
+ * source rate stays a valid, conservative ceiling for any smaller
+ * rendition. --next/--legacy convert the VP9-anchored result by the same
+ * codec-efficiency table that weights the source cap (1.3x the quality per
+ * bit for AV1, 0.8x for H.264 — note an AV1/H.264 source then caps a
+ * --next/--legacy job at exactly its own rate), so together with the CRF
+ * remaps above those modes change the size, never the look.
+ *
+ * Returns the budget's scale factor relative to the anchors; crf is on the
+ * VP9 scale, except --next passes its shifted CRF so the budget tracks the
+ * quality level actually encoded. */
+static const double rate_anchor_avg = 750000, rate_anchor_max = 1100000;
+
+static double rate_budget_scale(int crf, int w, int h, double ofps,
+                                int64_t src, enum AVCodecID src_codec)
+{
+    double f = ((double)w * h) / (854.0 * 480.0) * exp2((33 - crf) / 6.0);
+
+    if (ofps > 30)
+        f *= pow(ofps / 30.0, 0.75);
+    if (src >= 32000) /* absent (0) or absurd header rates: no cap */
+        f = FFMIN(f, src * codec_weight(src_codec) / rate_anchor_avg);
+    if (opt.next)
+        f /= codec_weight(AV_CODEC_ID_AV1);
+    else if (opt.legacy)
+        f /= codec_weight(AV_CODEC_ID_H264);
+    return f;
+}
+
+/* the Opus bitrate for a -q: anchored at 64k stereo / 48k mono for the
+ * default (= -q 4.8) — half of that at -q 0, ~1.5x at -q 10. The lossy
+ * source's own rate then caps it (floored at Opus's useful minimum): Opus
+ * packs at least as much quality per bit as any codec this build decodes,
+ * so bits past the source rate cannot recover quality the input never had.
+ * Lossless/PCM/multichannel sources declare rates far above the cap and
+ * stay uncapped. --legacy's AAC needs ~1.5x Opus's rate for the same
+ * quality (96k stereo at the default), and FFmpeg's native encoder sits at
+ * the weak end of AAC encoders — 1.5 errs the right way. */
+static int64_t audio_bitrate(int mono, int64_t src)
+{
+    double  q   = opt.quality < 0 ? 48.0 : opt.quality;
+    int64_t bps = (int64_t)((mono ? 48000 : 64000) * (0.5 + q / 96.0));
+    int64_t lo  = mono ? 16000 : 24000;
+
+    if (opt.legacy) { /* AAC anchors: 1.5x the Opus rates */
+        bps = bps * 3 / 2;
+        lo  = lo * 3 / 2;
+    }
+    if (src > 0 && src < bps)
+        bps = FFMAX(src, lo);
+    return bps;
+}
+
+/* ==== end of calibration ================================================== */
+
 /* one output stream mirroring an opened encoder: parameters copied, the
  * encoder's time base kept, the stream index returned */
 static int add_stream(AVFormatContext *ofmt, const AVCodecContext *enc, int *index)
@@ -1016,6 +1152,227 @@ static int add_stream(AVFormatContext *ofmt, const AVCodecContext *enc, int *ind
     ost->time_base = enc->time_base;
     *index = ost->index;
     return 0;
+}
+
+/* the HDR (PQ/HLG) -> SDR tonemap chain: linearize with zimg, tone-map to
+ * SDR in linear light, re-encode as bt709 — without this the encode
+ * "succeeds" but every color comes out gray and washed. Runs after the
+ * scaler so the float math runs at output resolution. Untagged streams get
+ * the in-practice-universal bt2020 guess. tonemap needs the source's peak
+ * brightness, but ffmpeg 8's zscale strips HDR side data during conversion,
+ * so fish it out of the input ourselves: the peeked first frame (in-stream
+ * SEI), the container (mkv/mp4 boxes), or assume the typical 1000-nit
+ * master. The last zscale quantizes tonemap's float output down to 8 bits:
+ * undithered, the smooth gradients tonemapping produces band visibly
+ * (zscale's dither default is none). */
+static void tonemap_spec(const AVCodecContext *dec, const AVStream *ist,
+                         int pass, char *buf, size_t size)
+{
+    double peak = peeked.peak;
+
+    if (peak <= 0)
+        peak = peak_from_metadata(
+            coded_sd(ist, AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
+            coded_sd(ist, AV_PKT_DATA_MASTERING_DISPLAY_METADATA));
+    if (peak <= 0)
+        peak = 10.0;
+
+    snprintf(buf, size,
+             "zscale=tin=%s%s%s:t=linear:npl=100,format=gbrpf32le,"
+             "zscale=p=bt709,tonemap=hable:desat=0:peak=%.6g,"
+             "zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,",
+             dec->color_trc == AVCOL_TRC_SMPTE2084
+                 ? "smpte2084" : "arib-std-b67",
+             dec->colorspace == AVCOL_SPC_UNSPECIFIED
+                 ? ":min=2020_ncl" : "",
+             dec->color_primaries == AVCOL_PRI_UNSPECIFIED
+                 ? ":pin=2020" : "",
+             peak);
+    if (pass != 1)
+        av_log(NULL, AV_LOG_WARNING, "HDR input (%s, %.6g-nit peak):"
+               " tonemapping to SDR bt709\n",
+               dec->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ" : "HLG",
+               peak * 100);
+}
+
+/* --legacy images: PNG/APNG is lossless — -q has nothing left to buy (the
+ * quality is already maximal, and so always at least the WebP pipeline's),
+ * only deflate effort remains. Default and --best run the densest search
+ * the encoder offers (zlib level 9 + the per-row "mixed" filter scan);
+ * --fast keeps the encoder defaults */
+static void setup_png(Pipe *p, AVDictionary **opts)
+{
+    if (opt.effort >= 0) {
+        p->enc->compression_level = 9;
+        av_dict_set(opts, "pred", "mixed", 0);
+    }
+}
+
+/* --next images: AVIF, stills and animations alike. -q buys the same look
+ * as the WebP pipeline, not the same number — the curves live in the
+ * calibration section (avif_still_crf, avif_anim_crf) */
+static void setup_avif(Pipe *p, AVDictionary **opts)
+{
+    double q   = image_quality();
+    int    crf = peeked.animated ? avif_anim_crf(q) : avif_still_crf(q);
+
+    p->enc->bit_rate     = 0;
+    p->enc->thread_count = width_threads(p->enc->width);
+    av_dict_set_int(opts, "crf", crf, 0);
+    av_dict_set(opts, "row-mt", "1", 0);
+    if (peeked.animated) {
+        /* animated GIF -> animated AVIF (the muxer's 'avis' brand),
+         * inter-coded at the video tiers' speeds — all-intra would spend a
+         * full keyframe on every GIF frame (gop_size left at its default
+         * of 12 would too, every 12). --best keeps the default speed for
+         * the same reason as video: cpu-used 3 measured +0.2% bytes at
+         * 1.8x the time */
+        p->enc->gop_size = 240;
+        av_dict_set(opts, "cpu-used", opt.effort < 0 ? "6" : "4", 0);
+    } else {
+        /* encoder effort (allintra speed 0-9): avifenc defaults to
+         * speed 6; webify's default digs deeper — files are downloaded
+         * many times — --fast matches the quick end, --best the slowest
+         * practical search. --fast briefly ran speed 8 (~2x faster than 6,
+         * -.002 SSIM on synthetic fixtures) but real photos sank it:
+         * -.018..-.038 vs WebP-fast on the Kodak fixtures — grain and skin
+         * detail are exactly what the shallower search drops — so 6 is the
+         * fast ceiling that holds the parity band
+         * (doc/next-calibration.md). */
+        av_dict_set(opts, "usage", "allintra", 0); /* like avifenc */
+        av_dict_set(opts, "still-picture", "1", 0);
+        av_dict_set(opts, "cpu-used", opt.effort < 0 ? "6"
+                    : opt.effort > 0 ? "2" : "4", 0);
+    }
+}
+
+/* default images: WebP via libwebp, matching cwebp bit for bit */
+static void setup_webp(AVDictionary **opts)
+{
+    char q[32];
+
+    snprintf(q, sizeof(q), "%g", image_quality());
+    av_dict_set(opts, "quality", q, 0); /* default matches cwebp's 80 */
+    /* cwebp's -m 6: best compression the format allows, worth the extra
+     * encode time for files that are downloaded many times. --fast
+     * drops to cwebp's default -m 4: measured 2-15x faster (dithered
+     * animations gain the most) for 2-11% more bytes */
+    av_dict_set(opts, "compression_level", opt.effort < 0 ? "4" : "6", 0);
+}
+
+/* video, all three pipelines (libvpx-vp9 / libaom-av1 / libx264): one
+ * shared quality-and-budget computation — the CRF mappings and rate-cap
+ * anchors live in the calibration section — then per-encoder effort tiers */
+static void setup_video(Pipe *p, AVFormatContext *ifmt, int stream_index,
+                        int pass, AVDictionary **opts)
+{
+    AVStream *ist  = ifmt->streams[stream_index];
+    int       crf  = vp9_video_crf(pass || vp9_ref_twopass);
+    double    ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
+    double    f;
+
+    if (opt.next)
+        crf = av1_video_crf(crf);
+    f = rate_budget_scale(crf, p->enc->width, p->enc->height, ofps,
+                          source_video_rate(ifmt, stream_index),
+                          ist->codecpar->codec_id);
+
+    /* a nonzero bit_rate would flip libx264 from CRF into ABR mode:
+     * --legacy carries only the peak cap, as CRF + VBV (the
+     * conventional 2-second buffer window) */
+    p->enc->bit_rate     = opt.legacy ? 0 : (int64_t)(rate_anchor_avg * f);
+    p->enc->rc_max_rate  = (int64_t)(rate_anchor_max * f);
+    if (opt.legacy)
+        p->enc->rc_buffer_size =
+            (int)FFMIN(2 * p->enc->rc_max_rate, INT_MAX);
+    p->enc->gop_size     = 240;
+    p->enc->thread_count = width_threads(p->enc->width);
+    if (opt.legacy) /* remapped last: the budget above tracks the look
+                     * (the VP9-scale CRF), not x264's number for it */
+        crf = legacy_video_crf(crf);
+    av_dict_set_int(opts, "crf", crf, 0);
+    if (!opt.legacy) {
+        av_dict_set(opts, "row-mt", "1", 0);
+        av_dict_set_int(opts, "tile-columns", width_tlog(p->enc->width), 0);
+    }
+    /* encoder effort by tier — each step has to pay for its time:
+     * --fast cpu-used 4 (Google's stats-pass speed, ~4x faster than
+     * the default; cpu-used 5 measured *strictly worse* at webify's
+     * tile/thread counts — 1.5-1.8x slower than 4, -.002 SSIM, +1%
+     * bytes — so 4 is the fast ceiling that pays), default cpu-used 1
+     * (Google's VOD setting), --best
+     * cpu-used 0 + longer alt-ref noise reduction (together measured
+     * 1-7% smaller at equal-or-better SSIM, ~75% more time; deadline
+     * "best" was measured 5x slower for -0.06% and rejected). The
+     * stats pass is insensitive to encoder effort: always run it fast.
+     * libaom (--next): --fast cpu-used 6 single-pass (about half the
+     * time of even the VP9 default), default cpu-used 4 two-pass (~3x
+     * the VP9 default's time — libaom is simply heavier). A deeper
+     * final pass does NOT pay here, unlike libvpx: at a fixed CRF
+     * libaom's slower speeds buy a sliver of quality, never bytes
+     * (cpu-used 3 measured +1% bytes for 1.2x time, cpu-used 2 +0.8%
+     * for 3.4x time, arnr-max-frames 15 +0.3% — all rejected), so
+     * --best keeps the default encoder settings */
+    if (opt.legacy) {
+        /* the preset ladder at a fixed CRF: medium -> slow buys nothing
+         * (+1.5% bytes), slow -> veryslow buys -19% bytes at equal SSIM
+         * for 2.7x the time (still ~10x faster than the VP9 default), so
+         * the default goes straight to veryslow; --fast (preset fast) is
+         * ~5x faster. --best changes nothing: placebo measured 3.7x the
+         * time for +1% bytes — there is no deeper setting that pays */
+        av_dict_set(opts, "preset",
+                    opt.effort < 0 ? "fast" : "veryslow", 0);
+    } else if (opt.next) {
+        av_dict_set(opts, "cpu-used", pass == 1 ? "6"
+                    : opt.effort < 0 ? "6" : "4", 0);
+    } else {
+        av_dict_set(opts, "cpu-used", pass == 1 ? "4"
+                    : opt.effort < 0 ? "4" : opt.effort > 0 ? "0" : "1", 0);
+        if (opt.effort > 0)
+            av_dict_set(opts, "arnr-maxframes", "15", 0);
+        av_dict_set(opts, "deadline", "good", 0);
+        /* libvpx defaults to frame-parallel decoding mode, which turns
+         * off backward-adaptive entropy coding; no browser needs that */
+        av_dict_set(opts, "frame-parallel", "0", 0);
+    }
+}
+
+/* the AVIF transparency layout: the alpha plane rides as a second AV1
+ * stream that the muxer stores as the auxiliary alpha item, encoded as
+ * monochrome AV1 (the muxer wants one plane here) */
+static int init_alpha(Pipe *p, const AVCodec *codec)
+{
+    AVDictionary *aopts = NULL;
+    int ret;
+
+    if (!(p->enc_a = avcodec_alloc_context3(codec)))
+        return AVERROR(ENOMEM);
+    copy_enc_geometry(p->enc_a, p->enc);
+    p->enc_a->pix_fmt      = AV_PIX_FMT_GRAY8;
+    p->enc_a->thread_count = p->enc->thread_count;
+    p->enc_a->bit_rate     = 0;
+    /* alpha is full-range by definition (MIAF), and decoders assume so:
+     * left at the limited-range default the bitstream says "tv" and
+     * libavif-class decoders stretch 16-235 to 0-255, distorting every
+     * gradient (measured SSIM 0.90 on a radial alpha vs 1.0 intended) */
+    p->enc_a->color_range  = AVCOL_RANGE_JPEG;
+    /* crf 0 ~ lossless: lossy WebP also stores its alpha plane
+     * losslessly by default, and alpha gradients band visibly while
+     * costing few bits */
+    av_dict_set(&aopts, "crf", "0", 0);
+    if (!peeked.animated) {
+        av_dict_set(&aopts, "usage", "allintra", 0);
+        av_dict_set(&aopts, "still-picture", "1", 0);
+    }
+    av_dict_set(&aopts, "row-mt", "1", 0);
+    /* still alpha keeps cpu-used 7 at --fast: the stills ladder's
+     * speed-7 rejection is a lossy-mode result — at crf 0 speed
+     * moves bytes, not the look */
+    av_dict_set(&aopts, "cpu-used",
+                opt.effort < 0 ? (peeked.animated ? "6" : "7") : "4", 0);
+    ret = avcodec_open2(p->enc_a, codec, &aopts);
+    av_dict_free(&aopts);
+    return ret;
 }
 
 /* image != 0 selects the WebP pipeline: no scaling, alpha kept, libwebp.
@@ -1102,46 +1459,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
          * (--legacy PNG likewise drops a fully opaque alpha channel — it
          * would only add bytes) */
     } else {
-        if (hdr) {
-            /* HDR (PQ/HLG) source: linearize with zimg, tone-map to SDR in
-             * linear light, re-encode as bt709 — without this the encode
-             * "succeeds" but every color comes out gray and washed. After
-             * the scaler so the float math runs at output resolution.
-             * Untagged streams get the in-practice-universal bt2020 guess.
-             * tonemap needs the source's peak brightness, but ffmpeg 8's
-             * zscale strips HDR side data during conversion, so fish it out
-             * of the input ourselves: the peeked first frame (in-stream
-             * SEI), the container (mkv/mp4 boxes), or assume the typical
-             * 1000-nit master. */
-            double peak = peeked.peak;
-
-            if (peak <= 0)
-                peak = peak_from_metadata(
-                    coded_sd(ist, AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
-                    coded_sd(ist, AV_PKT_DATA_MASTERING_DISPLAY_METADATA));
-            if (peak <= 0)
-                peak = 10.0;
-
-            /* the last zscale quantizes tonemap's float output down to 8
-             * bits: undithered, the smooth gradients tonemapping produces
-             * band visibly (zscale's dither default is none) */
-            snprintf(tonemap, sizeof(tonemap),
-                     "zscale=tin=%s%s%s:t=linear:npl=100,format=gbrpf32le,"
-                     "zscale=p=bt709,tonemap=hable:desat=0:peak=%.6g,"
-                     "zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,",
-                     p->dec->color_trc == AVCOL_TRC_SMPTE2084
-                         ? "smpte2084" : "arib-std-b67",
-                     p->dec->colorspace == AVCOL_SPC_UNSPECIFIED
-                         ? ":min=2020_ncl" : "",
-                     p->dec->color_primaries == AVCOL_PRI_UNSPECIFIED
-                         ? ":pin=2020" : "",
-                     peak);
-            if (pass != 1)
-                av_log(NULL, AV_LOG_WARNING, "HDR input (%s, %.6g-nit peak):"
-                       " tonemapping to SDR bt709\n",
-                       p->dec->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ" : "HLG",
-                       peak * 100);
-        }
+        if (hdr) /* tone-map PQ/HLG to SDR bt709 (see tonemap_spec) */
+            tonemap_spec(p->dec, ist, pass, tonemap, sizeof(tonemap));
         snprintf(spec, sizeof(spec), DEINT_FILTER "%s%s%s%s", rotate, scale,
                  tonemap, VIDEO_FILTERS);
     }
@@ -1202,208 +1521,14 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             return AVERROR(ENOMEM);
     }
 
-    if (image && opt.legacy) {
-        /* PNG/APNG is lossless: -q has nothing left to buy (the quality is
-         * already maximal — and so always at least the WebP pipeline's),
-         * only deflate effort remains. Default and --best run the densest
-         * search the encoder offers (zlib level 9 + the per-row "mixed"
-         * filter scan); --fast keeps the encoder defaults */
-        if (opt.effort >= 0) {
-            p->enc->compression_level = 9;
-            av_dict_set(&opts, "pred", "mixed", 0);
-        }
-    } else if (image && opt.next) {
-        /* AVIF. -q buys the same look as the WebP pipeline, not the same
-         * number: each curve below is a piecewise fit of measured equal-SSIM
-         * points against the WebP output across photo/noise/graphics
-         * fixtures, rounded to the slightly-lower-quality side so the size
-         * win is never paid back as quality (doc/next-calibration.md has
-         * the data). Stills track cwebp's scale: near-linear up to q 80,
-         * then cwebp's top end buys disproportionate quality and the crf
-         * has to dive (q 80 -> crf 28, q 95 -> 12, q 100 -> 6). Animations
-         * get their own much-higher curve — animated WebP is far weaker
-         * than stills WebP — but its equal point spreads enormously by
-         * content (q 80: live action crf 33, dithered noise 49, synthetic
-         * graphics 60), so the curve tracks the *live-action* equal points
-         * (52 at q 50 -> 36 at q 80 -> 18 at q 95, ceiling 63 below
-         * q ~29): a mean fit would pay the size win back as visible loss
-         * on faces, while graphics merely overdeliver at sizes that stay
-         * under ~0.2x of animated WebP anyway (-79..-89% at the default
-         * -q, was -96% under the old synthetic-only fit). */
-        double q   = image_quality();
-        int    crf = peeked.animated
-                   ? (int)lrint(q <= 80 ? FFMIN(63.0, 78.7 - 0.533 * q)
-                                        : 36.0 - 1.20 * (q - 80.0))
-                   : avif_still_crf(q);
-
-        /* anim --fast rides 4 CRF lower: cpu-used 6 loses ~.0045 SSIM to
-         * the default speed at the same CRF on live action, but animated
-         * WebP's fast tier loses nothing (-m 4 only costs bytes), so the
-         * fast look needs the bits back (-4 measured back in band). Not
-         * under the 63 ceiling though — there the default tier already
-         * sits below parity on purpose. */
-        if (peeked.animated && opt.effort < 0 && crf < 63)
-            crf = FFMAX(crf - 4, 0);
-
-        p->enc->bit_rate     = 0;
-        p->enc->thread_count = width_threads(p->enc->width);
-        av_dict_set_int(&opts, "crf", crf, 0);
-        av_dict_set(&opts, "row-mt", "1", 0);
-        if (peeked.animated) {
-            /* animated GIF -> animated AVIF (the muxer's 'avis' brand),
-             * inter-coded at the video tiers' speeds — all-intra would
-             * spend a full keyframe on every GIF frame (gop_size left at
-             * its default of 12 would too, every 12). --best keeps the
-             * default speed for the same reason as video: cpu-used 3
-             * measured +0.2% bytes at 1.8x the time */
-            p->enc->gop_size = 240;
-            av_dict_set(&opts, "cpu-used", opt.effort < 0 ? "6" : "4", 0);
-        } else {
-            /* encoder effort (allintra speed 0-9): avifenc defaults to
-             * speed 6; webify's default digs deeper — files are downloaded
-             * many times — --fast matches the quick end, --best the
-             * slowest practical search. --fast briefly ran speed 8 (~2x
-             * faster than 6, -.002 SSIM on synthetic fixtures) but real
-             * photos sank it: -.018..-.038 vs WebP-fast on the Kodak
-             * fixtures — grain and skin detail are exactly what the
-             * shallower search drops — so 6 is the fast ceiling that
-             * holds the parity band (doc/next-calibration.md). */
-            av_dict_set(&opts, "usage", "allintra", 0); /* like avifenc */
-            av_dict_set(&opts, "still-picture", "1", 0);
-            av_dict_set(&opts, "cpu-used", opt.effort < 0 ? "6"
-                        : opt.effort > 0 ? "2" : "4", 0);
-        }
-    } else if (image) {
-        char q[32];
-
-        snprintf(q, sizeof(q), "%g", image_quality());
-        av_dict_set(&opts, "quality", q, 0); /* default matches cwebp's 80 */
-        /* cwebp's -m 6: best compression the format allows, worth the extra
-         * encode time for files that are downloaded many times. --fast
-         * drops to cwebp's default -m 4: measured 2-15x faster (dithered
-         * animations gain the most) for 2-11% more bytes */
-        av_dict_set(&opts, "compression_level", opt.effort < 0 ? "4" : "6", 0);
-    } else {
-        /* -q 0-10 maps linearly onto VP9's CRF 63-0. With no -q, two-pass
-         * defaults to crf 36: measured against the old single-pass crf 33 it
-         * is slightly *better* on SSIM/PSNR while ~8-20% smaller, because
-         * two-pass actually reaches its quality target. Single-pass (--fast,
-         * or the rare unspoolable pipe) keeps the classic crf 33 (= -q 4.8).
-         *
-         * The constrained-quality caps start from Google's published 480p
-         * VOD numbers (750k avg / 1100k max at 854x480 crf 33) and follow
-         * the job: the output pixel count, the CRF target (VP9 bitrate
-         * roughly doubles per 6 CRF steps), and the output frame rate above
-         * 30 (Google's 50-60fps rows run ~1.7x their 24-30fps ones at the
-         * same crf, hence x(fps/30)^0.75). Google's minrate is dropped on
-         * purpose: a rate *floor* can only add bytes at a fixed quality
-         * target (measured 0-2% smaller, SSIM unchanged). Finally, the
-         * source stream's own bitrate, weighted by its codec's efficiency
-         * vs VP9, caps the budget from above: past the source's own spend,
-         * bits only reproduce its artifacts more faithfully (measured 27%
-         * smaller on a 400kbps input, SSIM vs that source -0.0025). The
-         * ceiling is deliberately NOT rescaled when downscaling or dropping
-         * frames — those only discard source information (and downscaling
-         * washes artifacts out), so the full source rate stays a valid,
-         * conservative ceiling for any smaller rendition. */
-        int crf  = opt.quality < 0 ? (pass || vp9_ref_twopass ? 36 : 33)
-                 : (int)lrint((100.0 - opt.quality) * 63.0 / 100.0);
-        if (opt.next) {
-            /* libaom beats libvpx by a growing margin as CRF rises (equal
-             * SSIM measured at +4 around crf 44, +2 around 33, none at or
-             * below 20), so the CRF is nudged up to return that surplus as
-             * bytes instead of quality the VP9 output never had. The fast
-             * tier needs 4 more: single-pass cpu-used 6 loses far less
-             * quality than vpx's fast tier does, measured at equal SSIM
-             * against it (doc/next-calibration.md). The budget below is
-             * computed from the shifted CRF — it tracks the quality level
-             * actually encoded. */
-            crf += crf > 20 ? (crf - 20) / 6 : 0;
-            if (opt.effort < 0)
-                crf += 4;
-            crf = FFMIN(crf, 63);
-        }
-        double f = ((double)p->enc->width * p->enc->height) / (854.0 * 480.0)
-                 * exp2((33 - crf) / 6.0);
-        double  ofps = p->enc->framerate.num > 0 ? av_q2d(p->enc->framerate) : 0;
-        int64_t src  = source_video_rate(ifmt, stream_index);
-        int     tlog = width_tlog(p->enc->width);
-
-        if (ofps > 30)
-            f *= pow(ofps / 30.0, 0.75);
-        if (src >= 32000) /* absent (0) or absurd header rates: no cap */
-            f = FFMIN(f, src * codec_weight(ist->codecpar->codec_id) / 750000.0);
-        if (opt.next) /* the budget above is anchored on VP9 numbers; the same
-                      * codec-efficiency table that weights the source cap
-                      * converts it to AV1 (1.3x the quality per bit — note
-                      * an AV1 source then caps a --next job at exactly its
-                      * own rate). Together with the CRF nudge above, --next
-                      * changes the size, not the look. */
-            f /= codec_weight(AV_CODEC_ID_AV1);
-        else if (opt.legacy) /* same conversion the other way: H.264 buys
-                              * 0.8x the quality per bit, so matching the
-                              * VP9 look needs 1.25x the budget (an H.264
-                              * source caps a --legacy job at its own rate) */
-            f /= codec_weight(AV_CODEC_ID_H264);
-        /* a nonzero bit_rate would flip libx264 from CRF into ABR mode:
-         * --legacy carries only the peak cap, as CRF + VBV (the
-         * conventional 2-second buffer window) */
-        p->enc->bit_rate     = opt.legacy ? 0 : (int64_t)(750000 * f);
-        p->enc->rc_max_rate  = (int64_t)(1100000 * f);
-        if (opt.legacy)
-            p->enc->rc_buffer_size =
-                (int)FFMIN(2 * p->enc->rc_max_rate, INT_MAX);
-        p->enc->gop_size     = 240;
-        p->enc->thread_count = width_threads(p->enc->width);
-        if (opt.legacy) /* remapped last: the budget above tracks the look
-                         * (the VP9-scale CRF), not x264's number for it */
-            crf = legacy_video_crf(crf);
-        av_dict_set_int(&opts, "crf", crf, 0);
-        if (!opt.legacy) {
-            av_dict_set(&opts, "row-mt", "1", 0);
-            av_dict_set_int(&opts, "tile-columns", tlog, 0);
-        }
-        /* encoder effort by tier — each step has to pay for its time:
-         * --fast cpu-used 4 (Google's stats-pass speed, ~4x faster than
-         * the default; cpu-used 5 measured *strictly worse* at webify's
-         * tile/thread counts — 1.5-1.8x slower than 4, -.002 SSIM, +1%
-         * bytes — so 4 is the fast ceiling that pays), default cpu-used 1
-         * (Google's VOD setting), --best
-         * cpu-used 0 + longer alt-ref noise reduction (together measured
-         * 1-7% smaller at equal-or-better SSIM, ~75% more time; deadline
-         * "best" was measured 5x slower for -0.06% and rejected). The
-         * stats pass is insensitive to encoder effort: always run it fast.
-         * libaom (--next): --fast cpu-used 6 single-pass (about half the
-         * time of even the VP9 default), default cpu-used 4 two-pass (~3x
-         * the VP9 default's time — libaom is simply heavier). A deeper
-         * final pass does NOT pay here, unlike libvpx: at a fixed CRF
-         * libaom's slower speeds buy a sliver of quality, never bytes
-         * (cpu-used 3 measured +1% bytes for 1.2x time, cpu-used 2 +0.8%
-         * for 3.4x time, arnr-max-frames 15 +0.3% — all rejected), so
-         * --best keeps the default encoder settings */
-        if (opt.legacy) {
-            /* the preset ladder at a fixed CRF: medium -> slow buys nothing
-             * (+1.5% bytes), slow -> veryslow buys -19% bytes at equal SSIM
-             * for 2.7x the time (still ~10x faster than the VP9 default), so
-             * the default goes straight to veryslow; --fast (preset fast) is
-             * ~5x faster. --best changes nothing: placebo measured 3.7x the
-             * time for +1% bytes — there is no deeper setting that pays */
-            av_dict_set(&opts, "preset",
-                        opt.effort < 0 ? "fast" : "veryslow", 0);
-        } else if (opt.next) {
-            av_dict_set(&opts, "cpu-used", pass == 1 ? "6"
-                        : opt.effort < 0 ? "6" : "4", 0);
-        } else {
-            av_dict_set(&opts, "cpu-used", pass == 1 ? "4"
-                        : opt.effort < 0 ? "4" : opt.effort > 0 ? "0" : "1", 0);
-            if (opt.effort > 0)
-                av_dict_set(&opts, "arnr-maxframes", "15", 0);
-            av_dict_set(&opts, "deadline", "good", 0);
-            /* libvpx defaults to frame-parallel decoding mode, which turns
-             * off backward-adaptive entropy coding; no browser needs that */
-            av_dict_set(&opts, "frame-parallel", "0", 0);
-        }
-    }
+    if (image && opt.legacy)
+        setup_png(p, &opts);
+    else if (image && opt.next)
+        setup_avif(p, &opts);
+    else if (image)
+        setup_webp(&opts);
+    else
+        setup_video(p, ifmt, stream_index, pass, &opts);
     if (opt.next && !image && ofmt) /* the open below consumes opts */
         av_dict_copy(&primeopts, opts, 0);
     ret = avcodec_open2(p->enc, codec, &opts);
@@ -1423,40 +1548,8 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         }
     }
 
-    if (alpha) {
-        AVDictionary *aopts = NULL;
-
-        if (!(p->enc_a = avcodec_alloc_context3(codec)))
-            return AVERROR(ENOMEM);
-        copy_enc_geometry(p->enc_a, p->enc);
-        p->enc_a->pix_fmt      = AV_PIX_FMT_GRAY8; /* monochrome AV1 — the
-                                         muxer wants one plane here */
-        p->enc_a->thread_count = p->enc->thread_count;
-        p->enc_a->bit_rate     = 0;
-        /* alpha is full-range by definition (MIAF), and decoders assume so:
-         * left at the limited-range default the bitstream says "tv" and
-         * libavif-class decoders stretch 16-235 to 0-255, distorting every
-         * gradient (measured SSIM 0.90 on a radial alpha vs 1.0 intended) */
-        p->enc_a->color_range         = AVCOL_RANGE_JPEG;
-        /* crf 0 ~ lossless: lossy WebP also stores its alpha plane
-         * losslessly by default, and alpha gradients band visibly while
-         * costing few bits */
-        av_dict_set(&aopts, "crf", "0", 0);
-        if (!peeked.animated) {
-            av_dict_set(&aopts, "usage", "allintra", 0);
-            av_dict_set(&aopts, "still-picture", "1", 0);
-        }
-        av_dict_set(&aopts, "row-mt", "1", 0);
-        /* still alpha keeps cpu-used 7 at --fast: the stills ladder's
-         * speed-7 rejection is a lossy-mode result — at crf 0 speed
-         * moves bytes, not the look */
-        av_dict_set(&aopts, "cpu-used",
-                    opt.effort < 0 ? (peeked.animated ? "6" : "7") : "4", 0);
-        ret = avcodec_open2(p->enc_a, codec, &aopts);
-        av_dict_free(&aopts);
-        if (ret < 0)
-            return ret;
-    }
+    if (alpha && (ret = init_alpha(p, codec)) < 0)
+        return ret;
 
     /* a still might do better lossless: race them (--fast skips the race
      * and the sharp_yuv re-encode — the streamed packet ships as-is) */
@@ -1524,30 +1617,10 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     p->enc->sample_fmt  = (AVSampleFormat)av_buffersink_get_format(p->sink);
     if ((ret = av_buffersink_get_ch_layout(p->sink, &p->enc->ch_layout)) < 0)
         return ret;
-    /* -q scales the audio too, anchored at 64k stereo / 48k mono for the
-     * default (= -q 4.8): half of that at -q 0, ~1.5x at -q 10. The lossy
-     * source's own rate then caps it (floored at Opus's useful minimum):
-     * Opus packs at least as much quality per bit as any codec this build
-     * decodes, so bits past the source rate cannot recover quality the
-     * input never had. Lossless/PCM/multichannel sources declare rates far
-     * above the cap and stay uncapped. */
-    {
-        double  q   = opt.quality < 0 ? 48.0 : opt.quality;
-        int64_t bps = (int64_t)((mono ? 48000 : 64000) * (0.5 + q / 96.0));
-        int64_t lo  = mono ? 16000 : 24000;
-        int64_t src = source_audio_rate(ist);
-
-        if (opt.legacy) { /* AAC needs ~1.5x Opus's rate for the same
-                           * quality (96k stereo at the default), and
-                           * FFmpeg's native encoder sits at the weak end
-                           * of AAC encoders — 1.5 errs the right way */
-            bps = bps * 3 / 2;
-            lo  = lo * 3 / 2;
-        }
-        if (src > 0 && src < bps)
-            bps = FFMAX(src, lo);
-        p->enc->bit_rate = bps;
-    }
+    /* -q scales the audio too, capped by a lossy source's own rate (the
+     * anchors and the why live in audio_bitrate, in the calibration
+     * section) */
+    p->enc->bit_rate  = audio_bitrate(mono, source_audio_rate(ist));
     p->enc->time_base = AVRational{ 1, p->enc->sample_rate };
     if (ofmt->oformat->flags & AVFMT_GLOBALHEADER)
         p->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
