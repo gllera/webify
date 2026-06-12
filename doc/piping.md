@@ -10,6 +10,9 @@ are embedded and the same input with the same options always produces the
 same bytes (test.sh compares the file run against the piped run with
 `cmp`).
 
+`-` selects stdin/stdout explicitly; omitting the output argument
+entirely is the same as passing `-` for it.
+
 How each case is handled:
 
 - **Piped images** are slurped into memory (they are small and their

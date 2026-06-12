@@ -184,6 +184,8 @@ t "-q 11 (out of range) rejected"          rejects -q 11 in out
 t "-q 60 (old 0-100 scale) rejected"       rejects -q 60 in out
 t "--max bogus rejected"                   rejects --max bogus in out
 t "--fast with --best rejected"            rejects --fast --best in out
+t "no file arguments rejected"             rejects
+t "three file arguments rejected"          rejects in out extra
 t "audio-only input rejected"              rejects audio.wav x.webm
 
 # --- encodes (all sections; the assert blocks below only read the outputs) -----
@@ -195,6 +197,7 @@ enc "$W -q 9.5 photo.png q95.webp"
 enc "$W -m 240  photo.png m240.webp"
 enc "$W -m 2000 photo.png m2000.webp"
 enc "$W - - < photo.png > piped.webp"
+enc "$W photo.png > noout.webp"  # <output> omitted: stdout
 enc "$W --fast photo.png q_fast.webp"
 enc "$W flat.png flat.webp"
 enc "$W anim.gif anim.webp"
@@ -207,6 +210,7 @@ enc "$W -q 9 tv.mp4 v_q9.webm"
 enc "$W rot.mp4 v_rot.webm"
 enc "$W tv.mkv v_file.webm"      # identity pair on mkv: also covers piping a container with no header rates
 enc "$W - - < tv.mkv > v_piped.webm"
+enc "$W tv.mkv > v_noout.webm"   # <output> omitted: stdout
 enc "$W lowrate.mkv v_lowrate.webm"
 enc "$W --fast lowrate.mkv v_lowrate_fast.webm"   # no stats pass: header caps only
 enc "$W frag.mp4 v_frag.webm"
@@ -257,6 +261,7 @@ t "image: -q 8 smaller than -q 9.5"                   lt "$(size q8.webp)" "$(si
 t "image: --max 240 fits the box (640x480 -> 240x180)" eq "$(dims m240.webp)" "240,180"
 t "image: never upscaled (--max 2000)"                eq "$(dims m2000.webp)" "640,480"
 t "image: stdin -> stdout pipe works"                 cmp -s piped.webp q_def.webp
+t "image: omitted output goes to stdout"              cmp -s noout.webp q_def.webp
 t "image: --fast tier produces a WebP"                grep -aq WEBP q_fast.webp
 t "image: lossless wins the race on flat graphics"    grep -aq VP8L flat.webp
 t "image: animated gif -> animated WebP (ANIM chunk)" grep -aq ANIM anim.webp
@@ -276,6 +281,7 @@ t "video: -q 2 smaller than -q 9"                     lt "$(size v_q2.webm)" "$(
 t "video: display-matrix rotation baked in"           eq "$(dims v_rot.webm)" "270,480"
 t "video: seek cues at the head (faststart)"          cues_at_head v_def.webm
 t "video: piped i/o byte-identical to file i/o"       cmp -s v_file.webm v_piped.webm
+t "video: omitted output goes to stdout"              cmp -s v_file.webm v_noout.webm
 t "video: piped output keeps cues at the head"        cues_at_head v_piped.webm
 # mkv declares no stream rates, so only the stats-pass measurement can cap:
 # the video budget becomes the measured rate x0.8 (h264 codec weight), under

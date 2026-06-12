@@ -2207,7 +2207,8 @@ static int usage(FILE *f, int status)
     fprintf(f,
             "webify: transcode any popular video to VP9/Opus WebM,\n"
             "         or any popular image to WebP (auto-detected)\n"
-            "usage: webify [options] <input> <output>   ('-' = stdin/stdout)\n"
+            "usage: webify [options] <input> [output]\n"
+            "       '-' = stdin/stdout; omitting [output] writes to stdout\n"
             "  -q, --quality <0-10>   target quality, higher is better\n"
             "                         (default: 8 for images; video picks the\n"
             "                         classic 480p look at the smallest size)\n"
@@ -2357,10 +2358,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "webify: --next and --legacy are mutually exclusive\n");
         return 2;
     }
-    if (argc - optind != 2)
+    if (argc - optind < 1 || argc - optind > 2)
         return usage(stderr, 2);
-    /* the '-' convention lives in the ffmpeg CLI, not libavformat */
+    /* the '-' convention lives in the ffmpeg CLI, not libavformat;
+     * <output> may be omitted entirely and defaults to stdout */
     const char *in  = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
-    const char *out = strcmp(argv[optind + 1], "-") ? argv[optind + 1] : "pipe:1";
+    const char *out = argc - optind < 2 || !strcmp(argv[optind + 1], "-")
+                          ? "pipe:1" : argv[optind + 1];
     return webify_run(in, out);
 }

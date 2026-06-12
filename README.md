@@ -14,8 +14,9 @@ modes:
 webify input.mp4 output.webm
 webify photo.jpg photo.webp
 webify -q 6 --max 720x1280 input.mov output.webm   # fit 720 tall, 1280 wide
-cat input.mkv | webify - - > output.webm   # '-' = stdin/stdout
-cat anim.gif  | webify - - > anim.webp
+webify input.mp4 > output.webm             # output omitted = stdout
+cat input.mkv | webify - > output.webm     # '-' = stdin (or explicit stdout)
+cat anim.gif  | webify - > anim.webp
 webify --next input.mp4 output.webm        # AV1/Opus WebM instead of VP9
 webify --next photo.jpg photo.avif         # AVIF instead of WebP
 webify --legacy input.mkv output.mp4       # H.264/AAC MP4 instead
@@ -67,7 +68,8 @@ Exit status: 0 on success, 1 when a conversion fails, 2 for usage errors.
 When stderr is a terminal and the input declares a duration, video
 conversions print pass/percentage progress.
 
-Every supported format works from stdin/stdout (`-`), and piping never
+Every supported format works from stdin/stdout (`-` — and the output
+argument can simply be omitted, which means stdout), and piping never
 changes the result: the bytes are identical to file i/o, with formats that
 need seeking spooled through a temporary file — see
 [doc/piping.md](doc/piping.md) for how each case is handled.

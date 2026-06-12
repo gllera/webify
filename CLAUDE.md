@@ -19,7 +19,7 @@ plus the tiny reviewable diffs in `patches/`, built in Docker
 
 ```bash
 ./build.sh        # Docker build; exports the static binary to ./dist/webify
-./test.sh         # 76-assert behavioral suite against dist/webify
+./test.sh         # 80-assert behavioral suite against dist/webify
                   #   needs host ffmpeg (>= 6), ffprobe, cwebp, python3
 ./fixtures.sh     # fetch the pinned calibration fixtures (release fixtures-v1)
 ./calibrate.sh    # equal-SSIM parity harness (see Calibration below)
