@@ -118,7 +118,11 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
-#define WEBIFY_VERSION "1.2"
+/* the release tag, baked in by the Docker build arg (build.yml passes
+ * github.ref_name on tag builds); local/branch builds report "dev" */
+#ifndef WEBIFY_VERSION
+#define WEBIFY_VERSION "dev"
+#endif
 
 #define VIDEO_FILTERS "format=yuv420p" /* the scale step is built in init_video */
 /* always first in the video chain: frames the decoder flagged interlaced are

@@ -66,8 +66,12 @@ FROM base AS build
 COPY --from=ffmpeg /build/vendor/out vendor/out
 COPY src ./src
 ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
+# the version --version reports: CI passes the release tag on tag builds,
+# everything else self-identifies as a dev build
+ARG VERSION=dev
 RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
     g++ -Os -static -Wall -Wextra -ffunction-sections -fdata-sections \
+        -DWEBIFY_VERSION="\"$VERSION\"" \
         $(pkg-config --cflags $libs) \
         src/webify.cpp -o /webify \
         $(pkg-config --libs --static $libs) \

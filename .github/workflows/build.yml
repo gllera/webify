@@ -56,6 +56,11 @@ jobs:
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=webify-${{ matrix.arch }}
           cache-to: type=gha,scope=webify-${{ matrix.arch }},mode=max
+          # release binaries self-identify by their tag; branch/PR builds
+          # report "dev" (the Dockerfile default — only the tiny final
+          # compile stage rebuilds when this changes)
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
 
       - name: Smoke check
         run: |

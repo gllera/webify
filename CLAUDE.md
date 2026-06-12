@@ -79,7 +79,8 @@ Re-run `./fixtures.sh && ./calibrate.sh` after: a vendored encoder bump
   are free on public repos only), BuildKit layer cache per library via
   `type=gha`. The test suite runs on both arches and gates the `release`
   job. Tag pattern is `'[0-9]*'` on purpose: `fixtures-*` tags must not
-  trigger builds.
+  trigger builds. Release binaries bake their tag into `--version` (Docker
+  build arg `VERSION`); local and branch builds report `dev`.
 - `.github/workflows/vendor-update.yml` (monthly): bumps pins, PRs on the
   rolling `vendor-updates` branch, tags `<ffmpeg-version>-<YYYYMMDD>`, and
   dispatches build.yml on the tag (GITHUB_TOKEN-pushed tags/PRs never fire
