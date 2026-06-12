@@ -1,0 +1,22 @@
+# Approximates the existing hand style (FFmpeg-derived). The source predates
+# this file and was never machine-formatted: use clang-format on new/changed
+# lines only (git clang-format), don't blanket-reformat the file.
+BasedOnStyle: LLVM
+Language: Cpp
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+SpaceBeforeParens: ControlStatements
+IndentCaseLabels: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
+AlignTrailingComments: true
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+SortIncludes: CaseSensitive
+ReflowComments: false
