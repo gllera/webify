@@ -70,7 +70,9 @@ ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
 # everything else self-identifies as a dev build
 ARG VERSION=dev
 RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
-    g++ -Os -static -Wall -Wextra -ffunction-sections -fdata-sections \
+    # -no-pie: drop the static-PIE self-relocation table (musl/gcc default
+    # to PIE); the vendored libs are --enable-pic so they link clean. ~3% smaller.
+    g++ -Os -static -no-pie -fno-pie -Wall -Wextra -ffunction-sections -fdata-sections \
         -DWEBIFY_VERSION="\"$VERSION\"" \
         $(pkg-config --cflags $libs) \
         src/webify.cpp -o /webify \

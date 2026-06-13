@@ -160,6 +160,7 @@ ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
 ff -f lavfi -i "color=c=red:size=320x240:duration=1:rate=1" -frames:v 1 flat.png
 ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alpha.png
 ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
+ff -f lavfi -i "gradients=size=320x240:c0=black:c1=white,format=gray" -frames:v 1 gray.png # monochrome source
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" -c:v libx264 -pix_fmt yuv420p \
    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4 # PQ-tagged HDR
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=50" \
@@ -201,6 +202,7 @@ enc "$W photo.png > noout.webp"  # <output> omitted: stdout
 enc "$W --fast photo.png q_fast.webp"
 enc "$W flat.png flat.webp"
 enc "$W anim.gif anim.webp"
+enc "$W - - < anim.gif > piped_anim.webp"   # animated-WebP race: piped == file
 enc "$W exif.jpg exif.webp"
 enc "cwebp -quiet -q 80 -m 6 -sharp_yuv photo.png -o ref80.webp"
 # video
@@ -245,6 +247,7 @@ enc "$W --legacy --best tiny.mp4 l_best.mp4"
 enc "$W --legacy photo.png l_q.png"
 enc "$W --legacy -q 2 photo.png l_q2.png"
 enc "$W --legacy plain.jpg l_jpg.png"
+enc "$W --legacy gray.png l_gray.png"
 enc "$W --legacy alpha.png l_alpha.png"
 enc "$W --legacy opaque.png l_opaque.png"
 enc "$W --legacy exif.jpg l_exif.png"
@@ -265,6 +268,8 @@ t "image: omitted output goes to stdout"              cmp -s noout.webp q_def.we
 t "image: --fast tier produces a WebP"                grep -aq WEBP q_fast.webp
 t "image: lossless wins the race on flat graphics"    grep -aq VP8L flat.webp
 t "image: animated gif -> animated WebP (ANIM chunk)" grep -aq ANIM anim.webp
+t "image: animated graphics gif races to lossless"    grep -aq VP8L anim.webp
+t "image: animated webp piped == file (race path)"    cmp -s piped_anim.webp anim.webp
 t "image: EXIF orientation baked in (-> 480x640)"     eq "$(dims exif.webp)" "480,640"
 
 # --- video ---------------------------------------------------------------------
@@ -330,6 +335,8 @@ t "legacy: still image -> PNG"                         eq "$(codecs l_q.png)" "p
 t "legacy: PNG is pixel-lossless vs the source"        same_pixels l_q.png photo.png
 t "legacy: -q does not change a PNG (always lossless)" cmp -s l_q.png l_q2.png
 t "legacy: YUV source (JPEG) comes out plain rgb24"    eq "$(pixfmt l_jpg.png)" "rgb24"
+t "legacy: monochrome source -> gray PNG"              eq "$(pixfmt l_gray.png)" "gray"
+t "legacy: gray PNG is pixel-lossless vs the source"   same_pixels l_gray.png gray.png
 t "legacy: real alpha kept (rgba PNG)"                 eq "$(pixfmt l_alpha.png)" "rgba"
 t "legacy: fully opaque alpha channel dropped"         eq "$(pixfmt l_opaque.png)" "rgb24"
 t "legacy: EXIF orientation baked in (-> 480x640)"     eq "$(dims l_exif.png)" "480,640"

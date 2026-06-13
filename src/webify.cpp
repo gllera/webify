@@ -206,6 +206,10 @@ struct Pipe {
     AVPacket        *enc_pkt;
     AVFrame         *first;     /* held 1st frame of a maybe-still image    */
     int              dual;      /* still + RGB: race lossy vs lossless      */
+    int              rgb;       /* RGB-coded source (libwebp does the YUV)  */
+    AVCodecContext  *enc_ll;    /* animated-WebP lossless race sibling enc  */
+    AVFormatContext *ofmt_ll;   /* its in-memory muxer (dyn_buf)            */
+    int              out_index_ll;
     int              prog;      /* report progress from this pipe's frames  */
     double           min_gap;   /* --max @F as a minimum pts spacing (s)    */
     double           next_keep; /* next pts (s) that won't be dropped       */
@@ -564,6 +568,7 @@ static void free_pipe(Pipe *p)
         av_freep(&p->enc->stats_in); /* stats_in is owned by the user */
     avcodec_free_context(&p->enc);
     avcodec_free_context(&p->enc_a);
+    avcodec_free_context(&p->enc_ll); /* ofmt_ll is freed by webify_run */
     avfilter_graph_free(&p->graph);
     av_frame_free(&p->dec_frame);
     av_frame_free(&p->filt_frame);
@@ -747,6 +752,61 @@ static int frame_has_real_alpha(const AVFrame *fr)
     return 0;
 }
 
+/* is the frame achromatic — every pixel R==G==B, or an already-gray format?
+ * Lets a monochrome --legacy source ship as a gray/ya8 PNG instead of a 3x
+ * larger rgb24/rgba one (measured -34..-47% bytes, pixels byte-identical
+ * after decode). Conservative by design: palettized formats check the
+ * palette, RGB formats scan the pixels, and anything we can't cheaply prove
+ * gray (YUV, exotic) returns 0 — so color output never regresses. */
+static int frame_is_grayscale(const AVFrame *fr)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get((AVPixelFormat)fr->format);
+
+    if (!d)
+        return 0;
+    if (d->flags & AV_PIX_FMT_FLAG_PAL) {
+        const uint32_t *pal = (const uint32_t *)fr->data[1];
+
+        for (int i = 0; i < 256; i++) {
+            uint32_t c = pal[i];
+
+            if (((c >> 16) & 0xFFu) != ((c >> 8) & 0xFFu) ||
+                ((c >> 8) & 0xFFu) != (c & 0xFFu))
+                return 0;
+        }
+        return 1;
+    }
+    if (!(d->flags & AV_PIX_FMT_FLAG_RGB)) /* gray = one luma plane (+ alpha?) */
+        return (d->nb_components - !!(d->flags & AV_PIX_FMT_FLAG_ALPHA)) == 1;
+    {
+        const AVComponentDescriptor *c = d->comp; /* [0]=R [1]=G [2]=B */
+        const unsigned be = d->flags & AV_PIX_FMT_FLAG_BE;
+
+        for (int y = 0; y < fr->height; y++) {
+            const uint8_t *r = fr->data[c[0].plane] +
+                               (ptrdiff_t)y * fr->linesize[c[0].plane] + c[0].offset;
+            const uint8_t *g = fr->data[c[1].plane] +
+                               (ptrdiff_t)y * fr->linesize[c[1].plane] + c[1].offset;
+            const uint8_t *b = fr->data[c[2].plane] +
+                               (ptrdiff_t)y * fr->linesize[c[2].plane] + c[2].offset;
+
+            for (int x = 0; x < fr->width; x++,
+                 r += c[0].step, g += c[1].step, b += c[2].step) {
+                unsigned vr = c[0].depth > 8 ? (be ? AV_RB16(r) : AV_RL16(r)) : *r;
+                unsigned vg = c[1].depth > 8 ? (be ? AV_RB16(g) : AV_RL16(g)) : *g;
+                unsigned vb = c[2].depth > 8 ? (be ? AV_RB16(b) : AV_RL16(b)) : *b;
+
+                vr = (vr >> c[0].shift) & ((1u << c[0].depth) - 1);
+                vg = (vg >> c[1].shift) & ((1u << c[1].depth) - 1);
+                vb = (vb >> c[2].shift) & ((1u << c[2].depth) - 1);
+                if (vr != vg || vg != vb)
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 /* the source's peak brightness from HDR metadata payloads, in the 100-nit
  * units the tonemap chain wants: MaxCLL when present, else the mastering
  * display's max luminance, else 0 (the caller picks the fallback) */
@@ -773,14 +833,20 @@ static const uint8_t *coded_sd(const AVStream *st, enum AVPacketSideDataType t)
  * *decoded frame*, and the filter graph (with its transpose/tonemap steps)
  * must exist before frames flow; so when the input can rewind — images
  * always can: slurped, spooled or real files — decode the first frame just
- * to look at it, and let the caller rewind. With detect_anim (--next image
- * inputs, whose still/animation and alpha/no-alpha encoder setups differ
- * before any frame flows) it keeps decoding to also learn whether a second
- * frame proves an animation and whether any frame really uses transparency,
- * stopping as soon as both are settled. */
-static struct { int32_t m[9]; int set; double peak; int animated; int alpha; } peeked;
+ * to look at it, and let the caller rewind. With detect_anim (every image
+ * input, whose still/animation encoder setup differs before any frame flows)
+ * it keeps decoding to learn whether a second frame proves an animation;
+ * need_alpha (--next/--legacy) makes it also scan for real transparency and
+ * decode until both are settled, while the default pipeline stops at the
+ * animation verdict. On the --legacy path it also notes whether the
+ * (single-frame) source is monochrome, so a gray PNG can stand in for a
+ * 3x-larger rgb24 one. */
+static struct {
+    int32_t m[9]; int set; double peak; int animated; int alpha; int gray;
+} peeked;
 
-static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
+static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim,
+                             int need_alpha)
 {
     AVCodecContext *dec = NULL;
     AVPacket *pkt = av_packet_alloc();
@@ -818,12 +884,21 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
                 peeked.peak = peak_from_metadata(cll ? cll->data : NULL,
                                                  mdm ? mdm->data : NULL);
             }
-            if (detect_anim && !peeked.alpha && frame_has_real_alpha(fr))
+            if (detect_anim && need_alpha && !peeked.alpha &&
+                frame_has_real_alpha(fr))
                 peeked.alpha = 1;
+            /* monochrome stills only (gray is used below gated on !animated):
+             * scan the first frame; a second frame makes it an animation and
+             * the legacy path stays rgb24/rgba regardless */
+            if (detect_anim && opt.legacy && frames == 1)
+                peeked.gray = frame_is_grayscale(fr);
             av_frame_unref(fr);
             if (frames >= 2)
                 peeked.animated = 1;
-            if (peeked.animated && peeked.alpha)
+            /* the default pipeline (need_alpha == 0) only wants the
+             * still/animation verdict, so a second frame settles it; the
+             * --next/--legacy paths keep decoding until alpha is known too */
+            if (peeked.animated && (peeked.alpha || !need_alpha))
                 goto end; /* every question answered */
         }
         if (frames > 0 && !detect_anim)
@@ -1201,15 +1276,16 @@ static void tonemap_spec(const AVCodecContext *dec, const AVStream *ist,
 
 /* --legacy images: PNG/APNG is lossless — -q has nothing left to buy (the
  * quality is already maximal, and so always at least the WebP pipeline's),
- * only deflate effort remains. Default and --best run the densest search
- * the encoder offers (zlib level 9 + the per-row "mixed" filter scan);
- * --fast keeps the encoder defaults */
+ * only deflate effort remains. Every tier takes zlib level 9 (lossless, so
+ * strictly smaller — never a quality cost); default and --best add the
+ * per-row "mixed" filter scan, but --fast keeps the encoder's default filter
+ * because "mixed" *alone* backfires on gradients (it only pays paired with
+ * the deeper search) */
 static void setup_png(Pipe *p, AVDictionary **opts)
 {
-    if (opt.effort >= 0) {
-        p->enc->compression_level = 9;
+    p->enc->compression_level = 9;
+    if (opt.effort >= 0)
         av_dict_set(opts, "pred", "mixed", 0);
-    }
 }
 
 /* --next images: AVIF, stills and animations alike. -q buys the same look
@@ -1454,7 +1530,9 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         rgb = !opt.next && !opt.legacy && desc &&
               (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL));
         snprintf(spec, sizeof(spec), "%s%sformat=%s", rotate, scale,
-                 opt.legacy ? (peeked.alpha ? "rgba" : "rgb24")
+                 opt.legacy ? (peeked.gray && !peeked.animated
+                                 ? (peeked.alpha ? "ya8" : "gray")
+                                 : (peeked.alpha ? "rgba" : "rgb24"))
                  : opt.next ? (peeked.alpha ? "yuva420p" : "yuv420p")
                  : rgb      ? av_get_pix_fmt_name(AV_PIX_FMT_RGB32)
                             : "yuv420p|yuva420p");
@@ -1556,8 +1634,11 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
 
     /* a still might do better lossless: race them (--fast skips the race
-     * and the sharp_yuv re-encode — the streamed packet ships as-is) */
-    p->dual = image && rgb && opt.effort >= 0;
+     * and the sharp_yuv re-encode — the streamed packet ships as-is).
+     * Animations race in a second muxer instead (init_anim_lossless), so the
+     * still-hold path is off for them — peeked.animated is known up front */
+    p->rgb  = rgb;
+    p->dual = image && rgb && opt.effort >= 0 && !peeked.animated;
     p->prog = !image;
 
     if (ofmt) {
@@ -1701,8 +1782,12 @@ static int encode_write(AVFormatContext *ofmt, Pipe *p, AVFrame *frame)
     AVFrame *m = NULL, *a = NULL;
     int ret;
 
-    if (!p->enc_a)
-        return encode_one(ofmt, p, p->enc, p->out_index, frame);
+    if (!p->enc_a) {
+        ret = encode_one(ofmt, p, p->enc, p->out_index, frame);
+        if (ret >= 0 && p->enc_ll) /* feed the animated-WebP lossless race */
+            ret = encode_one(p->ofmt_ll, p, p->enc_ll, p->out_index_ll, frame);
+        return ret;
+    }
     /* AVIF with transparency: color planes to the main stream, the alpha
      * plane to the auxiliary one (NULL falls through and flushes both) */
     if (frame) {
@@ -1842,8 +1927,20 @@ static int finish_still(AVFormatContext *ofmt, Pipe *p)
         goto end;
 
     pick = lossy;
-    /* a failed lossless attempt is not fatal: the lossy one stands */
-    if (reencode_still(p, 1, 75, 0, less) >= 0 &&
+    /* the lossless probe is a throwaway whose only job is to decide the race
+     * (the smaller of lossy vs lossless wins). It runs at quality 0 —
+     * libwebp's fastest lossless effort, ~22-30% quicker than the old 75 —
+     * because the lossy/lossless size gap is fixed by content class (graphics
+     * win by 10-100x, photos lose by as much), never by probe effort: a
+     * 16-image sweep including content engineered to straddle the crossover
+     * never flipped the decision between effort 0 and 75. A race winner still
+     * ships the quality-100 re-encode below (libwebp's max effort, the
+     * smaller candidate), so output stays lossless and the same size to within
+     * the encoder's sub-0.1% effort noise — byte-for-byte identical except on
+     * the rare graphic whose probe size ties q100's, which now ships the
+     * (equal-size) q100 bytes. A failed lossless attempt is not fatal: the
+     * lossy one stands. */
+    if (reencode_still(p, 1, 0, 0, less) >= 0 &&
         less->size && less->size < lossy->size) {
         pick = less;
         /* lossless won: re-run the winner at maximum effort (cwebp
@@ -1985,6 +2082,61 @@ static void discard_other_streams(AVFormatContext *ifmt, int vidx, int aidx)
             ifmt->streams[i]->discard = AVDISCARD_ALL;
 }
 
+/* The animated-WebP lossless-vs-lossy race: a second muxer that encodes the
+ * same filtered frames as lossless WebP into memory, in parallel with the
+ * lossy stream. Lossless animation is SSIM 1.0 by definition, so whenever it
+ * comes out smaller (flat-color and graphics GIFs — measured -19..-81%) it is
+ * a free win; photographic animations lose the race and ship the lossy stream
+ * unchanged. Both candidates are buffered so the smaller can be chosen at the
+ * end. Set up only for the default pipeline on an RGB animation at >= default
+ * effort (--fast and YUV sources skip it). */
+static int init_anim_lossless(Pipe *p, const char *muxer)
+{
+    AVDictionary *opts = NULL, *muxopts = NULL;
+    int ret;
+
+    if (!(p->enc_ll = avcodec_alloc_context3(p->enc->codec)))
+        return AVERROR(ENOMEM);
+    copy_enc_geometry(p->enc_ll, p->enc);
+    p->enc_ll->framerate    = p->enc->framerate;
+    p->enc_ll->thread_count = p->enc->thread_count;
+    av_dict_set(&opts, "lossless", "1", 0);
+    av_dict_set(&opts, "quality", "75", 0);          /* lossless: the effort dial */
+    av_dict_set(&opts, "compression_level", "6", 0); /* like the default lossy tier */
+    ret = avcodec_open2(p->enc_ll, p->enc->codec, &opts);
+    av_dict_free(&opts);
+    if (ret < 0)
+        return ret;
+
+    if ((ret = avformat_alloc_output_context2(&p->ofmt_ll, NULL, muxer, NULL)) < 0)
+        return ret;
+    p->ofmt_ll->flags |= AVFMT_FLAG_BITEXACT; /* same determinism as the primary */
+    if ((ret = avio_open_dyn_buf(&p->ofmt_ll->pb)) < 0)
+        return ret;
+    if ((ret = add_stream(p->ofmt_ll, p->enc_ll, &p->out_index_ll)) < 0)
+        return ret;
+    av_dict_set(&muxopts, "loop", "0", 0); /* infinite, like the lossy stream */
+    ret = avformat_write_header(p->ofmt_ll, &muxopts);
+    av_dict_free(&muxopts);
+    return ret;
+}
+
+/* hand a finished in-memory output to its destination: stdout for a pipe,
+ * otherwise the named file (the image muxers that assemble in memory — avif,
+ * apng, and the webp race — all land here) */
+static int emit_output(int to_pipe, const char *path, const uint8_t *buf, int n)
+{
+    AVIOContext *pb = NULL;
+    int ret;
+
+    if (to_pipe)
+        return write_all(STDOUT_FILENO, buf, n);
+    if ((ret = avio_open(&pb, path, AVIO_FLAG_WRITE)) < 0)
+        return ret;
+    avio_write(pb, buf, n);
+    return avio_closep(&pb); /* flushes; surfaces a write error */
+}
+
 static int webify_run(const char *in_path, const char *out_path)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
@@ -1994,7 +2146,7 @@ static int webify_run(const char *in_path, const char *out_path)
     AVDictionary *muxopts = NULL;
     char *stats = NULL, tmp_out[512] = "";
     const char *sink, *oname;
-    int ret, vidx, aidx, image, spool_out = 0;
+    int ret, vidx, aidx, image, spool_out = 0, race = 0, mem_out = 0;
     int out_pipe = is_pipe(out_path);
 
     av_log_set_level(AV_LOG_WARNING);
@@ -2031,7 +2183,7 @@ static int webify_run(const char *in_path, const char *out_path)
         (is_hdr_trc((AVColorTransferCharacteristic)
                     ifmt->streams[vidx]->codecpar->color_trc) &&
          input_can_rewind(ifmt))) {
-        peek_first_frame(ifmt, vidx, image && (opt.next || opt.legacy));
+        peek_first_frame(ifmt, vidx, image, opt.next || opt.legacy);
         if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
             goto end;
     }
@@ -2115,9 +2267,14 @@ static int webify_run(const char *in_path, const char *out_path)
      * for stdout, write into memory and dump the finished file at the end
      * (images stay off disk on purpose — video uses the temp spool above) */
     spool_out = out_pipe && (!strcmp(oname, "avif") || !strcmp(oname, "apng"));
+    /* default-pipeline RGB animations race a lossless WebP candidate: both are
+     * assembled in memory so the smaller can win (see init_anim_lossless) */
+    race = image && !opt.next && !opt.legacy && opt.effort >= 0 &&
+           peeked.animated && video.rgb;
+    mem_out = spool_out || race;
     if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
-        ret = spool_out ? avio_open_dyn_buf(&ofmt->pb)
-                        : avio_open(&ofmt->pb, sink, AVIO_FLAG_WRITE);
+        ret = mem_out ? avio_open_dyn_buf(&ofmt->pb)
+                      : avio_open(&ofmt->pb, sink, AVIO_FLAG_WRITE);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "cannot create '%s': %s\n", out_path,
                    err2str(ret));
@@ -2147,6 +2304,8 @@ static int webify_run(const char *in_path, const char *out_path)
     av_dict_free(&muxopts);
     if (ret < 0)
         goto end;
+    if (race && (ret = init_anim_lossless(&video, oname)) < 0)
+        goto end;
 
     while ((ret = av_read_frame(ifmt, pkt)) >= 0) {
         if (pkt->stream_index == video.in_index)
@@ -2165,6 +2324,8 @@ static int webify_run(const char *in_path, const char *out_path)
     if ((ret = flush_pipe(ofmt, &audio)) < 0)
         goto end;
     ret = av_write_trailer(ofmt);
+    if (race && ret >= 0)
+        ret = av_write_trailer(video.ofmt_ll);
 
 end:
     progress_done(); /* leave stderr on a clean line for any error below */
@@ -2175,19 +2336,35 @@ end:
     avformat_close_input(&ifmt);
     close_stdin_io(&io);
     if (ofmt) {
-        if (spool_out && ofmt->pb) {
-            uint8_t *buf = NULL;
-            int n = avio_close_dyn_buf(ofmt->pb, &buf);
+        if (mem_out && ofmt->pb) {
+            uint8_t *lossy = NULL, *less = NULL;
+            int nlossy = avio_close_dyn_buf(ofmt->pb, &lossy), nless = 0;
+            const uint8_t *win = lossy;
+            int wn = nlossy;
 
             ofmt->pb = NULL;
-            if (ret >= 0 && (ret = write_all(STDOUT_FILENO, buf, n)) < 0)
+            if (race && video.ofmt_ll && video.ofmt_ll->pb) {
+                nless = avio_close_dyn_buf(video.ofmt_ll->pb, &less);
+                video.ofmt_ll->pb = NULL;
+                if (ret >= 0 && nless > 0 && nless < nlossy) { /* lossless won */
+                    win = less;
+                    wn  = nless;
+                }
+            }
+            if (ret >= 0 && (ret = emit_output(out_pipe, out_path, win, wn)) < 0)
                 av_log(NULL, AV_LOG_ERROR, "cannot write output: %s\n",
                        err2str(ret));
-            av_free(buf);
+            av_free(lossy);
+            av_free(less);
         }
         if (!(ofmt->oformat->flags & AVFMT_NOFILE))
             avio_closep(&ofmt->pb);
         avformat_free_context(ofmt);
+    }
+    if (video.ofmt_ll) { /* error path may leave its dyn_buf open */
+        if (video.ofmt_ll->pb)
+            avio_closep(&video.ofmt_ll->pb);
+        avformat_free_context(video.ofmt_ll);
     }
     if (tmp_out[0]) { /* piped-output spool: hand the finished file over */
         if (ret >= 0 && (ret = drain_file_to_stdout(tmp_out)) < 0)

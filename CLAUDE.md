@@ -19,7 +19,7 @@ plus the tiny reviewable diffs in `patches/`, built in Docker
 
 ```bash
 ./build.sh        # Docker build; exports the static binary to ./dist/webify
-./test.sh         # 80-assert behavioral suite against dist/webify
+./test.sh         # 84-assert behavioral suite against dist/webify
                   #   needs host ffmpeg (>= 6), ffprobe, cwebp, python3
 ./fixtures.sh     # fetch the pinned calibration fixtures (release fixtures-v1)
 ./calibrate.sh    # equal-SSIM parity harness (see Calibration below)
@@ -32,7 +32,8 @@ plus the tiny reviewable diffs in `patches/`, built in Docker
 1. **Piped i/o is byte-identical to file i/o, in every mode.** Piped input is
    spooled to an unlinked temp file (stats pass / HDR peek can rewind); piped
    video output spools through a *named* temp file (faststart re-opens by
-   URL). Asserted with `cmp` for VP9, AV1 and H.264.
+   URL). Asserted with `cmp` for VP9, AV1, H.264 and animated WebP (whose
+   lossless race also assembles in memory — see invariant 8).
 2. **Output is deterministic** (`AVFMT_FLAG_BITEXACT` on the muxer). Known
    exception: x264's threaded ratecontrol is timing-sensitive when the VBV
    binds hard (`--legacy` near `-q 0`) — bytes can vary between runs there.
@@ -50,6 +51,20 @@ plus the tiny reviewable diffs in `patches/`, built in Docker
    `patches/0001-libwebpenc-expose-sharp_yuv.patch`.
 7. **Never upscale; mono stays mono; rate caps follow the source** (its
    codec-weighted measured bitrate caps the budget from above).
+8. **The default WebP pipeline races lossless vs lossy and ships the
+   smaller.** Single-frame RGB stills race in `finish_still` (the probe runs
+   at libwebp's fastest lossless effort — content class, not effort, decides
+   the race; the winner re-encodes at quality 100). RGB *animations* race in a
+   second in-memory muxer (`init_anim_lossless`) fed the same filtered frames;
+   lossless winners are pixel-exact VP8L (graphics/flat-color GIFs, −19..−81%),
+   photographic content keeps the lossy bytes verbatim. `--fast` and YUV
+   sources skip both races. `peeked.animated` (a cheap up-front peek) picks the
+   path. Asserted with `grep VP8L` + a piped==file `cmp`.
+9. **Monochrome `--legacy` sources ship as `gray`/`ya8` PNG** (lossless,
+   pixel-exact, ~−40% vs rgb24/rgba); color and animated sources stay
+   rgb24/rgba. The detector (`frame_is_grayscale`) is conservative — YUV and
+   formats it can't cheaply prove gray fall through to rgb24, so color never
+   regresses. **Not** pal8 (measured a *loss*: it disables pred=mixed).
 
 ## Calibration
 
@@ -60,7 +75,10 @@ anchors, the codec-efficiency table. The data and method are in
 
 Re-run `./fixtures.sh && ./calibrate.sh` after: a vendored encoder bump
 (libaom/libvpx/libwebp/x264), filter-chain or muxer changes, or any
-`--fast`/`--best` tier change. Hard-won procedural lessons:
+`--fast`/`--best` tier change — but only when they move the *lossy* `-q`
+operating point. Lossless-only paths (the WebP lossless races, `--legacy`
+PNG/gray) are SSIM 1.0 by construction and need no re-fit. Hard-won
+procedural lessons:
 
 - **Fit on real content, never synthetics alone** — every synthetic-only fit
   here has had to be redone (the anim curve measured −.055 SSIM on live
