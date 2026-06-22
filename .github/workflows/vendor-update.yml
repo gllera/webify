@@ -1,0 +1,75 @@
+name: vendor-update
+
+# Monthly upstream version check: runs update-vendor.sh, and if any pin
+# changed, opens (or refreshes) a PR on the rolling `vendor-updates` branch.
+# PRs created with GITHUB_TOKEN never fire on:pull_request workflows, so the
+# build is dispatched on the branch explicitly — its result lands on the PR's
+# head commit either way. Merge only when both arches are green.
+
+on:
+  schedule:
+    - cron: '0 6 1 * *' # 06:00 UTC on the 1st of every month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write # gh workflow run (dispatching build.yml on the PR branch)
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check upstream versions and rewrite pins
+        id: check
+        continue-on-error: true # a failed probe shouldn't drop the bumps that worked
+        run: ./update-vendor.sh | tee /tmp/vendor-update.txt
+
+      - name: Open or refresh the update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "All pins already at the latest upstream versions."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -am 'vendor: bump pins to latest upstream releases' \
+              -m "$(grep '^bump' /tmp/vendor-update.txt)"
+          git push -f origin HEAD:vendor-updates
+          # tag the bumped vendor state as <ffmpeg-version>-<utc-date>, e.g.
+          # 8.1.1-20260115 (ffmpeg's version after the update, whether or not
+          # ffmpeg itself was among the bumps); -f so a same-day rerun moves
+          # the tag to the newest bump commit instead of failing
+          tag="$(sed -n 's/^FFMPEG_VERSION=//p' vendor.d/80-ffmpeg.sh)-$(date -u +%Y%m%d)"
+          git tag -f "$tag"
+          git push -f origin "refs/tags/$tag"
+          {
+            echo 'Automated monthly vendor version check (`update-vendor.sh`):'
+            echo
+            echo '```'
+            cat /tmp/vendor-update.txt
+            echo '```'
+            echo
+            echo "Vendor state tagged \`$tag\`."
+            echo
+            echo 'CI was dispatched on the tag (same commit as this branch): green on'
+            echo 'both arches publishes the release with the binaries attached — merge'
+            echo 'only when it is.'
+          } > /tmp/pr-body.md
+          gh pr create --head vendor-updates \
+              --title 'vendor: bump pins to latest upstream releases' \
+              --body-file /tmp/pr-body.md \
+            || gh pr edit vendor-updates --body-file /tmp/pr-body.md
+          # dispatched on the tag ref so build.yml's release job attaches the
+          # binaries (a GITHUB_TOKEN tag push can't fire on:push by itself)
+          gh workflow run build.yml --ref "refs/tags/$tag"
+
+      - name: Surface probe failures
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo 'update-vendor.sh reported at least one failed upstream probe (see its FAIL lines above).'
+          exit 1
