@@ -20,6 +20,21 @@ It vendors a minimal FFmpeg + four codec libraries (official release tarballs,
 sha256-pinned per library in `vendor.d/*.sh`), built in Docker (one stage per
 library, see `Dockerfile`).
 
+Two flags exist for asset-self-hosting integration (e.g. SRR's `asset-peek` /
+`asset-process`), both emitting one line of JSON to stdout:
+
+- `--peek <input>` — open + probe only (no encode), print
+  `{"mimetype","extension","supported"}`. `supported:false` (empty type) when
+  there's no video stream webify can encode, so a caller hosts the original.
+- `--json` — after a transcode to a **file** `<output>`, also print
+  `{"mimetype","extension"}`. Purely additive: the media bytes are byte-identical
+  to a run without it (asserted in `test.sh`); rejected with a stdout `<output>`.
+
+Both live in `webify_peek` / the `emit_json` tail of `webify_run`; the output
+type is fixed (`image/avif` for images, `video/mp4` for video) so there is no
+content-encoding field. Re-verify with `./test.sh` (the `--peek` / `--json`
+blocks).
+
 ## Commands
 
 ```bash

@@ -44,6 +44,18 @@ file arguments):
   rate (e.g. `--max @30` halves the frame budget of a 60 fps screencast).
   Each part is optional: `720`, `480x854`, `720x`, `@30`, and `480x@30`
   are all valid.
+- `--json` — after writing to a **file** `<output>`, print the result's
+  `{"mimetype","extension"}` as JSON to stdout (e.g.
+  `{"mimetype":"image/avif","extension":"avif"}`). The media bytes are
+  unchanged — `--json` only adds the report — so the output file must be a real
+  path, not stdout (which carries the JSON). Lets a caller learn the produced
+  type without re-sniffing the bytes.
+- `--peek <input>` — identify `<input>` and print the type it *would* produce,
+  `{"mimetype","extension","supported"}`, **without** encoding (just the open +
+  probe). `supported` is `false` (with empty type) when the input has no video
+  stream webify can encode — so a caller can host the original unchanged instead
+  of transcoding it. Always exits 0; the JSON, not the exit code, carries the
+  verdict. Takes no `<output>`.
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the
   vendored FFmpeg version baked into the binary.
 

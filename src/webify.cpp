@@ -1357,7 +1357,7 @@ static int emit_output(int to_pipe, const char *path, const uint8_t *buf, int n)
     return avio_closep(&pb); /* flushes; surfaces a write error */
 }
 
-static int webify_run(const char *in_path, const char *out_path)
+static int webify_run(const char *in_path, const char *out_path, int emit_json)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
     Pipe video = {}, audio = {};
@@ -1366,7 +1366,7 @@ static int webify_run(const char *in_path, const char *out_path)
     AVDictionary *muxopts = NULL;
     char tmp_out[512] = "";
     const char *sink, *oname;
-    int ret, vidx, aidx, image, mem_out = 0;
+    int ret, vidx, aidx, image = 0, mem_out = 0;
     int out_pipe = is_pipe(out_path);
 
     av_log_set_level(AV_LOG_WARNING);
@@ -1532,6 +1532,48 @@ end:
         av_log(NULL, AV_LOG_ERROR, "transcode failed: %s\n", err2str(ret));
         return 1;
     }
+    /* --json: the bytes went to a file, so stdout is free for the result's
+     * type (the chosen output format is fixed: avif for images, mp4 for video).
+     * No content-encoding field — these formats are never transfer-compressed. */
+    if (emit_json)
+        printf("{\"mimetype\":\"%s\",\"extension\":\"%s\"}\n",
+               image ? "image/avif" : "video/mp4", image ? "avif" : "mp4");
+    return 0;
+}
+
+/* --peek: identify the input and predict the post-transcode type without
+ * encoding (open + probe only, the cheap part of webify_run). Prints
+ * {"mimetype","extension","supported"} to stdout; supported is false (with an
+ * empty type) when the input has no video stream webify can encode, so the
+ * caller hosts the original unchanged. Always exits 0 — the JSON, not the exit
+ * code, carries the verdict. */
+static int webify_peek(const char *in_path)
+{
+    AVFormatContext *ifmt = NULL;
+    StdinIO io = {};
+    const char *mime = "", *ext = "";
+    int vidx;
+
+    av_log_set_level(AV_LOG_FATAL); /* a non-media input failing to open is the
+                                     * expected supported:false path, not noise */
+
+    int ret = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
+                               : avformat_open_input(&ifmt, in_path, NULL, NULL);
+    if (ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0 &&
+        (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
+        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        int aidx  = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+        int image = input_is_image(ifmt, vidx, aidx);
+
+        mime = image ? "image/avif" : "video/mp4";
+        ext  = image ? "avif" : "mp4";
+    }
+
+    printf("{\"mimetype\":\"%s\",\"extension\":\"%s\",\"supported\":%s}\n",
+           mime, ext, *ext ? "true" : "false");
+
+    avformat_close_input(&ifmt);
+    close_stdin_io(&io);
     return 0;
 }
 
@@ -1553,6 +1595,11 @@ static int usage(FILE *f, int status)
             "                         all. @F drops frames to cap the frame\n"
             "                         rate (video only; @30 halves a 60fps\n"
             "                         clip); combine freely: 480x854@30, 480x@30\n"
+            "      --json             after writing to a file <output>, print the\n"
+            "                         result's {mimetype,extension} JSON to stdout\n"
+            "      --peek <input>     identify <input> and print its predicted\n"
+            "                         post-transcode {mimetype,extension,supported}\n"
+            "                         JSON without encoding (no <output>)\n"
             "  -h, --help             show this help\n"
             "      --version          print version (incl. vendored FFmpeg)\n");
     return status;
@@ -1616,15 +1663,17 @@ bad:
 
 int main(int argc, char **argv)
 {
-    enum { OPT_VERSION = 1000 };
+    enum { OPT_VERSION = 1000, OPT_JSON, OPT_PEEK };
     static const struct option longopts[] = {
         { "quality", required_argument, NULL, 'q' },
         { "max",     required_argument, NULL, 'm' },
+        { "json",    no_argument,       NULL, OPT_JSON },
+        { "peek",    no_argument,       NULL, OPT_PEEK },
         { "help",    no_argument,       NULL, 'h' },
         { "version", no_argument,       NULL, OPT_VERSION },
         { NULL, 0, NULL, 0 },
     };
-    int c;
+    int c, emit_json = 0, peek = 0;
     char *end;
 
     while ((c = getopt_long(argc, argv, "hq:m:", longopts, NULL)) != -1) {
@@ -1634,6 +1683,12 @@ int main(int argc, char **argv)
         case OPT_VERSION:
             printf("webify %s (FFmpeg %s)\n", WEBIFY_VERSION, av_version_info());
             return 0;
+        case OPT_JSON:
+            emit_json = 1;
+            break;
+        case OPT_PEEK:
+            peek = 1;
+            break;
         case 'q':
             opt.quality = strtod(optarg, &end);
             if (*end || end == optarg || opt.quality < 0 || opt.quality > 10) {
@@ -1650,6 +1705,12 @@ int main(int argc, char **argv)
             return usage(stderr, 2);
         }
     }
+    /* --peek takes exactly one input and no output (it never writes media) */
+    if (peek) {
+        if (emit_json || argc - optind != 1)
+            return usage(stderr, 2);
+        return webify_peek(strcmp(argv[optind], "-") ? argv[optind] : "pipe:0");
+    }
     if (argc - optind < 1 || argc - optind > 2)
         return usage(stderr, 2);
     /* the '-' convention lives in the ffmpeg CLI, not libavformat;
@@ -1657,5 +1718,11 @@ int main(int argc, char **argv)
     const char *in  = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
     const char *out = argc - optind < 2 || !strcmp(argv[optind + 1], "-")
                           ? "pipe:1" : argv[optind + 1];
-    return webify_run(in, out);
+    /* --json reports on stdout, so the media must go to a file, not stdout */
+    if (emit_json && is_pipe(out)) {
+        fprintf(stderr, "webify: --json needs a file <output> "
+                        "(stdout carries the JSON)\n");
+        return 2;
+    }
+    return webify_run(in, out, emit_json);
 }

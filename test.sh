@@ -140,6 +140,24 @@ t "no file arguments rejected"             rejects
 t "three file arguments rejected"          rejects in out extra
 t "audio-only input rejected"              rejects audio.wav x.mp4
 
+# --- --peek: identify + predict the output type, no encode ---------------------
+t "--peek image -> image/avif, supported"    eq "$("$WEBIFY" --peek photo.png)" '{"mimetype":"image/avif","extension":"avif","supported":true}'
+t "--peek animated gif -> image/avif"        eq "$("$WEBIFY" --peek anim.gif)"  '{"mimetype":"image/avif","extension":"avif","supported":true}'
+t "--peek video -> video/mp4, supported"     eq "$("$WEBIFY" --peek tv.mp4)"    '{"mimetype":"video/mp4","extension":"mp4","supported":true}'
+t "--peek audio-only -> unsupported"         eq "$("$WEBIFY" --peek audio.wav)" '{"mimetype":"","extension":"","supported":false}'
+t "--peek garbage input -> unsupported"      eq "$("$WEBIFY" --peek evil.mp4)"  '{"mimetype":"","extension":"","supported":false}'
+t "--peek exits 0 even when unsupported"     bash -c "$W --peek audio.wav >/dev/null"
+t "--peek with an <output> rejected"         rejects --peek photo.png out.x
+t "--peek combined with --json rejected"     rejects --peek --json photo.png
+
+# --- --json: transcode to a file, report {mimetype,extension} on stdout --------
+t "--json image: stdout reports avif"        eq "$("$WEBIFY" --json photo.png j1.avif)" '{"mimetype":"image/avif","extension":"avif"}'
+t "--json video: stdout reports mp4"         eq "$("$WEBIFY" --json tv.mp4 j1.mp4)"     '{"mimetype":"video/mp4","extension":"mp4"}'
+t "--json writes a valid AVIF file"          bash -c "$W --json photo.png j2.avif >/dev/null && grep -aq ftypavif j2.avif"
+t "--json bytes == a plain run (additive)"   bash -c "$W photo.png j3a.avif 2>/dev/null; $W --json photo.png j3b.avif >/dev/null; cmp -s j3a.avif j3b.avif"
+t "--json to a stdout output rejected"       rejects --json photo.png -
+t "--json with no explicit <output> rejected" rejects --json photo.png
+
 # --- encodes (the assert blocks below only read the outputs) -------------------
 # images -> AVIF
 enc "$W photo.png  q_def.avif"
