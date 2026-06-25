@@ -145,7 +145,7 @@ t "dropped flag --fast rejected"           rejects --fast in out
 t "dropped flag --best rejected"           rejects --best in out
 t "no file arguments rejected"             rejects
 t "three file arguments rejected"          rejects in out extra
-t "audio-only input rejected"              rejects audio.wav x.mp4
+t "input with neither video nor audio rejected"  rejects note.txt x.mp4
 
 # --- --peek: identify (no encode); media via FFmpeg, the rest via libmagic -----
 # webify-native output types (exact — webify owns them)
@@ -157,8 +157,8 @@ t "--peek pdf -> application/pdf"            has "$("$WEBIFY" --peek doc.pdf)"  
 t "--peek svg (undecodable) -> svg"         has "$("$WEBIFY" --peek pic.svg)"  '"mimetype":"image/svg+xml","extension":"svg","supported":false'
 t "--peek gzipped svg -> inner type + gzip" has "$("$WEBIFY" --peek pic.svgz)" '"mimetype":"image/svg+xml","extension":"svg","supported":false,"encoding":"gzip"'
 t "--peek text -> text/plain (built-in)"    has "$("$WEBIFY" --peek note.txt)" '"mimetype":"text/plain"'
-# audio-only: webify can't transcode it, but FFmpeg already knows the type
-t "--peek wav (audio-only) -> audio/wav"    has "$("$WEBIFY" --peek audio.wav)" '"mimetype":"audio/wav","extension":"wav","supported":false'
+# audio-only: webify transcodes it to AAC/m4a -> supported
+t "--peek audio-only -> audio/mp4, supported" has "$("$WEBIFY" --peek audio.wav)" '"mimetype":"audio/mp4","extension":"m4a","supported":true'
 t "--peek unknown bytes -> octet-stream"    has "$("$WEBIFY" --peek junk.bin)"  '"mimetype":"application/octet-stream","extension":"","supported":false'
 t "--peek exits 0 even when unsupported"     bash -c "$W --peek audio.wav >/dev/null"
 t "--peek with an <output> rejected"         rejects --peek photo.png out.x
@@ -198,6 +198,9 @@ enc "$W frag.mp4 v_frag.mp4"
 enc "$W stereo.mp4 v_stereo.mp4"
 enc "$W hdr.mp4 v_hdr.mp4"
 enc "$W ilace.ts v_ilace.mp4"
+# audio-only -> AAC in .m4a (the mp4 muxer with just an audio stream)
+enc "$W audio.wav a_def.m4a"
+enc "$W - - < audio.wav > a_piped.m4a"
 drain
 
 # --- images (AVIF) -------------------------------------------------------------
@@ -230,6 +233,13 @@ t "video: moov at the head (faststart)"               moov_at_head v_def.mp4
 t "video: piped i/o byte-identical to file i/o"       cmp -s v_file.mp4 v_piped.mp4
 t "video: omitted output goes to stdout"              cmp -s v_file.mp4 v_noout.mp4
 t "video: piped output keeps moov at the head"        moov_at_head v_piped.mp4
+
+# --- audio-only (AAC in .m4a) --------------------------------------------------
+t "audio: audio-only encodes to AAC"                  eq "$(codecs a_def.m4a)" "aac"
+t "audio: output has no video stream"                 eq "$(probe v:0 codec_name a_def.m4a)" ""
+t "audio: mono source stays mono"                     eq "$(channels a_def.m4a)" "1"
+t "audio: moov at the head (faststart)"               moov_at_head a_def.m4a
+t "audio: piped i/o byte-identical to file i/o"       cmp -s a_def.m4a a_piped.m4a
 t "video: muted fragmented mp4 stays video"           eq "$(codecs v_frag.mp4)" "h264"
 t "video: crafted mp4 input does not hang"            bash -c "timeout 5 $W - - < evil.mp4 > /dev/null 2>&1; [ \$? -ne 124 ]"
 

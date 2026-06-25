@@ -1,6 +1,7 @@
 /*
- * webify — transcode any popular video file to H.264/AAC MP4, or any popular
- * image file to AVIF (auto-detected). One option set covers both modes:
+ * webify — transcode any popular video file to H.264/AAC MP4, any popular audio
+ * file to AAC M4A, or any popular image file to AVIF (auto-detected). One option
+ * set covers every mode:
  * -q/--quality 0-10 (mapped to the x264 CRF for video, the AVIF CRF for
  * images) and -m/--max [HxW | S][@F] (downscale to fit H px tall / W px wide —
  * a single number S bounds both, a missing side ("480x", "x854") is
@@ -1367,6 +1368,15 @@ static int emit_output(int to_pipe, const char *path, const uint8_t *buf, int n)
     return avio_closep(&pb); /* flushes; surfaces a write error */
 }
 
+/* the output webify produces for each input class: image -> AVIF, audio-only ->
+ * AAC in an .m4a (the mp4 muxer with just an audio stream), everything else
+ * (video) -> H.264/AAC MP4. Shared by the --json report and --peek's prediction. */
+static void output_type(int image, int audio_only, const char **mime, const char **ext)
+{
+    *mime = image ? "image/avif" : audio_only ? "audio/mp4" : "video/mp4";
+    *ext  = image ? "avif" : audio_only ? "m4a" : "mp4";
+}
+
 static int webify_run(const char *in_path, const char *out_path, int emit_json)
 {
     AVFormatContext *ifmt = NULL, *ofmt = NULL;
@@ -1376,7 +1386,7 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
     AVDictionary *muxopts = NULL;
     char tmp_out[512] = "";
     const char *sink, *oname;
-    int ret, vidx, aidx, image = 0, mem_out = 0;
+    int ret, vidx, aidx, image = 0, audio_only = 0, mem_out = 0;
     int out_pipe = is_pipe(out_path);
 
     av_log_set_level(AV_LOG_WARNING);
@@ -1393,15 +1403,23 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
         goto end;
 
     vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (vidx < 0 || (ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
-        av_log(NULL, AV_LOG_ERROR, "'%s' has no video stream\n", in_path);
-        ret = AVERROR_STREAM_NOT_FOUND;
-        goto end;
+    aidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    /* a real video stream drives image/video mode; a cover-art "video" doesn't
+     * count. With only audio, transcode that to AAC in an .m4a (mp4 muxer). */
+    audio_only = vidx < 0 ||
+                 (ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC);
+    if (audio_only) {
+        if (aidx < 0) {
+            av_log(NULL, AV_LOG_ERROR, "'%s' has no video or audio stream\n", in_path);
+            ret = AVERROR_STREAM_NOT_FOUND;
+            goto end;
+        }
+        vidx = -1;
+    } else {
+        image = input_is_image(ifmt, vidx, aidx);
+        if (image)
+            aidx = -1; /* the image pipeline takes no audio */
     }
-    aidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0); /* optional */
-    image = input_is_image(ifmt, vidx, aidx);
-    if (image)
-        aidx = -1; /* the image pipeline takes no audio */
 
     prog.tty      = isatty(STDERR_FILENO);
     prog.duration = ifmt->duration;
@@ -1409,10 +1427,11 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
     /* images peek for animation/alpha/orientation; HDR videos peek for the
      * source peak — both consume the input, so rewind after (HDR videos that
      * cannot rewind fall back to tag defaults) */
-    if (image ||
-        (is_hdr_trc((AVColorTransferCharacteristic)
-                    ifmt->streams[vidx]->codecpar->color_trc) &&
-         input_can_rewind(ifmt))) {
+    if (!audio_only &&
+        (image ||
+         (is_hdr_trc((AVColorTransferCharacteristic)
+                     ifmt->streams[vidx]->codecpar->color_trc) &&
+          input_can_rewind(ifmt)))) {
         peek_first_frame(ifmt, vidx, image);
         if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
             goto end;
@@ -1452,10 +1471,12 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
 
     if (!image)
         progress_start("encoding:");
-    if ((ret = init_video(&video, ifmt, ofmt, vidx, image)) < 0)
+    if (!audio_only && (ret = init_video(&video, ifmt, ofmt, vidx, image)) < 0)
         goto end;
     if (aidx >= 0 && (ret = init_audio(&audio, ifmt, ofmt, aidx)) < 0)
         goto end;
+    if (audio_only)
+        audio.prog = 1; /* drive the progress bar off the audio frames */
 
     if (!(pkt = av_packet_alloc())) {
         ret = AVERROR(ENOMEM);
@@ -1493,7 +1514,7 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
         goto end;
 
     while ((ret = av_read_frame(ifmt, pkt)) >= 0) {
-        if (pkt->stream_index == video.in_index)
+        if (video.dec && pkt->stream_index == video.in_index)
             ret = decode_packet(ofmt, &video, pkt);
         else if (audio.dec && pkt->stream_index == audio.in_index)
             ret = decode_packet(ofmt, &audio, pkt);
@@ -1542,12 +1563,15 @@ end:
         av_log(NULL, AV_LOG_ERROR, "transcode failed: %s\n", err2str(ret));
         return 1;
     }
-    /* --json: the bytes went to a file, so stdout is free for the result's
-     * type (the chosen output format is fixed: avif for images, mp4 for video).
-     * No content-encoding field — these formats are never transfer-compressed. */
-    if (emit_json)
-        printf("{\"mimetype\":\"%s\",\"extension\":\"%s\"}\n",
-               image ? "image/avif" : "video/mp4", image ? "avif" : "mp4");
+    /* --json: the bytes went to a file, so stdout is free for the result's type
+     * (fixed per input class — see output_type). No content-encoding field —
+     * these formats are never transfer-compressed. */
+    if (emit_json) {
+        const char *mt, *ex;
+
+        output_type(image, audio_only, &mt, &ex);
+        printf("{\"mimetype\":\"%s\",\"extension\":\"%s\"}\n", mt, ex);
+    }
     return 0;
 }
 
@@ -1678,17 +1702,19 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
 
 /* --peek: identify the input and print {"mimetype","extension","supported",
  * "encoding"} to stdout WITHOUT encoding (open + probe only). For a webify-
- * encodable image/video it predicts the transcode output (image/avif, video/mp4)
- * and supported=true; otherwise it falls back to `file` for the source's real,
- * browser-compatible type (seeing inside a gzip wrapper and tagging
- * encoding="gzip"), supported=false, so the caller hosts the original unchanged.
- * Always exits 0 — the JSON, not the exit code, carries the verdict. */
+ * encodable input it predicts the transcode output (image/avif, video/mp4, or
+ * audio/mp4 for audio-only) with supported=true. Otherwise supported=false and
+ * the source's real type: from FFmpeg for media it can open but not transcode,
+ * else from `file` (libmagic — seeing inside a gzip wrapper and tagging
+ * encoding="gzip"), so the caller hosts the original unchanged. Always exits 0 —
+ * the JSON, not the exit code, carries the verdict. */
 static int webify_peek(const char *in_path)
 {
     AVFormatContext *ifmt = NULL;
     StdinIO          io   = {};
-    char mime[256] = "", ext[16] = "", enc[16] = "";
-    int  supported = 0, vidx;
+    char        mime[256] = "", ext[16] = "", enc[16] = "";
+    int         supported = 0, vidx = -1;
+    const char *mt, *ex;
 
     av_log_set_level(AV_LOG_FATAL); /* a non-media input failing to open is the
                                      * expected supported:false path, not noise */
@@ -1696,23 +1722,30 @@ static int webify_peek(const char *in_path)
     int ret    = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
                                   : avformat_open_input(&ifmt, in_path, NULL, NULL);
     int opened = ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0;
-
-    if (opened &&
+    int aidx   = opened ? av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
+    /* a real (non-cover-art) video stream means image/video mode; only audio
+     * means audio-only mode — the same split webify_run makes */
+    int has_video = opened &&
         (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
-        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
-        avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
-        /* a video stream webify can actually decode (not just a demuxer match —
-         * e.g. SVG is recognized but has no decoder): it transcodes to avif/mp4 */
-        int aidx  = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-        int image = input_is_image(ifmt, vidx, aidx);
+        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC);
 
+    if (has_video && avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
+        /* a video stream webify can actually decode (not just a demuxer match —
+         * e.g. SVG is recognized but has no decoder): transcodes to avif/mp4 */
         supported = 1;
-        snprintf(mime, sizeof mime, "%s", image ? "image/avif" : "video/mp4");
-        snprintf(ext, sizeof ext, "%s", image ? "avif" : "mp4");
+        output_type(input_is_image(ifmt, vidx, aidx), 0, &mt, &ex);
+        snprintf(mime, sizeof mime, "%s", mt);
+        snprintf(ext, sizeof ext, "%s", ex);
+    } else if (!has_video && aidx >= 0 &&
+               avcodec_find_decoder(ifmt->streams[aidx]->codecpar->codec_id)) {
+        /* audio-only webify can decode: transcodes the audio to AAC in an .m4a */
+        supported = 1;
+        output_type(0, 1, &mt, &ex);
+        snprintf(mime, sizeof mime, "%s", mt);
+        snprintf(ext, sizeof ext, "%s", ex);
     } else if (opened) {
-        /* FFmpeg recognized the container but webify can't transcode it
-         * (audio-only, or a video codec the build can't decode): report the type
-         * FFmpeg already knows — no libmagic needed for media it can open */
+        /* FFmpeg recognized the container but webify can't transcode it (an
+         * undecodable codec): report the type FFmpeg already knows */
         ffmpeg_mime(ifmt, mime, sizeof mime);
         if (*mime)
             snprintf(ext, sizeof ext, "%s", mime_to_ext(mime));
@@ -1734,8 +1767,8 @@ static int webify_peek(const char *in_path)
 static int usage(FILE *f, int status)
 {
     fprintf(f,
-            "webify: transcode any popular video to H.264/AAC MP4,\n"
-            "         or any popular image to AVIF (auto-detected)\n"
+            "webify: transcode any popular video to H.264/AAC MP4, audio to\n"
+            "         AAC M4A, or any popular image to AVIF (auto-detected)\n"
             "usage: webify [options] <input> [output]\n"
             "       '-' = stdin/stdout; omitting [output] writes to stdout\n"
             "  -q, --quality <0-10>   target quality, higher is better\n"

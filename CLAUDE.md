@@ -5,10 +5,10 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 ## What this is
 
 `webify` is a single static C++ binary (one source file, `src/webify.cpp`)
-that converts any popular video to **H.264/AAC MP4** (faststart) and any
-popular image to **AVIF** (animated GIF → animated AVIF), tuned for web
-delivery. Input type is auto-detected; one option set (`-q`, `--max`) covers
-both modes.
+that converts any popular video to **H.264/AAC MP4** (faststart), any popular
+audio to **AAC M4A**, and any popular image to **AVIF** (animated GIF → animated
+AVIF), tuned for web delivery. Input type is auto-detected; one option set
+(`-q`, `--max`) covers all modes.
 
 This is a deliberately **simplified** descendant of the original `webify`
 (github.com/gllera/webify): there are no `--next` / `--legacy` format switches
@@ -60,8 +60,10 @@ blocks).
 
 ## Invariants — re-verify with ./test.sh before merging anything that could touch them
 
-1. **Two output formats only**: video → H.264/AAC MP4, image/GIF → AVIF. No
-   other muxer or encoder is compiled into the FFmpeg build.
+1. **Three output classes, two muxers**: video → H.264/AAC MP4, audio-only →
+   AAC M4A (the same mp4 muxer + AAC encoder, just no video stream), image/GIF →
+   AVIF. No other muxer or encoder is compiled into the FFmpeg build. An input
+   with neither a decodable video nor audio stream is rejected.
 2. **One effort tier, one quality dial**: `-q 0..10` maps to the x264/AVIF CRF
    and the AAC bitrate; nothing else trades quality or time.
 3. **Piped i/o is byte-identical to file i/o.** Piped video output spools

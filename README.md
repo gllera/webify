@@ -1,15 +1,16 @@
 # webify
 
 A single, fully static binary that transcodes any popular video file to
-**H.264/AAC MP4** — and any popular image file to **AVIF** — with sane
-defaults tuned for serving the result over the internet: H.264 in CRF mode at
-preset `veryslow`, the `moov` atom at the head of the file (faststart), and
-AVIF at AV1 Main profile (8-bit 4:2:0, the one profile hardware decoders
-reliably implement). Input type is auto-detected, and one option set covers
-both modes:
+**H.264/AAC MP4**, any popular audio file to **AAC M4A**, and any popular image
+file to **AVIF** — with sane defaults tuned for serving the result over the
+internet: H.264 in CRF mode at preset `veryslow`, the `moov` atom at the head of
+the file (faststart), and AVIF at AV1 Main profile (8-bit 4:2:0, the one profile
+hardware decoders reliably implement). Input type is auto-detected, and one
+option set covers every mode:
 
 ```
 webify input.mp4 output.mp4
+webify song.mp3  song.m4a                        # audio-only -> AAC M4A
 webify photo.jpg photo.avif
 webify anim.gif  anim.avif                       # animated GIF -> animated AVIF
 webify -q 6 --max 720x1280 input.mov output.mp4  # fit 720 tall, 1280 wide
