@@ -36,6 +36,7 @@ t() { # <description> <command...> — command's exit code decides pass/fail
 }
 eq()      { [ "$1" = "$2" ]; }
 lt()      { [ "$1" -lt "$2" ]; }
+has()     { case "$1" in *"$2"*) ;; *) return 1 ;; esac; } # $1 contains $2?
 rejects() { ! "$WEBIFY" "$@" 2>/dev/null; }
 
 # The encodes dominate the suite's wall time and are all independent (distinct
@@ -125,6 +126,11 @@ exif  = b"Exif\x00\x00" + tiff
 open("exif.jpg", "wb").write(jpg[:2] + b"\xff\xe1" +
                              struct.pack(">H", len(exif) + 2) + exif + jpg[2:])
 EOF
+# non-media assets for the --peek libmagic fallback
+printf '%%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%%%EOF\n' > doc.pdf
+printf '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>\n' > pic.svg
+gzip -c pic.svg > pic.svgz                          # a gzip-compressed asset
+printf 'plain text body\n' > note.txt
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "$W --help | grep -q usage"
@@ -140,12 +146,17 @@ t "no file arguments rejected"             rejects
 t "three file arguments rejected"          rejects in out extra
 t "audio-only input rejected"              rejects audio.wav x.mp4
 
-# --- --peek: identify + predict the output type, no encode ---------------------
-t "--peek image -> image/avif, supported"    eq "$("$WEBIFY" --peek photo.png)" '{"mimetype":"image/avif","extension":"avif","supported":true}'
-t "--peek animated gif -> image/avif"        eq "$("$WEBIFY" --peek anim.gif)"  '{"mimetype":"image/avif","extension":"avif","supported":true}'
-t "--peek video -> video/mp4, supported"     eq "$("$WEBIFY" --peek tv.mp4)"    '{"mimetype":"video/mp4","extension":"mp4","supported":true}'
-t "--peek audio-only -> unsupported"         eq "$("$WEBIFY" --peek audio.wav)" '{"mimetype":"","extension":"","supported":false}'
-t "--peek garbage input -> unsupported"      eq "$("$WEBIFY" --peek evil.mp4)"  '{"mimetype":"","extension":"","supported":false}'
+# --- --peek: identify (no encode); media via FFmpeg, the rest via libmagic -----
+# webify-native output types (exact — webify owns them)
+t "--peek image -> image/avif, supported"    eq "$("$WEBIFY" --peek photo.png)" '{"mimetype":"image/avif","extension":"avif","supported":true,"encoding":""}'
+t "--peek animated gif -> image/avif"        eq "$("$WEBIFY" --peek anim.gif)"  '{"mimetype":"image/avif","extension":"avif","supported":true,"encoding":""}'
+t "--peek video -> video/mp4, supported"     eq "$("$WEBIFY" --peek tv.mp4)"    '{"mimetype":"video/mp4","extension":"mp4","supported":true,"encoding":""}'
+# libmagic fallback for non-media (substring: robust to db bumps)
+t "--peek pdf -> application/pdf"            has "$("$WEBIFY" --peek doc.pdf)"  '"mimetype":"application/pdf","extension":"pdf","supported":false,"encoding":""'
+t "--peek svg (undecodable) -> svg"         has "$("$WEBIFY" --peek pic.svg)"  '"mimetype":"image/svg+xml","extension":"svg","supported":false'
+t "--peek gzipped svg -> inner type + gzip" has "$("$WEBIFY" --peek pic.svgz)" '"mimetype":"image/svg+xml","extension":"svg","supported":false,"encoding":"gzip"'
+t "--peek text -> text/plain (built-in)"    has "$("$WEBIFY" --peek note.txt)" '"mimetype":"text/plain"'
+t "--peek unmapped type -> unsupported"     has "$("$WEBIFY" --peek audio.wav)" '"supported":false'
 t "--peek exits 0 even when unsupported"     bash -c "$W --peek audio.wav >/dev/null"
 t "--peek with an <output> rejected"         rejects --peek photo.png out.x
 t "--peek combined with --json rejected"     rejects --peek --json photo.png

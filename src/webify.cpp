@@ -61,6 +61,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <magic.h> /* libmagic: content sniffing for --peek's non-media fallback */
+#include <zlib.h>  /* gunzip the head ourselves to sniff inside a gzip wrapper */
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -75,6 +78,13 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
+}
+
+/* the embedded compiled libmagic database (magic.mgc), linked in by the Docker
+ * build via `ld -r -b binary` so webify stays a single self-contained binary */
+extern "C" {
+extern const unsigned char _binary_magic_mgc_start[];
+extern const unsigned char _binary_magic_mgc_end[];
 }
 
 /* the release tag, baked in by the Docker build arg (build.yml passes
@@ -1541,39 +1551,138 @@ end:
     return 0;
 }
 
-/* --peek: identify the input and predict the post-transcode type without
- * encoding (open + probe only, the cheap part of webify_run). Prints
- * {"mimetype","extension","supported"} to stdout; supported is false (with an
- * empty type) when the input has no video stream webify can encode, so the
- * caller hosts the original unchanged. Always exits 0 — the JSON, not the exit
- * code, carries the verdict. */
+/* first two bytes are the gzip magic (1f 8b)? */
+static int is_gzip(const char *path)
+{
+    unsigned char b[2] = { 0, 0 };
+    FILE         *f    = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    size_t r = fread(b, 1, sizeof b, f);
+    fclose(f);
+    return r == 2 && b[0] == 0x1f && b[1] == 0x8b;
+}
+
+/* a browser-facing file extension for the common web asset types `file` reports
+ * (empty when unmapped — the caller then keeps the source name's extension) */
+static const char *mime_to_ext(const char *mime)
+{
+    static const struct {
+        const char *mime, *ext;
+    } map[] = {
+        { "application/pdf", "pdf" },          { "image/svg+xml", "svg" },
+        { "image/png", "png" },                { "image/jpeg", "jpg" },
+        { "image/gif", "gif" },                { "image/webp", "webp" },
+        { "image/avif", "avif" },              { "image/bmp", "bmp" },
+        { "image/tiff", "tiff" },              { "image/x-icon", "ico" },
+        { "image/vnd.microsoft.icon", "ico" }, { "video/mp4", "mp4" },
+        { "video/webm", "webm" },              { "video/quicktime", "mov" },
+        { "audio/mpeg", "mp3" },               { "audio/ogg", "ogg" },
+        { "audio/x-wav", "wav" },              { "audio/wav", "wav" },
+        { "text/plain", "txt" },               { "text/html", "html" },
+        { "text/css", "css" },                 { "text/csv", "csv" },
+        { "text/xml", "xml" },                 { "application/xml", "xml" },
+        { "application/json", "json" },        { "text/javascript", "js" },
+        { "application/javascript", "js" },    { "application/zip", "zip" },
+        { "font/woff2", "woff2" },             { "font/woff", "woff" },
+        { "font/ttf", "ttf" },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+        if (!strcmp(mime, map[i].mime))
+            return map[i].ext;
+    return "";
+}
+
+/* identify a non-media input with the statically-linked, embedded libmagic
+ * database. A gzip source is inflated here (zlib `gz*`, already linked) and its
+ * *inner* type sniffed — libmagic's own MAGIC_COMPRESS dlopens zlib, which a
+ * fully-static musl binary can't do — and tagged encoding="gzip" (a browser
+ * Content-Encoding) so it is hosted and rendered as that inner type. The
+ * mimetype is a standard, browser-compatible type. Best-effort: the fields stay
+ * empty on any failure, so the caller falls back to the source name. */
+static void peek_identify(const char *path, char *mime, size_t mn,
+                          char *ext, size_t en, char *enc, size_t cn)
+{
+    magic_t m = magic_open(MAGIC_MIME_TYPE | MAGIC_ERROR);
+    if (!m)
+        return;
+    void  *db  = (void *)_binary_magic_mgc_start;
+    size_t len = (size_t)(_binary_magic_mgc_end - _binary_magic_mgc_start);
+    if (magic_load_buffers(m, &db, &len, 1) != 0) {
+        magic_close(m);
+        return;
+    }
+
+    const char *t      = NULL;
+    int         gz_src = is_gzip(path);
+    if (gz_src) {
+        unsigned char head[8192];
+        gzFile        gz = gzopen(path, "rb");
+
+        if (gz) {
+            int n = gzread(gz, head, sizeof head);
+            gzclose(gz);
+            if (n > 0)
+                t = magic_buffer(m, head, (size_t)n);
+        }
+    } else {
+        t = magic_file(m, path);
+    }
+
+    if (t && *t) {
+        snprintf(mime, mn, "%s", t);
+        snprintf(ext, en, "%s", mime_to_ext(mime));
+        if (gz_src)
+            snprintf(enc, cn, "gzip");
+    }
+    magic_close(m);
+}
+
+/* --peek: identify the input and print {"mimetype","extension","supported",
+ * "encoding"} to stdout WITHOUT encoding (open + probe only). For a webify-
+ * encodable image/video it predicts the transcode output (image/avif, video/mp4)
+ * and supported=true; otherwise it falls back to `file` for the source's real,
+ * browser-compatible type (seeing inside a gzip wrapper and tagging
+ * encoding="gzip"), supported=false, so the caller hosts the original unchanged.
+ * Always exits 0 — the JSON, not the exit code, carries the verdict. */
 static int webify_peek(const char *in_path)
 {
     AVFormatContext *ifmt = NULL;
-    StdinIO io = {};
-    const char *mime = "", *ext = "";
-    int vidx;
+    StdinIO          io   = {};
+    char mime[256] = "", ext[16] = "", enc[16] = "";
+    int  supported = 0, vidx;
 
     av_log_set_level(AV_LOG_FATAL); /* a non-media input failing to open is the
                                      * expected supported:false path, not noise */
 
     int ret = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
                                : avformat_open_input(&ifmt, in_path, NULL, NULL);
+    /* supported only when there is a video stream webify can actually decode:
+     * a demuxer may recognize a format (e.g. SVG) the build has no decoder for —
+     * those fall through to the `file` fallback and are hosted unchanged */
     if (ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0 &&
         (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
-        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
+        avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
         int aidx  = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
         int image = input_is_image(ifmt, vidx, aidx);
 
-        mime = image ? "image/avif" : "video/mp4";
-        ext  = image ? "avif" : "mp4";
+        supported = 1;
+        snprintf(mime, sizeof mime, "%s", image ? "image/avif" : "video/mp4");
+        snprintf(ext, sizeof ext, "%s", image ? "avif" : "mp4");
     }
-
-    printf("{\"mimetype\":\"%s\",\"extension\":\"%s\",\"supported\":%s}\n",
-           mime, ext, *ext ? "true" : "false");
-
     avformat_close_input(&ifmt);
     close_stdin_io(&io);
+
+    /* not a webify-encodable image/video: identify the source so the caller
+     * hosts it with a correct, browser-compatible Content-Type/-Encoding */
+    if (!supported && !is_pipe(in_path))
+        peek_identify(in_path, mime, sizeof mime, ext, sizeof ext, enc, sizeof enc);
+
+    printf("{\"mimetype\":\"%s\",\"extension\":\"%s\",\"supported\":%s,"
+           "\"encoding\":\"%s\"}\n",
+           mime, ext, supported ? "true" : "false", enc);
     return 0;
 }
 
@@ -1597,9 +1706,10 @@ static int usage(FILE *f, int status)
             "                         clip); combine freely: 480x854@30, 480x@30\n"
             "      --json             after writing to a file <output>, print the\n"
             "                         result's {mimetype,extension} JSON to stdout\n"
-            "      --peek <input>     identify <input> and print its predicted\n"
-            "                         post-transcode {mimetype,extension,supported}\n"
-            "                         JSON without encoding (no <output>)\n"
+            "      --peek <input>     identify <input> and print a {mimetype,\n"
+            "                         extension,supported,encoding} JSON without\n"
+            "                         transcoding; non-media types fall back to\n"
+            "                         `file` (sees inside gzip). No <output>\n"
             "  -h, --help             show this help\n"
             "      --version          print version (incl. vendored FFmpeg)\n");
     return status;

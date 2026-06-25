@@ -37,6 +37,11 @@ FROM base AS zimg
 COPY vendor.d/70-zimg.sh vendor.d/
 RUN vendor.d/70-zimg.sh
 
+# libmagic (file): linked directly into webify, not through ffmpeg
+FROM base AS libmagic
+COPY vendor.d/50-libmagic.sh vendor.d/
+RUN vendor.d/50-libmagic.sh
+
 # ffmpeg links all of the above, so it re-runs when any library changed
 FROM base AS ffmpeg
 COPY --from=dav1d /build/vendor/out vendor/out
@@ -47,20 +52,26 @@ COPY vendor.d/80-ffmpeg.sh vendor.d/
 RUN vendor.d/80-ffmpeg.sh
 
 FROM base AS build
-COPY --from=ffmpeg /build/vendor/out vendor/out
+COPY --from=ffmpeg   /build/vendor/out vendor/out
+COPY --from=libmagic /build/vendor/out vendor/out
 COPY src ./src
 ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
 # the version --version reports: CI passes the release tag on tag builds,
 # everything else self-identifies as a dev build
 ARG VERSION=dev
 RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
+    # embed the compiled libmagic database as an object (symbols
+    # _binary_magic_mgc_{start,end}) so the binary needs no external magic file
+    cp vendor/out/share/misc/magic.mgc magic.mgc && \
+    ld -r -b binary magic.mgc -o magic_mgc.o && \
     # -no-pie: drop the static-PIE self-relocation table (musl/gcc default
     # to PIE); the vendored libs are --enable-pic so they link clean. ~3% smaller.
+    # libmagic + zlib link directly (no .pc): -I/-L vendor/out, -lmagic, -lz.
     g++ -Os -static -no-pie -fno-pie -Wall -Wextra -ffunction-sections -fdata-sections \
         -DWEBIFY_VERSION="\"$VERSION\"" \
-        $(pkg-config --cflags $libs) \
-        src/webify.cpp -o /webify \
-        $(pkg-config --libs --static $libs) \
+        $(pkg-config --cflags $libs) -Ivendor/out/include \
+        src/webify.cpp magic_mgc.o -o /webify \
+        $(pkg-config --libs --static $libs) -Lvendor/out/lib -lmagic -lz \
         -Wl,--gc-sections -s && \
     ls -lh /webify
 

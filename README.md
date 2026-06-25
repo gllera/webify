@@ -50,12 +50,16 @@ file arguments):
   unchanged — `--json` only adds the report — so the output file must be a real
   path, not stdout (which carries the JSON). Lets a caller learn the produced
   type without re-sniffing the bytes.
-- `--peek <input>` — identify `<input>` and print the type it *would* produce,
-  `{"mimetype","extension","supported"}`, **without** encoding (just the open +
-  probe). `supported` is `false` (with empty type) when the input has no video
-  stream webify can encode — so a caller can host the original unchanged instead
-  of transcoding it. Always exits 0; the JSON, not the exit code, carries the
-  verdict. Takes no `<output>`.
+- `--peek <input>` — identify `<input>` and print
+  `{"mimetype","extension","supported","encoding"}` **without** encoding (just
+  open + probe). For something webify can transcode it predicts the output type
+  (`image/avif` / `video/mp4`, `supported:true`); otherwise it sniffs the real,
+  browser-compatible type with the statically-linked **libmagic** (`supported:false`,
+  so a caller hosts the original unchanged) — looking *inside* a gzip wrapper and
+  reporting the inner type with `encoding:"gzip"` (an HTTP `Content-Encoding`).
+  libmagic and a curated magic database are embedded, so there is no runtime
+  dependency. Always exits 0; the JSON, not the exit code, carries the verdict.
+  Takes no `<output>`.
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the
   vendored FFmpeg version baked into the binary.
 

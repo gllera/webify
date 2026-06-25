@@ -24,15 +24,25 @@ Two flags exist for asset-self-hosting integration (e.g. SRR's `asset-peek` /
 `asset-process`), both emitting one line of JSON to stdout:
 
 - `--peek <input>` — open + probe only (no encode), print
-  `{"mimetype","extension","supported"}`. `supported:false` (empty type) when
-  there's no video stream webify can encode, so a caller hosts the original.
+  `{"mimetype","extension","supported","encoding"}`. A video stream webify can
+  *decode* (decoder check, not just a demuxer match) → `supported:true` with the
+  predicted output type; otherwise `peek_identify` sniffs the real type with the
+  statically-linked, **embedded** libmagic so a caller hosts the original. gzip
+  is inflated here (zlib `gz*`) to sniff the *inner* type and tagged
+  `encoding:"gzip"` — a static musl binary can't `dlopen` zlib for libmagic's
+  MAGIC_COMPRESS.
 - `--json` — after a transcode to a **file** `<output>`, also print
   `{"mimetype","extension"}`. Purely additive: the media bytes are byte-identical
   to a run without it (asserted in `test.sh`); rejected with a stdout `<output>`.
 
-Both live in `webify_peek` / the `emit_json` tail of `webify_run`; the output
-type is fixed (`image/avif` for images, `video/mp4` for video) so there is no
-content-encoding field. Re-verify with `./test.sh` (the `--peek` / `--json`
+`--peek` lives in `webify_peek` / `peek_identify` / `mime_to_ext` / `is_gzip`;
+`--json` in the `emit_json` tail of `webify_run`. **libmagic** is vendored
+(`vendor.d/50-libmagic.sh`, file 5.46, static) and its magic database is
+recompiled to a **curated** subset (`MAGIC_SET` = documents, markup, fonts — the
+only non-media web assets the FFmpeg path can't decode) so the embedded `.mgc`
+is ~150 KB, not ~10 MB; the Dockerfile `build` stage embeds it via `ld -r -b
+binary` (symbols `_binary_magic_mgc_{start,end}`). Unmapped types fall back to
+`application/octet-stream`. Re-verify with `./test.sh` (the `--peek` / `--json`
 blocks).
 
 ## Commands
@@ -82,7 +92,9 @@ reference pipeline to fit against.
 - `vendor.d/*.sh`: one script per library, upstream release version +
   tarball sha256 pinned. Linked: **x264** (H.264 encode, GPL, pinned to the
   `stable` branch tip by commit hash), **libaom** (AV1/AVIF encode), **dav1d**
-  (AV1 decode), **zimg** (HDR tonemap). `00-nasm.sh` only builds on bare hosts.
+  (AV1 decode), **zimg** (HDR tonemap), **libmagic** (file 5.46 — `--peek`
+  content sniffing, curated magic db; linked into webify directly, not through
+  ffmpeg). `00-nasm.sh` only builds on bare hosts.
 - `.github/workflows/build.yml`: native amd64 + arm64 builds, BuildKit layer
   cache per library via `type=gha`; the test suite gates the `release` job.
   Tag pattern `'[0-9]*'` publishes a GitHub Release.
