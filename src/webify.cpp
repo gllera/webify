@@ -1592,27 +1592,23 @@ static int is_gzip(const char *path)
  * (empty when unmapped — the caller then keeps the source name's extension) */
 static const char *mime_to_ext(const char *mime)
 {
+    /* only the types the --peek fallbacks can actually emit: libmagic on the
+     * curated db (MAGIC_SET = pdf/sgml/fonts, plus built-in text) and ffmpeg_mime
+     * (audio). FFmpeg-decodable raster/video never reach here (they're
+     * supported:true). Anything unmapped returns "" and the caller keeps the
+     * source name's extension; add a row if MAGIC_SET grows a type that needs a
+     * specific extension. */
     static const struct {
         const char *mime, *ext;
     } map[] = {
-        { "application/pdf", "pdf" },          { "image/svg+xml", "svg" },
-        { "image/png", "png" },                { "image/jpeg", "jpg" },
-        { "image/gif", "gif" },                { "image/webp", "webp" },
-        { "image/avif", "avif" },              { "image/bmp", "bmp" },
-        { "image/tiff", "tiff" },              { "image/x-icon", "ico" },
-        { "image/vnd.microsoft.icon", "ico" }, { "video/mp4", "mp4" },
-        { "video/webm", "webm" },              { "video/quicktime", "mov" },
-        { "audio/mpeg", "mp3" },               { "audio/ogg", "ogg" },
-        { "audio/x-wav", "wav" },              { "audio/wav", "wav" },
-        { "audio/flac", "flac" },              { "audio/aac", "aac" },
-        { "audio/mp4", "m4a" },                { "audio/aiff", "aiff" },
-        { "text/plain", "txt" },               { "text/html", "html" },
-        { "text/css", "css" },                 { "text/csv", "csv" },
-        { "text/xml", "xml" },                 { "application/xml", "xml" },
-        { "application/json", "json" },        { "text/javascript", "js" },
-        { "application/javascript", "js" },    { "application/zip", "zip" },
-        { "font/woff2", "woff2" },             { "font/woff", "woff" },
-        { "font/ttf", "ttf" },
+        { "application/pdf", "pdf" }, { "image/svg+xml", "svg" },
+        { "text/html", "html" },     { "text/xml", "xml" },
+        { "application/xml", "xml" }, { "text/plain", "txt" },
+        { "font/woff2", "woff2" },   { "font/woff", "woff" },
+        { "font/ttf", "ttf" },       { "audio/mpeg", "mp3" },
+        { "audio/wav", "wav" },      { "audio/flac", "flac" },
+        { "audio/ogg", "ogg" },      { "audio/aac", "aac" },
+        { "audio/aiff", "aiff" },    { "audio/mp4", "m4a" },
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(mime, map[i].mime))
@@ -1657,10 +1653,10 @@ static void peek_identify(const char *path, char *mime, size_t mn,
     }
 
     if (t && *t) {
-        snprintf(mime, mn, "%s", t);
-        snprintf(ext, en, "%s", mime_to_ext(mime));
+        av_strlcpy(mime, t, mn);
+        av_strlcpy(ext, mime_to_ext(mime), en);
         if (gz_src)
-            snprintf(enc, cn, "gzip");
+            av_strlcpy(enc, "gzip", cn);
     }
     magic_close(m);
 }
@@ -1675,10 +1671,8 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
 {
     const char *mt = ifmt->iformat->mime_type;
     if (mt && *mt) { /* a comma-joined list for some demuxers; take the first */
-        size_t i = 0;
-        for (; mt[i] && mt[i] != ',' && i + 1 < mn; i++)
-            mime[i] = mt[i];
-        mime[i] = '\0';
+        size_t n = strcspn(mt, ",");
+        av_strlcpy(mime, mt, n + 1 < mn ? n + 1 : mn);
         return;
     }
     static const struct {
@@ -1691,13 +1685,13 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
     const char *n = ifmt->iformat->name;
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(n, map[i].name)) {
-            snprintf(mime, mn, "%s", map[i].mime);
+            av_strlcpy(mime, map[i].mime, mn);
             return;
         }
     /* the mov/mp4/m4a family is one comma-joined demuxer name; with no decodable
      * video (we are here) an opened one is audio (m4a) */
     if (strstr(n, "mp4"))
-        snprintf(mime, mn, "audio/mp4");
+        av_strlcpy(mime, "audio/mp4", mn);
 }
 
 /* --peek: identify the input and print {"mimetype","extension","supported",
@@ -1734,21 +1728,21 @@ static int webify_peek(const char *in_path)
          * e.g. SVG is recognized but has no decoder): transcodes to avif/mp4 */
         supported = 1;
         output_type(input_is_image(ifmt, vidx, aidx), 0, &mt, &ex);
-        snprintf(mime, sizeof mime, "%s", mt);
-        snprintf(ext, sizeof ext, "%s", ex);
+        av_strlcpy(mime, mt, sizeof mime);
+        av_strlcpy(ext, ex, sizeof ext);
     } else if (!has_video && aidx >= 0 &&
                avcodec_find_decoder(ifmt->streams[aidx]->codecpar->codec_id)) {
         /* audio-only webify can decode: transcodes the audio to AAC in an .m4a */
         supported = 1;
         output_type(0, 1, &mt, &ex);
-        snprintf(mime, sizeof mime, "%s", mt);
-        snprintf(ext, sizeof ext, "%s", ex);
+        av_strlcpy(mime, mt, sizeof mime);
+        av_strlcpy(ext, ex, sizeof ext);
     } else if (opened) {
         /* FFmpeg recognized the container but webify can't transcode it (an
          * undecodable codec): report the type FFmpeg already knows */
         ffmpeg_mime(ifmt, mime, sizeof mime);
         if (*mime)
-            snprintf(ext, sizeof ext, "%s", mime_to_ext(mime));
+            av_strlcpy(ext, mime_to_ext(mime), sizeof ext);
     }
     avformat_close_input(&ifmt);
     close_stdin_io(&io);
