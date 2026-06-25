@@ -1593,7 +1593,7 @@ static int is_gzip(const char *path)
 static const char *mime_to_ext(const char *mime)
 {
     /* only the types the --peek fallbacks can actually emit: libmagic on the
-     * curated db (MAGIC_SET = pdf/sgml/fonts, plus built-in text) and ffmpeg_mime
+     * curated db (MAGIC_SET = pdf/sgml/fonts, plus built-in text/JSON) and ffmpeg_mime
      * (audio). FFmpeg-decodable raster/video never reach here (they're
      * supported:true). Anything unmapped returns "" and the caller keeps the
      * source name's extension; add a row if MAGIC_SET grows a type that needs a
@@ -1604,6 +1604,7 @@ static const char *mime_to_ext(const char *mime)
         { "application/pdf", "pdf" }, { "image/svg+xml", "svg" },
         { "text/html", "html" },     { "text/xml", "xml" },
         { "application/xml", "xml" }, { "text/plain", "txt" },
+        { "application/json", "json" },
         { "font/woff2", "woff2" },   { "font/woff", "woff" },
         { "font/ttf", "ttf" },       { "audio/mpeg", "mp3" },
         { "audio/wav", "wav" },      { "audio/flac", "flac" },
@@ -1639,15 +1640,28 @@ static void peek_identify(const char *path, char *mime, size_t mn,
     const char *t      = NULL;
     int         gz_src = is_gzip(path);
     if (gz_src) {
-        unsigned char head[8192];
-        gzFile        gz = gzopen(path, "rb");
+        /* inflate up to CAP bytes, not just a header: libmagic's compiled-in
+         * whole-document detectors (JSON, CSV) reject a truncated fragment, so
+         * an 8 KB peek mis-typed a >8 KB gzipped JSON as text/plain. CAP bounds
+         * the inflate so a huge gz can't exhaust memory; it's well above any
+         * document libmagic would scan on the uncompressed magic_file() path. */
+        const size_t   CAP  = 10u * 1024 * 1024;
+        unsigned char *head = (unsigned char *)av_malloc(CAP);
+        gzFile         gz   = gzopen(path, "rb");
 
-        if (gz) {
-            int n = gzread(gz, head, sizeof head);
-            gzclose(gz);
-            if (n > 0)
-                t = magic_buffer(m, head, (size_t)n);
+        if (head && gz) {
+            size_t off = 0;
+            int    n;
+            while (off < CAP &&
+                   (n = gzread(gz, head + off, (unsigned)(CAP - off))) > 0)
+                off += (size_t)n;
+            if (off > 0)
+                t = magic_buffer(m, head, off); /* t points into libmagic's own
+                                                 * buffer, safe past av_free */
         }
+        if (gz)
+            gzclose(gz);
+        av_free(head);
     } else {
         t = magic_file(m, path);
     }

@@ -132,6 +132,8 @@ printf '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>\n' > pic.
 gzip -c pic.svg > pic.svgz                          # a gzip-compressed asset
 printf 'plain text body\n' > note.txt
 python3 -c 'import sys; sys.stdout.buffer.write(bytes(range(8))*16)' > junk.bin  # no magic
+python3 -c 'import json,sys; sys.stdout.write(json.dumps({"items":list(range(4000))}))' > data.json  # >8KB JSON
+gzip -c data.json > data.json.gz                    # gzipped JSON, inner >8KB
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "$W --help | grep -q usage"
@@ -157,6 +159,8 @@ t "--peek pdf -> application/pdf"            has "$("$WEBIFY" --peek doc.pdf)"  
 t "--peek svg (undecodable) -> svg"         has "$("$WEBIFY" --peek pic.svg)"  '"mimetype":"image/svg+xml","extension":"svg","supported":false'
 t "--peek gzipped svg -> inner type + gzip" has "$("$WEBIFY" --peek pic.svgz)" '"mimetype":"image/svg+xml","extension":"svg","supported":false,"encoding":"gzip"'
 t "--peek text -> text/plain (built-in)"    has "$("$WEBIFY" --peek note.txt)" '"mimetype":"text/plain"'
+t "--peek json -> application/json"         has "$("$WEBIFY" --peek data.json)" '"mimetype":"application/json","extension":"json","supported":false,"encoding":""'
+t "--peek gzipped json (>8KB inner) -> json + gzip" has "$("$WEBIFY" --peek data.json.gz)" '"mimetype":"application/json","extension":"json","supported":false,"encoding":"gzip"'
 # audio-only: webify transcodes it to AAC/m4a -> supported
 t "--peek audio-only -> audio/mp4, supported" has "$("$WEBIFY" --peek audio.wav)" '"mimetype":"audio/mp4","extension":"m4a","supported":true'
 t "--peek unknown bytes -> octet-stream"    has "$("$WEBIFY" --peek junk.bin)"  '"mimetype":"application/octet-stream","extension":"","supported":false'
