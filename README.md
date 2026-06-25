@@ -52,12 +52,14 @@ file arguments):
   type without re-sniffing the bytes.
 - `--peek <input>` — identify `<input>` and print
   `{"mimetype","extension","supported","encoding"}` **without** encoding (just
-  open + probe). For something webify can transcode it predicts the output type
-  (`image/avif` / `video/mp4`, `supported:true`); otherwise it sniffs the real,
-  browser-compatible type with the statically-linked **libmagic** (`supported:false`,
-  so a caller hosts the original unchanged) — looking *inside* a gzip wrapper and
-  reporting the inner type with `encoding:"gzip"` (an HTTP `Content-Encoding`).
-  libmagic and a curated magic database are embedded, so there is no runtime
+  open + probe). If webify can transcode it, it predicts the output type
+  (`image/avif` / `video/mp4`, `supported:true`). Otherwise `supported:false` and
+  the browser-compatible source type, so a caller hosts the original unchanged:
+  audio-only and other media FFmpeg recognizes are typed by **FFmpeg** itself
+  (e.g. `audio/mpeg`, `audio/wav`); non-media (PDF, SVG, fonts, …) is sniffed by
+  a statically-linked, **embedded** **libmagic** — looking *inside* a gzip
+  wrapper and reporting the inner type with `encoding:"gzip"` (an HTTP
+  `Content-Encoding`). Everything is in the binary, so there is no runtime
   dependency. Always exits 0; the JSON, not the exit code, carries the verdict.
   Takes no `<output>`.
 - `-h`, `--help` / `--version` — the usual; `--version` also reports the

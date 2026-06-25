@@ -24,13 +24,16 @@ Two flags exist for asset-self-hosting integration (e.g. SRR's `asset-peek` /
 `asset-process`), both emitting one line of JSON to stdout:
 
 - `--peek <input>` — open + probe only (no encode), print
-  `{"mimetype","extension","supported","encoding"}`. A video stream webify can
-  *decode* (decoder check, not just a demuxer match) → `supported:true` with the
-  predicted output type; otherwise `peek_identify` sniffs the real type with the
-  statically-linked, **embedded** libmagic so a caller hosts the original. gzip
-  is inflated here (zlib `gz*`) to sniff the *inner* type and tagged
-  `encoding:"gzip"` — a static musl binary can't `dlopen` zlib for libmagic's
-  MAGIC_COMPRESS.
+  `{"mimetype","extension","supported","encoding"}`. Three layers: (1) a video
+  stream webify can *decode* (decoder check, not just a demuxer match) →
+  `supported:true` + predicted output type; (2) else if FFmpeg opened it, take
+  the type FFmpeg already knows (`ffmpeg_mime`: `iformat->mime_type`, else a
+  demuxer-name map — audio is the case, e.g. mp3/wav/flac/ogg/m4a); (3) else
+  `peek_identify` sniffs a non-media asset with the statically-linked **embedded**
+  libmagic (pdf/svg/fonts). gzip is inflated here (zlib `gz*`) to sniff the
+  *inner* type and tagged `encoding:"gzip"` — a static musl binary can't `dlopen`
+  zlib for libmagic's MAGIC_COMPRESS. So libmagic only carries what FFmpeg can't
+  open, which keeps the curated db tiny.
 - `--json` — after a transcode to a **file** `<output>`, also print
   `{"mimetype","extension"}`. Purely additive: the media bytes are byte-identical
   to a run without it (asserted in `test.sh`); rejected with a stdout `<output>`.

@@ -1580,6 +1580,8 @@ static const char *mime_to_ext(const char *mime)
         { "video/webm", "webm" },              { "video/quicktime", "mov" },
         { "audio/mpeg", "mp3" },               { "audio/ogg", "ogg" },
         { "audio/x-wav", "wav" },              { "audio/wav", "wav" },
+        { "audio/flac", "flac" },              { "audio/aac", "aac" },
+        { "audio/mp4", "m4a" },                { "audio/aiff", "aiff" },
         { "text/plain", "txt" },               { "text/html", "html" },
         { "text/css", "css" },                 { "text/csv", "csv" },
         { "text/xml", "xml" },                 { "application/xml", "xml" },
@@ -1639,6 +1641,41 @@ static void peek_identify(const char *path, char *mime, size_t mn,
     magic_close(m);
 }
 
+/* the mimetype FFmpeg already knows for a container it opened but webify can't
+ * transcode (audio-only, or an undecodable video codec). Prefers the demuxer's
+ * own mime_type (set for e.g. mp3 -> audio/mpeg); otherwise maps the stable
+ * demuxer name, since most audio demuxers leave mime_type unset. Stays empty for
+ * a demuxer that pins nothing useful (e.g. the generic image2 used for SVG) — the
+ * caller then falls back to libmagic. */
+static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
+{
+    const char *mt = ifmt->iformat->mime_type;
+    if (mt && *mt) { /* a comma-joined list for some demuxers; take the first */
+        size_t i = 0;
+        for (; mt[i] && mt[i] != ',' && i + 1 < mn; i++)
+            mime[i] = mt[i];
+        mime[i] = '\0';
+        return;
+    }
+    static const struct {
+        const char *name, *mime;
+    } map[] = {
+        { "wav", "audio/wav" },   { "flac", "audio/flac" }, { "ogg", "audio/ogg" },
+        { "aac", "audio/aac" },   { "adts", "audio/aac" },  { "mp3", "audio/mpeg" },
+        { "aiff", "audio/aiff" },
+    };
+    const char *n = ifmt->iformat->name;
+    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+        if (!strcmp(n, map[i].name)) {
+            snprintf(mime, mn, "%s", map[i].mime);
+            return;
+        }
+    /* the mov/mp4/m4a family is one comma-joined demuxer name; with no decodable
+     * video (we are here) an opened one is audio (m4a) */
+    if (strstr(n, "mp4"))
+        snprintf(mime, mn, "audio/mp4");
+}
+
 /* --peek: identify the input and print {"mimetype","extension","supported",
  * "encoding"} to stdout WITHOUT encoding (open + probe only). For a webify-
  * encodable image/video it predicts the transcode output (image/avif, video/mp4)
@@ -1656,28 +1693,36 @@ static int webify_peek(const char *in_path)
     av_log_set_level(AV_LOG_FATAL); /* a non-media input failing to open is the
                                      * expected supported:false path, not noise */
 
-    int ret = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
-                               : avformat_open_input(&ifmt, in_path, NULL, NULL);
-    /* supported only when there is a video stream webify can actually decode:
-     * a demuxer may recognize a format (e.g. SVG) the build has no decoder for —
-     * those fall through to the `file` fallback and are hosted unchanged */
-    if (ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0 &&
+    int ret    = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
+                                  : avformat_open_input(&ifmt, in_path, NULL, NULL);
+    int opened = ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0;
+
+    if (opened &&
         (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
         !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
         avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
+        /* a video stream webify can actually decode (not just a demuxer match —
+         * e.g. SVG is recognized but has no decoder): it transcodes to avif/mp4 */
         int aidx  = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
         int image = input_is_image(ifmt, vidx, aidx);
 
         supported = 1;
         snprintf(mime, sizeof mime, "%s", image ? "image/avif" : "video/mp4");
         snprintf(ext, sizeof ext, "%s", image ? "avif" : "mp4");
+    } else if (opened) {
+        /* FFmpeg recognized the container but webify can't transcode it
+         * (audio-only, or a video codec the build can't decode): report the type
+         * FFmpeg already knows — no libmagic needed for media it can open */
+        ffmpeg_mime(ifmt, mime, sizeof mime);
+        if (*mime)
+            snprintf(ext, sizeof ext, "%s", mime_to_ext(mime));
     }
     avformat_close_input(&ifmt);
     close_stdin_io(&io);
 
-    /* not a webify-encodable image/video: identify the source so the caller
-     * hosts it with a correct, browser-compatible Content-Type/-Encoding */
-    if (!supported && !is_pipe(in_path))
+    /* FFmpeg pinned no type (it didn't recognize the file, or its demuxer exposes
+     * none): sniff a non-media web asset with libmagic, gzip-aware */
+    if (!*mime && !is_pipe(in_path))
         peek_identify(in_path, mime, sizeof mime, ext, sizeof ext, enc, sizeof enc);
 
     printf("{\"mimetype\":\"%s\",\"extension\":\"%s\",\"supported\":%s,"

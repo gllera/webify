@@ -131,6 +131,7 @@ printf '%%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%%%EOF\n' > doc.pdf
 printf '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>\n' > pic.svg
 gzip -c pic.svg > pic.svgz                          # a gzip-compressed asset
 printf 'plain text body\n' > note.txt
+python3 -c 'import sys; sys.stdout.buffer.write(bytes(range(8))*16)' > junk.bin  # no magic
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "$W --help | grep -q usage"
@@ -156,7 +157,9 @@ t "--peek pdf -> application/pdf"            has "$("$WEBIFY" --peek doc.pdf)"  
 t "--peek svg (undecodable) -> svg"         has "$("$WEBIFY" --peek pic.svg)"  '"mimetype":"image/svg+xml","extension":"svg","supported":false'
 t "--peek gzipped svg -> inner type + gzip" has "$("$WEBIFY" --peek pic.svgz)" '"mimetype":"image/svg+xml","extension":"svg","supported":false,"encoding":"gzip"'
 t "--peek text -> text/plain (built-in)"    has "$("$WEBIFY" --peek note.txt)" '"mimetype":"text/plain"'
-t "--peek unmapped type -> unsupported"     has "$("$WEBIFY" --peek audio.wav)" '"supported":false'
+# audio-only: webify can't transcode it, but FFmpeg already knows the type
+t "--peek wav (audio-only) -> audio/wav"    has "$("$WEBIFY" --peek audio.wav)" '"mimetype":"audio/wav","extension":"wav","supported":false'
+t "--peek unknown bytes -> octet-stream"    has "$("$WEBIFY" --peek junk.bin)"  '"mimetype":"application/octet-stream","extension":"","supported":false'
 t "--peek exits 0 even when unsupported"     bash -c "$W --peek audio.wav >/dev/null"
 t "--peek with an <output> rejected"         rejects --peek photo.png out.x
 t "--peek combined with --json rejected"     rejects --peek --json photo.png
