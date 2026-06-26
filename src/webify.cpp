@@ -972,6 +972,23 @@ static int init_alpha(Pipe *p, const AVCodec *codec)
     return ret;
 }
 
+/* Map the deprecated yuvjXXXp (JPEG/full-range) pixel formats to their
+ * canonical yuvXXXp equivalents; everything else passes through. The layouts
+ * are bit-identical — the J variants only signalled full range, which we carry
+ * explicitly as AVCOL_RANGE_JPEG. Used on both the buffersrc args and the
+ * frames pushed into it so they agree and swscale never sees a J format. */
+static enum AVPixelFormat dejpeg_pix_fmt(enum AVPixelFormat fmt)
+{
+    switch (fmt) {
+    case AV_PIX_FMT_YUVJ420P: return AV_PIX_FMT_YUV420P;
+    case AV_PIX_FMT_YUVJ422P: return AV_PIX_FMT_YUV422P;
+    case AV_PIX_FMT_YUVJ444P: return AV_PIX_FMT_YUV444P;
+    case AV_PIX_FMT_YUVJ440P: return AV_PIX_FMT_YUV440P;
+    case AV_PIX_FMT_YUVJ411P: return AV_PIX_FMT_YUV411P;
+    default:                  return fmt;
+    }
+}
+
 /* image != 0 selects the AVIF pipeline (libaom, alpha kept when really used);
  * otherwise the H.264 video pipeline (libx264). */
 static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
@@ -992,12 +1009,20 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
 
     sar = p->dec->sample_aspect_ratio;
+    /* mjpeg & friends decode to the deprecated yuvjXXXp formats; normalise to
+     * the canonical format + JPEG range so the buffersrc, the frames it later
+     * receives (re-stamped identically in decode_packet) and the graph's
+     * swscale all agree on one format — silencing swscale's "deprecated pixel
+     * format ... set range" warning. Bit-identical layout: output unchanged. */
+    enum AVPixelFormat pix = dejpeg_pix_fmt(p->dec->pix_fmt);
+    enum AVColorRange  rng = pix != p->dec->pix_fmt ? AVCOL_RANGE_JPEG
+                                                    : p->dec->color_range;
     snprintf(args, sizeof(args),
              "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d"
              ":colorspace=%d:range=%d",
-             p->dec->width, p->dec->height, p->dec->pix_fmt,
+             p->dec->width, p->dec->height, pix,
              ist->time_base.num, ist->time_base.den, sar.num, FFMAX(sar.den, 1),
-             p->dec->colorspace, p->dec->color_range);
+             p->dec->colorspace, rng);
     if (p->dec->framerate.num > 0 && p->dec->framerate.den > 0)
         av_strlcatf(args, sizeof(args), ":frame_rate=%d/%d",
                     p->dec->framerate.num, p->dec->framerate.den);
@@ -1285,6 +1310,15 @@ static int decode_packet(AVFormatContext *ofmt, Pipe *p, AVPacket *pkt)
                 }
                 p->next_keep = t + p->min_gap * 0.999; /* float-safe spacing */
             }
+        }
+        /* re-stamp deprecated yuvjXXXp to match the buffersrc's de-jpeg'd format
+         * (see init_video) — same bytes, modern range-tagged enum — so the
+         * graph doesn't see frame properties change on the fly */
+        enum AVPixelFormat dj =
+            dejpeg_pix_fmt((enum AVPixelFormat)p->dec_frame->format);
+        if (dj != p->dec_frame->format) {
+            p->dec_frame->format      = dj;
+            p->dec_frame->color_range = AVCOL_RANGE_JPEG;
         }
         /* flags=0: the graph consumes our reference (we don't reuse the frame) */
         ret = av_buffersrc_add_frame_flags(p->src, p->dec_frame, 0);
