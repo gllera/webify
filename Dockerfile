@@ -80,5 +80,43 @@ RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil"
 ARG COMPRESS=0
 RUN if [ "$COMPRESS" = "1" ]; then apk add --no-cache upx && upx --best --lzma /webify; fi
 
+# libFuzzer build of the demux + first-frame decode path (the --peek CVE
+# surface), compiled with clang against the same vendored static libs. Not part
+# of the default build — fuzz.yml (weekly) builds `fuzz-bin` and runs it. Dynamic
+# (not -static): the libFuzzer/compiler-rt runtime needs it. -Wno-unused-function
+# because main() and the encode path are #ifdef'd out under WEBIFY_FUZZER.
+FROM ffmpeg AS fuzz
+RUN apk add --no-cache clang compiler-rt
+COPY --from=libmagic /build/vendor/out vendor/out
+COPY src ./src
+ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
+RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
+    cp vendor/out/share/misc/magic.mgc magic.mgc && \
+    ld -r -b binary magic.mgc -o magic_mgc.o && \
+    clang++ -g -O1 -DWEBIFY_FUZZER -fsanitize=fuzzer -Wno-unused-function \
+        $(pkg-config --cflags $libs) -Ivendor/out/include \
+        src/webify.cpp magic_mgc.o -o /webify_fuzz \
+        $(pkg-config --libs --static $libs) -Lvendor/out/lib -lmagic -lz && \
+    ls -lh /webify_fuzz
+
+FROM scratch AS fuzz-bin
+COPY --from=fuzz /webify_fuzz /webify_fuzz
+
+# Hermetic behavioral + golden test image. ffmpeg/ffprobe are pinned by digest
+# (mwader/static-ffmpeg, multi-arch index) so the generated fixtures — and thus
+# the golden hashes — are byte-stable and independent of the host toolchain.
+# `docker run` it to gate a build (WEBIFY_GOLDEN=1 enforces the hashes); run with
+# `-e REBASELINE=1 -v "$PWD/goldens:/src/goldens"` to refresh them on the host.
+FROM alpine:3.24 AS test
+RUN apk add --no-cache bash coreutils findutils grep gawk sed python3
+COPY --from=mwader/static-ffmpeg:8.0@sha256:415a41fa3167b890b9703d20bd0f00bf1e9dab8a4b6c27fef1445b2bf5f1ab4a \
+     /ffmpeg /ffprobe /usr/local/bin/
+COPY --from=build /webify /usr/local/bin/webify
+WORKDIR /src
+COPY test.sh ./
+COPY goldens ./goldens
+ENV WEBIFY=/usr/local/bin/webify WEBIFY_GOLDEN=1
+ENTRYPOINT ["bash", "./test.sh"]
+
 FROM scratch AS dist
 COPY --from=build /webify /webify

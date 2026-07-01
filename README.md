@@ -45,6 +45,13 @@ file arguments):
   rate (e.g. `--max @30` halves the frame budget of a 60 fps screencast).
   Each part is optional: `720`, `480x854`, `720x`, `@30`, and `480x@30`
   are all valid.
+- `--max-pixels <N>` — reject any decoded frame larger than `N` pixels
+  (width×height); a decompression-bomb guard checked before the decoder
+  allocates and again per frame. Default `134217728` (128 MP — well above 8K or
+  a 108 MP phone photo); `0` disables. Also `WEBIFY_MAX_PIXELS`.
+- `--timeout <S>` — kill the transcode after `S` wall-clock seconds. Default `0`
+  (unlimited); a batch caller feeding untrusted input should set it. Also
+  `WEBIFY_TIMEOUT`.
 - `--json` — after writing to a **file** `<output>`, print the result's
   `{"mimetype","extension"}` as JSON to stdout (e.g.
   `{"mimetype":"image/avif","extension":"avif"}`). The media bytes are
@@ -69,6 +76,19 @@ file arguments):
 Exit status: 0 on success, 1 when a conversion fails, 2 for usage errors.
 When stderr is a terminal and the input declares a duration, video
 conversions print percentage progress.
+
+## Sandbox
+
+Because webify is meant to be pointed at untrusted input, it fences itself the
+moment the CLI is parsed and before it opens a single byte: **Landlock** limits
+the filesystem to the input file, the output's directory and `$TMPDIR`; a
+**seccomp-bpf allowlist** kills (`SIGSYS`) any syscall a transcode doesn't
+make — including `execve`, `socket`, `connect`, `ptrace` and `mount` — so a
+decoder exploit can neither run a program nor open a network connection; and
+`--max-pixels` / `--timeout` cap a decompression bomb or a runaway loop. The
+guards are best-effort (an old kernel simply gets fewer) and never change the
+output bytes. Set `WEBIFY_NO_SANDBOX=1` to disable them for debugging (or
+`WEBIFY_NO_SECCOMP=1` for just the syscall filter).
 
 Both formats work from stdin/stdout (`-` — and the output argument can simply
 be omitted, which means stdout), and piping never changes the result: the
@@ -105,8 +125,11 @@ the host:
 ./build.sh                        # -> dist/webify (static musl binary)
 UPX=1 ./build.sh                  # also upx-compress (~60% smaller, slower start)
 PLATFORM=linux/arm64 ./build.sh   # cross-build via qemu/binfmt (slow)
-./test.sh                         # smoke test the built binary (needs host
-                                  # ffmpeg, ffprobe, python3)
+./test.sh                         # smoke test with host ffmpeg/ffprobe/python3
+                                  # (behavioral asserts; golden byte checks skip)
+TEST=1 ./build.sh                 # hermetic test image: behavioral + byte-exact
+                                  # golden hashes against a digest-pinned ffmpeg
+FUZZ=1 ./build.sh                 # -> dist/webify_fuzz (libFuzzer build)
 ```
 
 ## Design

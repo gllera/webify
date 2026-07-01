@@ -65,15 +65,22 @@ jobs:
           file dist/webify
           ./dist/webify --version
 
-      - name: Install test suite dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+      # The hermetic `test` stage bundles the built binary with a digest-pinned
+      # ffmpeg, so the fixtures — and the golden hashes — are byte-stable and
+      # need no host toolchain. It reuses the cached build stage (cache-from
+      # only). Running it enforces WEBIFY_GOLDEN=1: any behavioral OR byte-exact
+      # regression fails the job, which gates the whole matrix and the release.
+      - name: Build hermetic test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: test
+          load: true
+          tags: webify-test:ci
+          cache-from: type=gha,scope=webify-${{ matrix.arch }}
 
-      # the behavioral suite gates everything downstream: the release job
-      # needs this whole matrix, so no release ever ships untested binaries
-      - name: Test suite
-        run: ./test.sh
+      - name: Test suite (behavioral + golden)
+        run: docker run --rm webify-test:ci
 
       # tar keeps the executable bit (upload-artifact alone strips it)
       - name: Pack

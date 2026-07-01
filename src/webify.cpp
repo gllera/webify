@@ -56,11 +56,27 @@
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
+#include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* the sandbox (see the ==== Sandbox ==== section): Landlock fences the
+ * filesystem, a seccomp allowlist kills exec/socket/ptrace, and rlimits/timers
+ * cap a bomb or a runaway loop. Linux-only, which webify already is. */
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/landlock.h>
+#include <linux/seccomp.h>
 
 #include <magic.h> /* libmagic: content sniffing for --peek's non-media fallback */
 #include <zlib.h>  /* gunzip the head ourselves to sniff inside a gzip wrapper */
@@ -116,7 +132,10 @@ static struct {
     double quality; /* internal 0-100 scale (CLI -q is 0-10, x10 at parse),
                        higher = better; <0 = per-mode default */
     double max_fps; /* video only; 0 = keep every frame */
-} opt = { 0, 0, -1.0, 0 };
+    long   max_pixels; /* reject any decoded frame bigger than this (w*h); a
+                          decompression-bomb guard. 0 = unbounded */
+    int    timeout;    /* wall-clock ceiling in seconds; 0 = unlimited */
+} opt = { 0, 0, -1.0, 0, 134217728L /* 128 MP */, 0 };
 
 /* progress on stderr, only when it is a terminal and the duration is known */
 static struct {
@@ -176,6 +195,16 @@ static const char *err2str(int errnum)
 {
     static char buf[AV_ERROR_MAX_STRING_SIZE];
     return av_make_error_string(buf, sizeof(buf), errnum);
+}
+
+/* a frame of w*h pixels within the --max-pixels bomb guard? Checked against the
+ * container's coded dimensions (before the decoder allocates) and again against
+ * each decoded frame (headers can lie). 0/negative dims are "not yet known" and
+ * pass — the per-frame check catches them. */
+static int pixels_ok(int w, int h)
+{
+    return opt.max_pixels <= 0 || w <= 0 || h <= 0 ||
+           (long)w * h <= opt.max_pixels;
 }
 
 /* ---- stdin input -----------------------------------------------------------
@@ -721,6 +750,10 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
         if (ret < 0)
             break;
         while (avcodec_receive_frame(dec, fr) >= 0) {
+            if (!pixels_ok(fr->width, fr->height)) {
+                av_frame_unref(fr);
+                goto end; /* bomb guard: let the caller reopen and reject */
+            }
             if (++frames == 1) {
                 const AVFrameSideData *sd =
                     av_frame_get_side_data(fr, AV_FRAME_DATA_DISPLAYMATRIX);
@@ -1297,6 +1330,12 @@ static int decode_packet(AVFormatContext *ofmt, Pipe *p, AVPacket *pkt)
             return 0;
         if (ret < 0)
             return ret;
+        if (!pixels_ok(p->dec_frame->width, p->dec_frame->height)) {
+            av_log(NULL, AV_LOG_ERROR, "frame %dx%d exceeds --max-pixels %ld\n",
+                   p->dec_frame->width, p->dec_frame->height, opt.max_pixels);
+            av_frame_unref(p->dec_frame);
+            return AVERROR(ERANGE);
+        }
         p->dec_frame->pts = p->dec_frame->best_effort_timestamp;
         if ((p->prog || p->min_gap > 0) && p->dec_frame->pts != AV_NOPTS_VALUE) {
             double t = p->dec_frame->pts * av_q2d(p->dec->pkt_timebase);
@@ -1453,6 +1492,19 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
         image = input_is_image(ifmt, vidx, aidx);
         if (image)
             aidx = -1; /* the image pipeline takes no audio */
+    }
+
+    /* decompression-bomb guard: reject an over-large canvas from the coded
+     * dimensions, before the decoder allocates a frame buffer for it (the
+     * per-frame check in decode_packet catches headers that lie) */
+    if (!audio_only &&
+        !pixels_ok(ifmt->streams[vidx]->codecpar->width,
+                   ifmt->streams[vidx]->codecpar->height)) {
+        av_log(NULL, AV_LOG_ERROR, "input %dx%d exceeds --max-pixels %ld\n",
+               ifmt->streams[vidx]->codecpar->width,
+               ifmt->streams[vidx]->codecpar->height, opt.max_pixels);
+        ret = AVERROR(ERANGE);
+        goto end;
     }
 
     prog.tty      = isatty(STDERR_FILENO);
@@ -1806,6 +1858,322 @@ static int webify_peek(const char *in_path)
     return 0;
 }
 
+/* ==== Sandbox ================================================================
+ * webify is fed arbitrary internet bytes, so after the CLI is parsed and before
+ * any libav* call opens the input, the process drops what it will never need:
+ * Landlock fences the filesystem to {tmp, input, output-dir}; a seccomp
+ * allowlist kills any exec/socket/ptrace/mount attempt; and --max-pixels /
+ * --timeout cap a decompression bomb or a runaway loop. Every guard is
+ * best-effort (an old kernel just gets fewer of them) and every guard is
+ * defeatable with WEBIFY_NO_SANDBOX=1 (or WEBIFY_NO_SECCOMP=1 for just the
+ * syscall filter) for a debugging session. Applied in every mode — transcode,
+ * --peek and --json alike.
+ * ========================================================================== */
+
+#ifndef SECCOMP_RET_KILL_PROCESS /* older <linux/seccomp.h>: only KILL_THREAD */
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+
+#if defined(__x86_64__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#error "webify sandbox: unsupported architecture"
+#endif
+
+/* the temp directory make_temp / the input spool use — Landlock must grant it */
+static const char *tmp_dir(void)
+{
+    const char *d = getenv("TMPDIR");
+    return d && *d ? d : "/tmp";
+}
+
+/* Landlock has no musl wrappers — raw syscalls. __NR_* resolve per-arch. */
+static long ll_create_ruleset(const struct landlock_ruleset_attr *attr,
+                              size_t size, __u32 flags)
+{
+    return syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+static long ll_add_rule(int fd, enum landlock_rule_type t, const void *attr,
+                        __u32 flags)
+{
+    return syscall(__NR_landlock_add_rule, fd, t, attr, flags);
+}
+static long ll_restrict_self(int fd, __u32 flags)
+{
+    return syscall(__NR_landlock_restrict_self, fd, flags);
+}
+
+/* grant `path` (a file or a directory) the given rights; a path that can't be
+ * opened is skipped (e.g. a pipe end, or an output file not created yet — the
+ * caller grants its parent directory instead) */
+static void ll_allow(int rs, const char *path, __u64 access)
+{
+    struct landlock_path_beneath_attr pb;
+    int fd;
+
+    if (!path || (fd = open(path, O_PATH | O_CLOEXEC)) < 0)
+        return;
+    pb.allowed_access = access;
+    pb.parent_fd      = fd;
+    ll_add_rule(rs, LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
+    close(fd);
+}
+
+/* the directory holding `path`, into `out` ("." when it has no slash) */
+static void parent_dir(const char *path, char *out, size_t n)
+{
+    const char *slash = strrchr(path, '/');
+
+    if (!slash)
+        av_strlcpy(out, ".", n);
+    else if (slash == path)
+        av_strlcpy(out, "/", n);
+    else
+        av_strlcpy(out, path, (size_t)(slash - path) + 1 < n
+                                  ? (size_t)(slash - path) + 1 : n);
+}
+
+/* fence the filesystem to exactly what a transcode touches: the temp dir (the
+ * input spool + the piped-output temp), the input file, and the output's
+ * directory. Best-effort — a kernel without Landlock (or an older ABI) gets
+ * fewer rights or none, and webify still runs. in_path/out_path are NULL for a
+ * pipe end (its fd is already open; Landlock doesn't gate pipes). */
+static void sandbox_fs(const char *in_path, const char *out_path)
+{
+    struct landlock_ruleset_attr attr = {};
+    __u64 rw_dir, ro_file;
+    char dir[PATH_MAX];
+    int abi, rs;
+
+    abi = (int)ll_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 1)
+        return; /* no Landlock on this kernel — skip quietly */
+
+    ro_file = LANDLOCK_ACCESS_FS_READ_FILE;
+    rw_dir  = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+              LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
+              LANDLOCK_ACCESS_FS_REMOVE_FILE;
+    if (abi >= 3) /* avio truncates the output on open */
+        rw_dir |= LANDLOCK_ACCESS_FS_TRUNCATE;
+
+    attr.handled_access_fs = rw_dir;
+    rs = (int)ll_create_ruleset(&attr, sizeof(attr), 0);
+    if (rs < 0) {
+        av_log(NULL, AV_LOG_WARNING, "Landlock unavailable (%s); "
+               "filesystem not fenced\n", strerror(errno));
+        return;
+    }
+
+    ll_allow(rs, tmp_dir(), rw_dir); /* spool + piped-output temp */
+    ll_allow(rs, in_path, ro_file);  /* the input file (read)     */
+    if (out_path) {                  /* the output's directory    */
+        parent_dir(out_path, dir, sizeof(dir));
+        ll_allow(rs, dir, rw_dir);
+    }
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || ll_restrict_self(rs, 0))
+        av_log(NULL, AV_LOG_WARNING, "Landlock restrict failed (%s); "
+               "filesystem not fenced\n", strerror(errno));
+    close(rs);
+}
+
+/* the syscalls a threaded transcode legitimately makes. Anything absent — most
+ * pointedly execve/execveat/socket/connect/ptrace/mount — kills the process
+ * (SECCOMP_RET_KILL_PROCESS). Symbolic __NR_* resolve per-arch; the *at-only
+ * arches (arm64) simply lack the legacy names, so those are #ifdef-guarded. The
+ * list is generous on purpose: a false negative is a killed encode, so CI runs
+ * the whole fixture set under this filter to prove the list is complete. */
+static const int seccomp_allow[] = {
+    /* I/O on already-open or freshly-granted fds */
+    __NR_read, __NR_write, __NR_readv, __NR_writev, __NR_pread64, __NR_pwrite64,
+    __NR_lseek, __NR_close, __NR_fcntl, __NR_ftruncate, __NR_fsync,
+    __NR_dup, __NR_dup3,
+    /* open / stat / dirents (temp files, the input, isatty's fstat) */
+    __NR_openat, __NR_newfstatat, __NR_statx, __NR_getdents64, __NR_getcwd,
+    __NR_readlinkat, __NR_faccessat, __NR_unlinkat, __NR_ioctl,
+    /* memory */
+    __NR_mmap, __NR_munmap, __NR_mremap, __NR_mprotect, __NR_madvise, __NR_brk,
+    /* threads / synchronisation (libaom, libx264 and ffmpeg thread pools) */
+    __NR_clone, __NR_futex, __NR_set_robust_list, __NR_get_robust_list,
+    __NR_sched_getaffinity, __NR_sched_setaffinity, __NR_sched_yield,
+    __NR_gettid, __NR_getpid, __NR_getppid, __NR_tgkill, __NR_set_tid_address,
+    __NR_getuid, __NR_getgid, __NR_geteuid, __NR_getegid, __NR_membarrier,
+    /* signals (thread cancellation, our SIGALRM timeout, clean teardown) */
+    __NR_rt_sigaction, __NR_rt_sigprocmask, __NR_rt_sigreturn,
+    __NR_rt_sigtimedwait, __NR_sigaltstack, __NR_restart_syscall,
+    /* time / rng / limits / identity / process control */
+    __NR_getrandom, __NR_clock_gettime, __NR_clock_nanosleep, __NR_nanosleep,
+    __NR_gettimeofday, __NR_sysinfo, __NR_uname, __NR_prlimit64, __NR_getrlimit,
+    __NR_setitimer, __NR_prctl, __NR_ppoll,
+    /* exit */
+    __NR_exit, __NR_exit_group,
+#ifdef __NR_dup2
+    __NR_dup2,
+#endif
+#ifdef __NR_open
+    __NR_open,
+#endif
+#ifdef __NR_openat2
+    __NR_openat2,
+#endif
+#ifdef __NR_stat
+    __NR_stat,
+#endif
+#ifdef __NR_lstat
+    __NR_lstat,
+#endif
+#ifdef __NR_fstat
+    __NR_fstat,
+#endif
+#ifdef __NR_access
+    __NR_access,
+#endif
+#ifdef __NR_faccessat2
+    __NR_faccessat2,
+#endif
+#ifdef __NR_unlink
+    __NR_unlink,
+#endif
+#ifdef __NR_readlink
+    __NR_readlink,
+#endif
+#ifdef __NR_poll
+    __NR_poll,
+#endif
+#ifdef __NR_clone3
+    __NR_clone3,
+#endif
+#ifdef __NR_rseq
+    __NR_rseq,
+#endif
+#ifdef __NR_arch_prctl
+    __NR_arch_prctl,
+#endif
+};
+
+static void sandbox_seccomp(void)
+{
+    const size_t K = sizeof(seccomp_allow) / sizeof(seccomp_allow[0]);
+    struct sock_filter f[2 * (sizeof(seccomp_allow) / sizeof(int)) + 16];
+    struct sock_fprog prog;
+    size_t n = 0;
+#define PUSH(...) do { struct sock_filter _f = __VA_ARGS__; f[n++] = _f; } while (0)
+
+    /* kill on an arch mismatch (blocks the x86 compat / x32 confusion bypass) */
+    PUSH(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)));
+    PUSH(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_AUDIT_ARCH, 1, 0));
+    PUSH(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+    PUSH(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)));
+#ifdef __x86_64__
+    PUSH(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 0, 1)); /* x32 bit */
+    PUSH(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
+#endif
+    /* one JEQ per allowed nr, each jumping past the rest to the trailing ALLOW */
+    for (size_t i = 0; i < K; i++)
+        PUSH(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (unsigned)seccomp_allow[i],
+                      (unsigned char)(K - i), 0));
+    PUSH(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)); /* default */
+    PUSH(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));        /* jump target */
+#undef PUSH
+
+    prog.len    = (unsigned short)n;
+    prog.filter = f;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0))
+        av_log(NULL, AV_LOG_WARNING, "seccomp filter not installed (%s); "
+               "syscalls not restricted\n", strerror(errno));
+}
+
+/* --timeout expired: last-resort teardown from a signal handler */
+static void on_timeout(int)
+{
+    static const char msg[] = "webify: --timeout expired, killing transcode\n";
+    ssize_t r = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)r;
+    _exit(1);
+}
+
+static void sandbox_limits(void)
+{
+    const char *mb = getenv("WEBIFY_MEM_MB");
+
+    if (opt.timeout > 0) {
+        struct sigaction sa = {};
+        struct itimerval it = {};
+        struct rlimit cpu;
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+
+        sa.sa_handler = on_timeout;
+        sigaction(SIGALRM, &sa, NULL);
+        it.it_value.tv_sec = opt.timeout;
+        setitimer(ITIMER_REAL, &it, NULL); /* wall clock: the primary guard */
+        /* CPU-time backstop, for the case SIGALRM is somehow delayed. Sized off
+         * the core count so it can NEVER fire before the wall alarm: aggregate
+         * CPU time is at most ncpu * wall_seconds, and the encoders scale with
+         * the cores (width_threads returns up to 16, decoder auto-threads = the
+         * host's nproc), so timeout*(ncpu+1) CPU-seconds is only reached past
+         * `timeout` wall-seconds — after on_timeout has already fired. A fixed
+         * multiplier (the old *8) killed a wide/many-core encode via SIGXCPU at
+         * a fraction of the requested timeout. */
+        if (ncpu < 1)
+            ncpu = 1;
+        cpu.rlim_cur = (rlim_t)opt.timeout * (ncpu + 1) + 4;
+        cpu.rlim_max = cpu.rlim_cur;
+        setrlimit(RLIMIT_CPU, &cpu);
+    }
+    if (mb && *mb) { /* opt-in address-space cap (off by default: RLIMIT_AS
+                      * interacts badly with mmap allocators + thread stacks) */
+        long m = atol(mb);
+
+        if (m > 0) {
+            struct rlimit as;
+
+            as.rlim_cur = as.rlim_max = (rlim_t)m * 1024 * 1024;
+            setrlimit(RLIMIT_AS, &as);
+        }
+    }
+}
+
+/* apply every guard, in order: resource limits/timer first (they need no
+ * filter), then Landlock, then seccomp last — the seccomp allowlist omits the
+ * landlock_* syscalls, so they must run before it. WEBIFY_NO_SANDBOX disables
+ * everything; WEBIFY_NO_SECCOMP just the syscall filter. */
+static void sandbox_apply(const char *in_path, const char *out_path)
+{
+    if (getenv("WEBIFY_NO_SANDBOX"))
+        return;
+    sandbox_limits();
+    sandbox_fs(in_path, out_path);
+    if (!getenv("WEBIFY_NO_SECCOMP"))
+        sandbox_seccomp();
+}
+
+/* prove the sandbox is live without disturbing a real run: fork a child that
+ * installs the full sandbox, then attempts a forbidden syscall (socket()); a
+ * correct filter kills it with SIGSYS. Prints blocked/allowed, exits 0 when
+ * blocked. test.sh asserts the filter is active and that WEBIFY_NO_SANDBOX
+ * disables it. */
+static int sandbox_selftest(void)
+{
+    int status = 0;
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        sandbox_apply("pipe:0", NULL);
+        syscall(__NR_socket, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 0);
+        _exit(0); /* socket() returned — not blocked */
+    }
+    if (pid < 0) {
+        perror("webify: fork");
+        return 2;
+    }
+    waitpid(pid, &status, 0);
+    printf(WIFSIGNALED(status) ? "blocked\n" : "allowed\n");
+    return WIFSIGNALED(status) ? 0 : 1;
+}
+
 static int usage(FILE *f, int status)
 {
     fprintf(f,
@@ -1824,6 +2192,11 @@ static int usage(FILE *f, int status)
             "                         all. @F drops frames to cap the frame\n"
             "                         rate (video only; @30 halves a 60fps\n"
             "                         clip); combine freely: 480x854@30, 480x@30\n"
+            "      --max-pixels <N>   reject any decoded frame larger than N\n"
+            "                         pixels (w*h); a decompression-bomb guard\n"
+            "                         (default 134217728 = 128 MP; 0 = off)\n"
+            "      --timeout <S>      kill the transcode after S wall-clock\n"
+            "                         seconds (default 0 = unlimited)\n"
             "      --json             after writing to a file <output>, print the\n"
             "                         result's {mimetype,extension} JSON to stdout\n"
             "      --peek <input>     identify <input> and print a {mimetype,\n"
@@ -1891,20 +2264,83 @@ bad:
     return -1;
 }
 
+#ifdef WEBIFY_FUZZER
+/* libFuzzer entry (Dockerfile `fuzz` stage): drive the demux + first-frame
+ * decode path — the --peek/probe CVE surface — over the input bytes in memory,
+ * reusing the real code (the same StdinIO mem buffer, open_with_pb and
+ * peek_first_frame a real --peek uses). No encode, no stdout; the --max-pixels
+ * guard stays on (opt keeps its default) so a crafted giant canvas can't OOM
+ * the fuzzer. No sandbox here — fuzzing wants raw access. */
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    static const int quiet = (av_log_set_level(AV_LOG_QUIET), 0);
+    AVFormatContext *ifmt = NULL;
+    StdinIO io = {};
+    uint8_t *iobuf = NULL;
+    int vidx = -1;
+    (void)quiet;
+
+    if (size == 0 || size > (32u << 20)) /* bound the input */
+        return 0;
+    if (!(io.buf = (uint8_t *)av_malloc(size + AVPROBE_PADDING_SIZE)))
+        return 0;
+    memcpy(io.buf, data, size);
+    memset(io.buf + size, 0, AVPROBE_PADDING_SIZE);
+    io.size = size;
+
+    if (!(iobuf = (uint8_t *)av_malloc(IO_BUFSIZE))) {
+        av_free(io.buf);
+        return 0;
+    }
+    io.pb = avio_alloc_context(iobuf, IO_BUFSIZE, 0, &io, mem_read, NULL, mem_seek);
+    if (!io.pb) {
+        av_free(iobuf);
+        av_free(io.buf);
+        return 0;
+    }
+
+    if (open_with_pb(&ifmt, io.pb) >= 0) { /* frees ifmt itself on failure */
+        ifmt->probesize            = 1 << 20;
+        ifmt->max_analyze_duration = AV_TIME_BASE;
+        if (avformat_find_stream_info(ifmt, NULL) >= 0) {
+            vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+            if (vidx >= 0)
+                peek_first_frame(ifmt, vidx, 1); /* side data + bomb guard */
+        }
+    }
+
+    avformat_close_input(&ifmt); /* the custom pb survives this (see reopen) */
+    av_freep(&io.pb->buffer);
+    avio_context_free(&io.pb);
+    av_free(io.buf);
+    return 0;
+}
+#else
 int main(int argc, char **argv)
 {
-    enum { OPT_VERSION = 1000, OPT_JSON, OPT_PEEK };
+    enum { OPT_VERSION = 1000, OPT_JSON, OPT_PEEK, OPT_MAXPIX, OPT_TIMEOUT,
+           OPT_SELFTEST };
     static const struct option longopts[] = {
-        { "quality", required_argument, NULL, 'q' },
-        { "max",     required_argument, NULL, 'm' },
-        { "json",    no_argument,       NULL, OPT_JSON },
-        { "peek",    no_argument,       NULL, OPT_PEEK },
-        { "help",    no_argument,       NULL, 'h' },
-        { "version", no_argument,       NULL, OPT_VERSION },
+        { "quality",    required_argument, NULL, 'q' },
+        { "max",        required_argument, NULL, 'm' },
+        { "max-pixels", required_argument, NULL, OPT_MAXPIX },
+        { "timeout",    required_argument, NULL, OPT_TIMEOUT },
+        { "json",       no_argument,       NULL, OPT_JSON },
+        { "peek",       no_argument,       NULL, OPT_PEEK },
+        { "help",       no_argument,       NULL, 'h' },
+        { "version",    no_argument,       NULL, OPT_VERSION },
+        { "sandbox-selftest", no_argument, NULL, OPT_SELFTEST }, /* test.sh only */
         { NULL, 0, NULL, 0 },
     };
     int c, emit_json = 0, peek = 0;
     char *end;
+    const char *env;
+
+    /* environment defaults (CLI flags below override them) */
+    if ((env = getenv("WEBIFY_MAX_PIXELS")))
+        opt.max_pixels = atol(env);
+    if ((env = getenv("WEBIFY_TIMEOUT")))
+        opt.timeout = atoi(env);
 
     while ((c = getopt_long(argc, argv, "hq:m:", longopts, NULL)) != -1) {
         switch (c) {
@@ -1913,11 +2349,29 @@ int main(int argc, char **argv)
         case OPT_VERSION:
             printf("webify %s (FFmpeg %s)\n", WEBIFY_VERSION, av_version_info());
             return 0;
+        case OPT_SELFTEST:
+            return sandbox_selftest();
         case OPT_JSON:
             emit_json = 1;
             break;
         case OPT_PEEK:
             peek = 1;
+            break;
+        case OPT_MAXPIX:
+            opt.max_pixels = strtol(optarg, &end, 10);
+            if (*end || end == optarg || opt.max_pixels < 0) {
+                fprintf(stderr, "webify: --max-pixels must be >= 0, got '%s'\n",
+                        optarg);
+                return 2;
+            }
+            break;
+        case OPT_TIMEOUT:
+            opt.timeout = (int)strtol(optarg, &end, 10);
+            if (*end || end == optarg || opt.timeout < 0) {
+                fprintf(stderr, "webify: --timeout must be >= 0, got '%s'\n",
+                        optarg);
+                return 2;
+            }
             break;
         case 'q':
             opt.quality = strtod(optarg, &end);
@@ -1939,7 +2393,9 @@ int main(int argc, char **argv)
     if (peek) {
         if (emit_json || argc - optind != 1)
             return usage(stderr, 2);
-        return webify_peek(strcmp(argv[optind], "-") ? argv[optind] : "pipe:0");
+        const char *in = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
+        sandbox_apply(is_pipe(in) ? NULL : in, NULL);
+        return webify_peek(in);
     }
     if (argc - optind < 1 || argc - optind > 2)
         return usage(stderr, 2);
@@ -1954,5 +2410,8 @@ int main(int argc, char **argv)
                         "(stdout carries the JSON)\n");
         return 2;
     }
+    /* fence the process before a single byte of the input is opened */
+    sandbox_apply(is_pipe(in) ? NULL : in, is_pipe(out) ? NULL : out);
     return webify_run(in, out, emit_json);
 }
+#endif /* WEBIFY_FUZZER */

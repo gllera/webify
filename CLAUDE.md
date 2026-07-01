@@ -16,6 +16,11 @@ and no `--fast` / `--best` effort tiers. Video is always x264 at preset
 `veryslow` in CRF mode; images are always AVIF at AV1 Main profile (8-bit
 4:2:0); `-q` is the only quality dial, adjusting the CRF (and the AAC bitrate).
 
+It is fed **arbitrary internet bytes** (SRR's `asset-process`), so it fences
+itself the moment the CLI is parsed and before any libav call touches the input
+— see **Security sandbox** below (`--max-pixels`, `--timeout`, and the always-on
+Landlock + seccomp).
+
 It vendors a minimal FFmpeg + four codec libraries (official release tarballs,
 sha256-pinned per library in `vendor.d/*.sh`), built in Docker (one stage per
 library, see `Dockerfile`).
@@ -48,12 +53,45 @@ binary` (symbols `_binary_magic_mgc_{start,end}`). Unmapped types fall back to
 `application/octet-stream`. Re-verify with `./test.sh` (the `--peek` / `--json`
 blocks).
 
+## Security sandbox
+
+`webify.cpp`'s `==== Sandbox ====` section drops privileges in `main()` after arg
+parsing and before the input is opened. Applied in every mode (transcode, `--peek`,
+`--json`); all guards are best-effort (an old kernel just gets fewer) and all are
+defeatable via `WEBIFY_NO_SANDBOX=1` (everything) or `WEBIFY_NO_SECCOMP=1` (just the
+filter):
+
+- **Landlock** (`sandbox_fs`) fences the filesystem to exactly `{$TMPDIR, the input
+  file, the output's directory}` — a decoder RCE can't read or write elsewhere.
+- **seccomp-bpf allowlist** (`sandbox_seccomp` + `seccomp_allow[]`) kills
+  (`SIGSYS`, fail-closed) any syscall a threaded transcode doesn't make — pointedly
+  `execve`/`socket`/`connect`/`ptrace`/`mount`. The allowlist is generous and
+  CI-gated: `./test.sh` runs every fixture under it, so a missing syscall fails the
+  build, not production. Symbolic `__NR_*` (arch-resolved, `#ifdef`-guarded for the
+  `*at`-only arm64 names). `--sandbox-selftest` (used by `test.sh`) forks a child,
+  installs the sandbox, and attempts `socket()` to prove the filter is live.
+- **`--max-pixels N`** (default 128 MP; `WEBIFY_MAX_PIXELS`) rejects an over-large
+  canvas from the coded dims *before* the decoder allocates, and again per decoded
+  frame — a decompression-bomb guard. **`--timeout S`** (default 0/off;
+  `WEBIFY_TIMEOUT`) is a wall-clock `SIGALRM` ceiling (SRR passes it per asset).
+  `RLIMIT_AS` is opt-in via `WEBIFY_MEM_MB` (address-space caps fight mmap
+  allocators).
+
+**Invariant: the sandbox never changes output bytes** — it only restricts syscalls
+or aborts; `WEBIFY_NO_SANDBOX=1` output is byte-identical (asserted implicitly by
+the golden hashes, which are generated with the sandbox off under qemu-free CI).
+
 ## Commands
 
 ```bash
 ./build.sh        # Docker build; exports the static binary to ./dist/webify
-./test.sh         # behavioral smoke suite against dist/webify
-                  #   needs host ffmpeg (>= 6), ffprobe, python3
+./test.sh         # behavioral smoke suite against dist/webify (host ffmpeg path)
+                  #   needs host ffmpeg (>= 6), ffprobe, python3; golden byte
+                  #   checks are skipped (they need the pinned hermetic ffmpeg)
+TEST=1 ./build.sh # build + run the hermetic `test` image: behavioral + golden
+                  #   hashes against a digest-pinned ffmpeg (no host tools).
+                  #   REBASELINE=1 TEST=1 ./build.sh rewrites goldens/<arch>.sha256
+FUZZ=1 ./build.sh # export the libFuzzer binary to ./dist/webify_fuzz
 ./vendor.sh       # bare-host build of the vendored stack (Docker doesn't use it)
 ./update-vendor.sh# probe upstreams, rewrite the vendor.d version+sha256 pins
 ```
@@ -82,6 +120,12 @@ blocks).
    capped by a lossy source's own rate.
 8. **EXIF/display-matrix rotation baked in; interlaced video deinterlaced
    (bwdif); HDR (PQ/HLG) video tonemapped to SDR bt709.**
+9. **The sandbox never changes output bytes and encodes stay byte-stable across
+   core counts.** Every encoded path (x264, libaom, aac) is thread-deterministic;
+   only the zimg/zscale HDR tonemap is not (excluded from the golden set). The
+   golden hashes (`goldens/<arch>.sha256`, enforced by the hermetic `test` stage)
+   pin this — fixtures are `-threads 1` so their bytes don't drift with the
+   runner's cores either.
 
 ## Quality settings
 
@@ -101,11 +145,27 @@ reference pipeline to fit against.
   content sniffing, curated magic db; linked into webify directly, not through
   ffmpeg). `00-nasm.sh` only builds on bare hosts.
 - `.github/workflows/build.yml`: native amd64 + arm64 builds, BuildKit layer
-  cache per library via `type=gha`; the test suite gates the `release` job.
-  Tag pattern `'[0-9]*'` publishes a GitHub Release.
-- `.github/workflows/vendor-update.yml` (monthly): bumps pins, PRs on the
-  rolling `vendor-updates` branch, tags `<ffmpeg-version>-<YYYYMMDD>`, and
-  dispatches build.yml on the tag.
+  cache per library via `type=gha`. The gate is the hermetic **`test` Docker
+  stage** — an image bundling the built binary with a **digest-pinned ffmpeg**
+  (`mwader/static-ffmpeg`), so fixtures (and the golden hashes) are byte-stable
+  and need no host toolchain; `docker run` it enforces `WEBIFY_GOLDEN=1`. It gates
+  the `release` job. Tag pattern `'[0-9]*'` publishes a GitHub Release.
+- **Golden hashes** (`goldens/<arch>.sha256`): sha256 of ~18 deterministic
+  outputs, per-arch (encoders aren't bit-identical across amd64/arm64). Enforced
+  only under the pinned ffmpeg (the `test` stage sets `WEBIFY_GOLDEN=1`); a dev's
+  `./test.sh` skips them. A **missing** arch file is a soft skip (bootstraps a new
+  arch); a **mismatch** is a hard fail. Regenerate with `rebaseline.yml`
+  (workflow_dispatch, matrix build → `REBASELINE=1` → commits both arch files) or
+  locally `REBASELINE=1 TEST=1 ./build.sh` (amd64 only).
+- `.github/workflows/vendor-update.yml` (monthly): bumps pins, PRs on the rolling
+  `vendor-updates` branch, then dispatches **`rebaseline.yml`** (a bump changes
+  encoder bytes) which regenerates the goldens on the branch, tags
+  `<ffmpeg-version>-<YYYYMMDD>`, and dispatches build.yml on the tag — so the
+  release build runs against goldens that already match the new output.
+- `.github/workflows/fuzz.yml` (weekly + dispatch): builds the `fuzz-bin`
+  Dockerfile stage (clang + libFuzzer, `LLVMFuzzerTestOneInput` at the tail of
+  `webify.cpp` under `#ifdef WEBIFY_FUZZER`) and fuzzes the demux + first-frame
+  decode path (the `--peek` CVE surface) over a seed corpus.
 - License: **GPL-2.0+** (x264 is GPL; everything else is more permissive).
 
 ## Removed vs the original (don't re-add without a reason)

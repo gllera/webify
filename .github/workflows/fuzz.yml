@@ -1,0 +1,81 @@
+name: fuzz
+
+# Weekly libFuzzer run over the demux + first-frame decode path (the --peek
+# CVE surface), plus manual dispatch. Deliberately off the per-PR path: it is
+# slow and its value is cumulative coverage over time, not a gate. A crash drops
+# a reproducer artifact and fails the job.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # 04:00 UTC every Monday
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Fuzzing budget in seconds'
+        default: '600'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Build the clang/libFuzzer binary. Same per-library layer cache as the
+      # normal build, so the vendored stack restores instead of recompiling.
+      - name: Build fuzz binary
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: fuzz-bin
+          outputs: type=local,dest=fuzzbin
+          cache-from: type=gha,scope=webify-amd64
+          cache-to: type=gha,scope=webify-fuzz,mode=max
+
+      # A seed corpus of small real media so the fuzzer starts from valid
+      # headers of each demuxer webify accepts, not from zero.
+      - name: Seed corpus
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p corpus
+          ff() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/a.png
+          ff -f lavfi -i "testsrc2=size=48x48:d=1:r=4" corpus/b.gif
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=10" -f lavfi -i "sine=d=1" \
+             -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest corpus/c.mp4
+          ff -i corpus/c.mp4 -c copy corpus/d.mkv
+          ff -f lavfi -i "sine=d=1" corpus/e.wav
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/f.jpg
+
+      # Accumulate interesting inputs across weekly runs.
+      - name: Restore corpus cache
+        uses: actions/cache@v4
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      # The binary is dynamic musl, so run it inside Alpine (libFuzzer +
+      # libstdc++). A crash writes crash-<hash> to the mount, failing the run.
+      - name: Fuzz
+        run: |
+          SECONDS_BUDGET='${{ github.event.inputs.seconds || 600 }}'
+          docker run --rm \
+            -v "$PWD/fuzzbin:/b:ro" -v "$PWD/corpus:/corpus" -v "$PWD:/out" \
+            -w /out alpine:3.24 sh -c "
+              apk add -q libstdc++ &&
+              /b/webify_fuzz -artifact_prefix=/out/crash- \
+                -max_total_time=$SECONDS_BUDGET -rss_limit_mb=2048 -timeout=25 \
+                /corpus"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: crash-*
+          if-no-files-found: ignore

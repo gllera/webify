@@ -10,6 +10,7 @@
 #   ./build.sh && ./test.sh
 set -euo pipefail
 cd "$(dirname "$0")"
+SRCDIR="$PWD" # repo root: where goldens/ lives (cwd changes to a tmp dir below)
 
 WEBIFY="${WEBIFY:-$PWD/dist/webify}"
 for tool in ffmpeg ffprobe python3; do
@@ -90,13 +91,19 @@ EOF
 
 # --- fixtures ----------------------------------------------------------------
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 photo.png
+# -threads 1 on every re-encoded fixture: libx264/mpeg2 output is thread-count
+# dependent, so without it the fixture bytes (and the golden hashes derived from
+# them) would vary with the runner's core count. webify's own output is already
+# thread-stable (fixed width-based encoder threads + deterministic decode).
 ff -f lavfi -i "testsrc2=size=1280x720:duration=2:rate=30" \
    -f lavfi -i "sine=frequency=440:duration=2" \
-   -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
+   -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
 ff -i tv.mp4 -c copy tv.mkv                       # mkv: declares no per-stream rates
 ff -display_rotation 90 -i tv.mp4 -c copy rot.mp4 # portrait via display matrix
 ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
-   -c:v libx264 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
+   -c:v libx264 -threads 1 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
+# a source big/long enough that a veryslow re-encode reliably outlasts --timeout 1
+ff -f lavfi -i "testsrc2=size=1280x720:duration=8:rate=30" -c:v libx264 -pix_fmt yuv420p slow.mp4
 python3 - > evil.mp4 <<'EOF'                      # crafted 64-bit atom size: garbage in must not hang
 import struct, sys
 out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
@@ -105,16 +112,21 @@ sys.stdout.buffer.write(out + b"\x00" * 4096)
 EOF
 ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
    -f lavfi -i "sine=frequency=440:duration=1" \
-   -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 -shortest stereo.mp4
+   -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac -ac 2 -shortest stereo.mp4
 ff -f lavfi -i "sine=frequency=440:duration=1" audio.wav        # no video stream at all
 ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
 ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alpha.png
 ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
-ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" -c:v libx264 -pix_fmt yuv420p \
-   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4 # PQ-tagged HDR
+# PQ-tagged HDR. setparams stamps the frame-level color tags so they survive
+# across ffmpeg versions — a bare -color_trc doesn't land on the stream under
+# ffmpeg 8 (the hermetic test toolchain), leaving webify nothing to tonemap.
+ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" \
+   -vf "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
+   -c:v libx264 -threads 1 -pix_fmt yuv420p \
+   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=50" \
    -vf "tinterlace=mode=interleave_top,setparams=field_mode=tff" \
-   -c:v mpeg2video -flags +ildct+ilme -q:v 3 ilace.ts # truly interlaced 25i (fields 20ms apart)
+   -c:v mpeg2video -threads 1 -flags +ildct+ilme -q:v 3 ilace.ts # truly interlaced 25i (fields 20ms apart)
 ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
 python3 - <<'EOF'                                 # plain.jpg + EXIF Orientation=6 -> exif.jpg
 import struct
@@ -148,6 +160,27 @@ t "dropped flag --best rejected"           rejects --best in out
 t "no file arguments rejected"             rejects
 t "three file arguments rejected"          rejects in out extra
 t "input with neither video nor audio rejected"  rejects note.txt x.mp4
+t "--max-pixels negative rejected"         rejects --max-pixels -5 in out
+t "--max-pixels non-numeric rejected"      rejects --max-pixels abc in out
+t "--timeout negative rejected"            rejects --timeout -1 in out
+
+# --- sandbox: Landlock + seccomp fence, bomb + timeout guards -------------------
+# the selftest forks a child, installs the full sandbox, then attempts socket();
+# a live seccomp filter kills it with SIGSYS (prints "blocked"), the escape
+# hatch lets it through ("allowed")
+t "sandbox: seccomp filter is active"      bash -c "$W --sandbox-selftest | grep -q blocked"
+t "sandbox: WEBIFY_NO_SANDBOX disables it" bash -c "WEBIFY_NO_SANDBOX=1 $W --sandbox-selftest | grep -q allowed"
+t "sandbox: WEBIFY_NO_SECCOMP disables it" bash -c "WEBIFY_NO_SECCOMP=1 $W --sandbox-selftest | grep -q allowed"
+# encodes still succeed under the default (sandboxed) binary — that the whole
+# suite runs green already proves the allowlist is complete; this asserts one
+# explicitly for a clear signal
+t "sandbox: image encode works fenced"     bash -c "$W photo.png sb.avif >/dev/null 2>&1 && grep -aq ftypavif sb.avif"
+# --max-pixels bomb guard: photo.png is 640x480 = 307200 px
+t "guard: --max-pixels 1000 rejects photo" rejects --max-pixels 1000 photo.png sb2.avif
+t "guard: --max-pixels 500000 allows photo" bash -c "$W --max-pixels 500000 photo.png sb3.avif >/dev/null 2>&1 && grep -aq ftypavif sb3.avif"
+# --timeout: a veryslow re-encode of an 8s 720p source cannot finish in 1s, and
+# the outer `timeout 20` proves webify killed itself (exit != 0 and != 124/hang)
+t "guard: --timeout 1 kills a slow encode" bash -c "timeout 20 $W --timeout 1 slow.mp4 slow_out.mp4 >/dev/null 2>&1; c=\$?; [ \$c -ne 0 ] && [ \$c -ne 124 ]"
 
 # --- --peek: identify (no encode); media via FFmpeg, the rest via libmagic -----
 # webify-native output types (exact — webify owns them)
@@ -206,6 +239,49 @@ enc "$W ilace.ts v_ilace.mp4"
 enc "$W audio.wav a_def.m4a"
 enc "$W - - < audio.wav > a_piped.m4a"
 drain
+
+# --- golden hashes (hermetic ffmpeg only) --------------------------------------
+# Encoded outputs are byte-deterministic (AVFMT_FLAG_BITEXACT), but the *fixtures*
+# depend on the exact ffmpeg that produced them — so byte-exact golden checks
+# only run under WEBIFY_GOLDEN=1, which the Dockerfile `test` stage sets (it pins
+# ffmpeg by digest). A dev running ./test.sh with host ffmpeg skips them and gets
+# the behavioral asserts only. REBASELINE=1 rewrites goldens/<arch>.sha256 (used
+# by rebaseline.yml on vendor bumps). Hashes are per-arch: x264/libaom SIMD is
+# not guaranteed bit-identical across amd64/arm64.
+# Excluded on purpose: v_hdr.mp4 — the zimg/zscale tonemap path is not
+# thread-count-deterministic (its float output shifts with the worker count), so
+# its bytes vary across machines; the behavioral "tonemapped to bt709" assert
+# covers HDR instead. Every other encoded path (x264, libaom, aac) is thread-stable.
+GOLDEN_OUTPUTS="q_def.avif q2.avif q9.avif m240.avif m2000.avif anim.avif \
+alpha.avif opaque.avif exif.avif v_def.mp4 v_q2.mp4 v_q9.mp4 v_rot.mp4 \
+v_file.mp4 v_frag.mp4 v_stereo.mp4 v_ilace.mp4 a_def.m4a"
+if [ -n "${WEBIFY_GOLDEN:-}${REBASELINE:-}" ]; then
+    case "$(uname -m)" in
+        x86_64)  garch=amd64 ;;
+        aarch64) garch=arm64 ;;
+        *)       garch="$(uname -m)" ;;
+    esac
+    gdir="${GOLDEN_DIR:-$SRCDIR/goldens}"
+    gfile="$gdir/$garch.sha256"
+    if [ -n "${REBASELINE:-}" ]; then
+        mkdir -p "$gdir"
+        for o in $GOLDEN_OUTPUTS; do sha256sum "$o"; done | sort -k2 > "$gfile"
+        echo "== rebaselined $gfile =="; cat "$gfile"
+    elif [ -f "$gfile" ]; then
+        for o in $GOLDEN_OUTPUTS; do
+            want=$(awk -v f="$o" '$2==f{print $1}' "$gfile")
+            got=$(sha256sum "$o" | cut -d' ' -f1)
+            if [ -n "$want" ] && [ "$want" = "$got" ]; then
+                echo "ok   - golden: $o"; pass=$((pass+1))
+            else
+                echo "FAIL - golden: $o (want ${want:-<none>}, got $got)"
+                fail=$((fail+1))
+            fi
+        done
+    else
+        echo "warn - no golden file $gfile for $garch; byte checks skipped"
+    fi
+fi
 
 # --- images (AVIF) -------------------------------------------------------------
 t "image: still -> AVIF (ftyp brand)"                 grep -aq ftypavif q_def.avif

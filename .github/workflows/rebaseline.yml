@@ -1,0 +1,106 @@
+name: rebaseline
+
+# Regenerate the per-arch golden hashes and commit them. A vendor bump (or an
+# intentional code change that alters encoder output) legitimately moves the
+# bytes, so the goldens must move with it — visibly, as a committed diff.
+# Dispatched manually, or by vendor-update.yml after it bumps the pins. Each arch
+# builds the hermetic `test` image natively and runs it with REBASELINE=1; a
+# final job commits goldens/{amd64,arm64}.sha256 to the target branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to regenerate and commit goldens on'
+        default: main
+      tag:
+        description: 'After committing goldens, tag the vendor state and dispatch the release build (used by vendor-update)'
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build hermetic test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: test
+          load: true
+          tags: webify-test:reb
+          cache-from: type=gha,scope=webify-${{ matrix.arch }}
+          cache-to: type=gha,scope=webify-${{ matrix.arch }},mode=max
+
+      - name: Regenerate goldens
+        run: |
+          mkdir -p out
+          docker run --rm -e REBASELINE=1 -v "$PWD/out:/src/goldens" webify-test:reb
+
+      - name: Upload goldens
+        uses: actions/upload-artifact@v7
+        with:
+          name: goldens-${{ matrix.arch }}
+          path: out/${{ matrix.arch }}.sha256
+          if-no-files-found: error
+
+  commit:
+    needs: generate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write # gh workflow run build.yml on the release tag
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 0 # tags
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: goldens-*
+          merge-multiple: true
+          path: goldens
+
+      - name: Commit refreshed goldens
+        run: |
+          if git diff --quiet -- goldens; then
+            echo "Goldens already current for both arches."
+          else
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m 'test: refresh golden hashes' -- goldens
+            git push origin HEAD:'${{ github.event.inputs.ref }}'
+          fi
+
+      # vendor-update sets tag=true: tag the now-goldens-correct commit and
+      # dispatch the release build on it (a GITHUB_TOKEN tag push can't fire
+      # on:push by itself). The build runs against the fresh goldens, so a
+      # legitimate encoder byte-change lands green instead of failing the gate.
+      - name: Tag vendor state and dispatch release build
+        if: ${{ github.event.inputs.tag == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(sed -n 's/^FFMPEG_VERSION=//p' vendor.d/80-ffmpeg.sh)-$(date -u +%Y%m%d)"
+          git tag -f "$tag"
+          git push -f origin "refs/tags/$tag"
+          gh workflow run build.yml --ref "refs/tags/$tag"
+          echo "Tagged $tag and dispatched build.yml."

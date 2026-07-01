@@ -1,3 +1,5 @@
 *
 !vendor.d
 !src
+!test.sh
+!goldens

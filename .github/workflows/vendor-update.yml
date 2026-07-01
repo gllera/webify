@@ -40,13 +40,6 @@ jobs:
               commit -am 'vendor: bump pins to latest upstream releases' \
               -m "$(grep '^bump' /tmp/vendor-update.txt)"
           git push -f origin HEAD:vendor-updates
-          # tag the bumped vendor state as <ffmpeg-version>-<utc-date>, e.g.
-          # 8.1.1-20260115 (ffmpeg's version after the update, whether or not
-          # ffmpeg itself was among the bumps); -f so a same-day rerun moves
-          # the tag to the newest bump commit instead of failing
-          tag="$(sed -n 's/^FFMPEG_VERSION=//p' vendor.d/80-ffmpeg.sh)-$(date -u +%Y%m%d)"
-          git tag -f "$tag"
-          git push -f origin "refs/tags/$tag"
           {
             echo 'Automated monthly vendor version check (`update-vendor.sh`):'
             echo
@@ -54,19 +47,23 @@ jobs:
             cat /tmp/vendor-update.txt
             echo '```'
             echo
-            echo "Vendor state tagged \`$tag\`."
-            echo
-            echo 'CI was dispatched on the tag (same commit as this branch): green on'
-            echo 'both arches publishes the release with the binaries attached — merge'
-            echo 'only when it is.'
+            echo 'A vendor bump changes encoder bytes, so `rebaseline.yml` was'
+            echo 'dispatched on this branch to regenerate the per-arch golden hashes'
+            echo '(committed here), then tag the vendor state and dispatch the release'
+            echo 'build against the fresh goldens. Green on both arches publishes the'
+            echo 'release with the binaries attached — merge only when it is.'
           } > /tmp/pr-body.md
           gh pr create --head vendor-updates \
               --title 'vendor: bump pins to latest upstream releases' \
               --body-file /tmp/pr-body.md \
             || gh pr edit vendor-updates --body-file /tmp/pr-body.md
-          # dispatched on the tag ref so build.yml's release job attaches the
-          # binaries (a GITHUB_TOKEN tag push can't fire on:push by itself)
-          gh workflow run build.yml --ref "refs/tags/$tag"
+          # rebaseline.yml regenerates + commits the per-arch goldens on the
+          # branch, then (tag=true) tags the vendor state as
+          # <ffmpeg-version>-<utc-date> and dispatches build.yml on that tag —
+          # so the release build runs against goldens that already match the new
+          # encoder output instead of failing the golden gate.
+          gh workflow run rebaseline.yml --ref vendor-updates \
+              -f ref=vendor-updates -f tag=true
 
       - name: Surface probe failures
         if: steps.check.outcome == 'failure'
