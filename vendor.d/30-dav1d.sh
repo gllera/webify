@@ -3,9 +3,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-DAV1D_VERSION=1.5.3
+DAV1D_VERSION=1.5.4
 # sha256 matches the publisher's checksum file
-DAV1D_SHA256=732010aa5ef461fa93355ed2c6c5fedb48ddc4b74e697eaabe8907eaeb943011
+DAV1D_SHA256=686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5
 
 built dav1d && exit 0
 
