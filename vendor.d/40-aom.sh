@@ -6,9 +6,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-AOM_VERSION=3.14.1
+AOM_VERSION=3.15.0
 # pinned from a verified-good download
-AOM_SHA256=44bf90dbd23e734d50e70a8c41c285193922938bd0d3bc2ee56764d181d55ef5
+AOM_SHA256=ea08c38ecc078bc85bb1b691020e52b06250f1a81fe7ca5b624629225081af96
 
 built aom && exit 0
 

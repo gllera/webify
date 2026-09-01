@@ -12,9 +12,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-FFMPEG_VERSION=8.1.2
+FFMPEG_VERSION=9.0.1
 # pinned from a verified-good download
-FFMPEG_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+FFMPEG_SHA256=cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
 
 built ffmpeg && exit 0
 
