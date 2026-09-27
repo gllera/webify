@@ -96,23 +96,32 @@ EOF
 }
 
 # --- fixtures ----------------------------------------------------------------
-ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 photo.png
+# The media recipes are independent (each dependency chain runs as one job), so
+# they run concurrently: fx backgrounds one, and fx_wait waits PID by PID so a
+# failing recipe still aborts the suite under set -e.
+FX=()
+fx()      { "$@" & FX+=("$!"); }
+fx_wait() { local p; for p in "${FX[@]}"; do wait "$p"; done; FX=(); }
+
+fx ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 photo.png
 # -threads 1 on every re-encoded fixture: libx264/mpeg2 output is thread-count
 # dependent, so without it the fixture bytes (and the golden hashes derived from
 # them) would vary with the runner's core count. webify's own output is already
 # thread-stable (fixed width-based encoder threads + deterministic decode).
-ff -f lavfi -i "testsrc2=size=1280x720:duration=2:rate=30" \
-   -f lavfi -i "sine=frequency=440:duration=2" \
-   -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
-ff -i tv.mp4 -c copy tv.mkv                       # mkv: declares no per-stream rates
-ff -display_rotation 90 -i tv.mp4 -c copy rot.mp4 # portrait via display matrix
-ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
+{ ff -f lavfi -i "testsrc2=size=1280x720:duration=2:rate=30" \
+     -f lavfi -i "sine=frequency=440:duration=2" \
+     -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac -ac 1 -shortest tv.mp4
+  ff -i tv.mp4 -c copy tv.mkv                       # mkv: declares no per-stream rates
+  ff -display_rotation 90 -i tv.mp4 -c copy rot.mp4 # portrait via display matrix
+} & FX+=("$!")
+fx ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
    -c:v libx264 -threads 1 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
 # a source big/long enough that a veryslow re-encode reliably outlasts --timeout 1
-ff -f lavfi -i "testsrc2=size=1280x720:duration=8:rate=30" -c:v libx264 -pix_fmt yuv420p slow.mp4
+# (its own preset is irrelevant: webify's re-encode time is what counts)
+fx ff -f lavfi -i "testsrc2=size=1280x720:duration=8:rate=30" -c:v libx264 -preset ultrafast -pix_fmt yuv420p slow.mp4
 # a PNG bomb: 12000x12000 gray (144 MP, over the 128 MP default) in ~200 KB. Its
 # size lives only in the IHDR, so FFmpeg learns it by decoding a frame
-python3 - > bomb.png <<'EOF'
+python3 - > bomb.png <<'EOF' &
 import struct, sys, zlib
 W = H = 12000
 def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
@@ -121,31 +130,32 @@ idat = b"".join(c.compress(row) for _ in range(H)) + c.flush()
 sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 0, 0, 0, 0))
                         + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
 EOF
+FX+=("$!")
 python3 - > evil.mp4 <<'EOF'                      # crafted 64-bit atom size: garbage in must not hang
 import struct, sys
 out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
 out += b"\x00\x00\x00\x01free" + struct.pack(">Q", (1 << 64) - 8)
 sys.stdout.buffer.write(out + b"\x00" * 4096)
 EOF
-ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
+fx ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
    -f lavfi -i "sine=frequency=440:duration=1" \
    -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac -ac 2 -shortest stereo.mp4
-ff -f lavfi -i "sine=frequency=440:duration=1" audio.wav        # no video stream at all
-ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
-ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alpha.png
-ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
+fx ff -f lavfi -i "sine=frequency=440:duration=1" audio.wav        # no video stream at all
+fx ff -f lavfi -i "testsrc2=size=200x150:duration=1:rate=5" anim.gif
+fx ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 alpha.png
+fx ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
 # PQ-tagged HDR. setparams stamps the frame-level color tags so they survive
 # across ffmpeg versions — a bare -color_trc doesn't land on the stream under
 # ffmpeg 8 (the hermetic test toolchain), leaving webify nothing to tonemap.
-ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" \
+fx ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" \
    -vf "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
    -c:v libx264 -threads 1 -pix_fmt yuv420p \
    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc hdr.mp4
-ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=50" \
+fx ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=50" \
    -vf "tinterlace=mode=interleave_top,setparams=field_mode=tff" \
    -c:v mpeg2video -threads 1 -flags +ildct+ilme -q:v 3 ilace.ts # truly interlaced 25i (fields 20ms apart)
-ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
-python3 - <<'EOF'                                 # plain.jpg + EXIF Orientation=6 -> exif.jpg
+{ ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=1" -frames:v 1 -q:v 3 plain.jpg
+  python3 - <<'EOF'                               # plain.jpg + EXIF Orientation=6 -> exif.jpg
 import struct
 jpg   = open("plain.jpg", "rb").read()
 tiff  = b"II*\x00\x08\x00\x00\x00" + struct.pack("<H", 1)
@@ -155,6 +165,7 @@ exif  = b"Exif\x00\x00" + tiff
 open("exif.jpg", "wb").write(jpg[:2] + b"\xff\xe1" +
                              struct.pack(">H", len(exif) + 2) + exif + jpg[2:])
 EOF
+} & FX+=("$!")
 # non-media assets for the --peek libmagic fallback
 printf '%%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%%%EOF\n' > doc.pdf
 printf '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>\n' > pic.svg
@@ -163,6 +174,7 @@ printf 'plain text body\n' > note.txt
 python3 -c 'import sys; sys.stdout.buffer.write(bytes(range(8))*16)' > junk.bin  # no magic
 python3 -c 'import json,sys; sys.stdout.write(json.dumps({"items":list(range(4000))}))' > data.json  # >8KB JSON
 gzip -c data.json > data.json.gz                    # gzipped JSON, inner >8KB
+fx_wait
 
 # --- CLI contract --------------------------------------------------------------
 t "--help exits 0 and prints usage"        bash -c "$W --help | grep -q usage"
@@ -188,13 +200,9 @@ t "--timeout negative rejected"            rejects --timeout -1 in out
 t "sandbox: seccomp filter is active"      bash -c "$W --sandbox-selftest | grep -q blocked"
 t "sandbox: WEBIFY_NO_SANDBOX disables it" bash -c "WEBIFY_NO_SANDBOX=1 $W --sandbox-selftest | grep -q allowed"
 t "sandbox: WEBIFY_NO_SECCOMP disables it" bash -c "WEBIFY_NO_SECCOMP=1 $W --sandbox-selftest | grep -q allowed"
-# encodes still succeed under the default (sandboxed) binary — that the whole
-# suite runs green already proves the allowlist is complete; this asserts one
-# explicitly for a clear signal
-t "sandbox: image encode works fenced"     bash -c "$W photo.png sb.avif >/dev/null 2>&1 && grep -aq ftypavif sb.avif"
-# --max-pixels bomb guard: photo.png is 640x480 = 307200 px
+# --max-pixels bomb guard: photo.png is 640x480 = 307200 px (the encodes that
+# must succeed fenced are pooled and asserted after the drain, below)
 t "guard: --max-pixels 1000 rejects photo" rejects --max-pixels 1000 photo.png sb2.avif
-t "guard: --max-pixels 500000 allows photo" bash -c "$W --max-pixels 500000 photo.png sb3.avif >/dev/null 2>&1 && grep -aq ftypavif sb3.avif"
 # the bomb's size is only known by decoding it: the probe decoder gets
 # max_pixels too, so it refuses before allocating the 144 MB canvas (without
 # that, both modes peaked at ~150 MB before the guard saw the size)
@@ -209,9 +217,6 @@ pv=$("$WEBIFY" --max-pixels 1000 --peek tv.mp4)
 t "guard: --peek mp4 over it unsupported"  has "$pv" '"supported":false'
 t "guard: --peek mp4 over it -> video/mp4" has "$pv" '"mimetype":"video/mp4"'
 t "guard: --peek mkv over it -> video/*"   has "$("$WEBIFY" --max-pixels 1000 --peek tv.mkv)" '"mimetype":"video/webm"'
-# --timeout: a veryslow re-encode of an 8s 720p source cannot finish in 1s, and
-# the outer `timeout 20` proves webify killed itself (exit != 0 and != 124/hang)
-t "guard: --timeout 1 kills a slow encode" bash -c "timeout 20 $W --timeout 1 slow.mp4 slow_out.mp4 >/dev/null 2>&1; c=\$?; [ \$c -ne 0 ] && [ \$c -ne 124 ]"
 
 # --- --peek: identify (no encode); media via FFmpeg, the rest via libmagic -----
 # webify-native output types (exact — webify owns them)
@@ -228,17 +233,9 @@ t "--peek gzipped json (>8KB inner) -> json + gzip" has "$("$WEBIFY" --peek data
 # audio-only: webify transcodes it to AAC/m4a -> supported
 t "--peek audio-only -> audio/mp4, supported" has "$("$WEBIFY" --peek audio.wav)" '"mimetype":"audio/mp4","extension":"m4a","supported":true'
 t "--peek unknown bytes -> octet-stream"    has "$("$WEBIFY" --peek junk.bin)"  '"mimetype":"application/octet-stream","extension":"","supported":false'
-t "--peek exits 0 even when unsupported"     bash -c "$W --peek audio.wav >/dev/null"
+t "--peek exits 0 even when unsupported"     bash -c "$W --peek junk.bin >/dev/null"
 t "--peek with an <output> rejected"         rejects --peek photo.png out.x
 t "--peek combined with --json rejected"     rejects --peek --json photo.png
-
-# --- --json: transcode to a file, report {mimetype,extension} on stdout --------
-t "--json image: stdout reports avif"        eq "$("$WEBIFY" --json photo.png j1.avif)" '{"mimetype":"image/avif","extension":"avif"}'
-t "--json video: stdout reports mp4"         eq "$("$WEBIFY" --json tv.mp4 j1.mp4)"     '{"mimetype":"video/mp4","extension":"mp4"}'
-t "--json writes a valid AVIF file"          bash -c "$W --json photo.png j2.avif >/dev/null && grep -aq ftypavif j2.avif"
-t "--json bytes == a plain run (additive)"   bash -c "$W photo.png j3a.avif 2>/dev/null; $W --json photo.png j3b.avif >/dev/null; cmp -s j3a.avif j3b.avif"
-t "--json to a stdout output rejected"       rejects --json photo.png -
-t "--json with no explicit <output> rejected" rejects --json photo.png
 
 # --- encodes (the assert blocks below only read the outputs) -------------------
 # images -> AVIF
@@ -269,7 +266,30 @@ enc "$W ilace.ts v_ilace.mp4"
 # audio-only -> AAC in .m4a (the mp4 muxer with just an audio stream)
 enc "$W audio.wav a_def.m4a"
 enc "$W - - < audio.wav > a_piped.m4a"
+# guards + --json (exit status / stdout captured to files, asserted below)
+enc "$W --max-pixels 500000 photo.png sb3.avif"
+enc "timeout 20 $W --timeout 1 slow.mp4 slow_out.mp4 >/dev/null 2>&1; echo \$? > slow.rc"
+enc "$W --json photo.png j1.avif > j1.avif.json"
+enc "$W --json tv.mp4 j1.mp4 > j1.mp4.json"
 drain
+
+# --- sandbox + guards: pooled results ------------------------------------------
+# every pooled encode ran under the default (sandboxed) binary — the whole suite
+# running green already proves the allowlist is complete; this asserts one
+# explicitly for a clear signal
+t "sandbox: image encode works fenced"     grep -aq ftypavif q_def.avif
+t "guard: --max-pixels 500000 allows photo" grep -aq ftypavif sb3.avif
+# --timeout: a veryslow re-encode of an 8s 720p source cannot finish in 1s, and
+# the outer `timeout 20` proves webify killed itself (exit != 0 and != 124/hang)
+t "guard: --timeout 1 kills a slow encode" bash -c 'c=$(cat slow.rc); [ "$c" -ne 0 ] && [ "$c" -ne 124 ]'
+
+# --- --json: transcode to a file, report {mimetype,extension} on stdout --------
+t "--json image: stdout reports avif"        eq "$(cat j1.avif.json)" '{"mimetype":"image/avif","extension":"avif"}'
+t "--json video: stdout reports mp4"         eq "$(cat j1.mp4.json)"  '{"mimetype":"video/mp4","extension":"mp4"}'
+t "--json writes a valid AVIF file"          grep -aq ftypavif j1.avif
+t "--json bytes == a plain run (additive)"   bash -c "cmp -s j1.avif q_def.avif && cmp -s j1.mp4 v_def.mp4"
+t "--json to a stdout output rejected"       rejects --json photo.png -
+t "--json with no explicit <output> rejected" rejects --json photo.png
 
 # --- golden hashes (hermetic ffmpeg only) --------------------------------------
 # Encoded outputs are byte-deterministic (AVFMT_FLAG_BITEXACT), but the *fixtures*
@@ -279,13 +299,12 @@ drain
 # the behavioral asserts only. REBASELINE=1 rewrites goldens/<arch>.sha256 (used
 # by rebaseline.yml on vendor bumps). Hashes are per-arch: x264/libaom SIMD is
 # not guaranteed bit-identical across amd64/arm64.
-# Excluded on purpose: v_hdr.mp4 — the zimg/zscale tonemap path is not
-# thread-count-deterministic (its float output shifts with the worker count), so
-# its bytes vary across machines; the behavioral "tonemapped to bt709" assert
-# covers HDR instead. Every other encoded path (x264, libaom, aac) is thread-stable.
+# Every encoded path is thread-stable, the HDR tonemap included (its dithering
+# zscale is pinned to one thread — error diffusion across slices would make it
+# depend on the core count).
 GOLDEN_OUTPUTS="q_def.avif q2.avif q9.avif m240.avif m2000.avif anim.avif \
 alpha.avif opaque.avif exif.avif v_def.mp4 v_q2.mp4 v_q9.mp4 v_rot.mp4 \
-v_file.mp4 v_frag.mp4 v_stereo.mp4 v_ilace.mp4 a_def.m4a"
+v_file.mp4 v_frag.mp4 v_stereo.mp4 v_ilace.mp4 v_hdr.mp4 a_def.m4a"
 if [ -n "${WEBIFY_GOLDEN:-}${REBASELINE:-}" ]; then
     case "$(uname -m)" in
         x86_64)  garch=amd64 ;;

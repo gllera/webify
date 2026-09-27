@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the minimal static FFmpeg stack (+ dav1d, libaom, x264, zimg) into
-# vendor/out by running the per-library scripts in vendor.d/ in order. Each
-# script pins its own upstream release version and tarball sha256 — official
-# tarballs only.
+# Builds the minimal static FFmpeg stack (+ dav1d, libaom, x264, zimg) and
+# libmagic into vendor/out by running the per-library scripts in vendor.d/ in
+# order. Each script pins its own upstream release version and tarball sha256 —
+# official tarballs only.
 #
 # The Docker build (see Dockerfile) does NOT run this file: it gives every
 # vendor.d script its own build stage, so changing one library only recompiles

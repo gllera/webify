@@ -67,9 +67,11 @@ jobs:
 
       # The hermetic `test` stage bundles the built binary with a digest-pinned
       # ffmpeg, so the fixtures — and the golden hashes — are byte-stable and
-      # need no host toolchain. It reuses the cached build stage (cache-from
-      # only). Running it enforces WEBIFY_GOLDEN=1: any behavioral OR byte-exact
-      # regression fails the job, which gates the whole matrix and the release.
+      # need no host toolchain. It reuses the cached build stage, and exports
+      # the whole graph back (test depends on build, so this is a superset of the
+      # dist export) so the test stage's own layers are cached too. Running it
+      # enforces WEBIFY_GOLDEN=1: any behavioral OR byte-exact regression fails
+      # the job, which gates the whole matrix and the release.
       - name: Build hermetic test image
         uses: docker/build-push-action@v7
         with:
@@ -78,6 +80,7 @@ jobs:
           load: true
           tags: webify-test:ci
           cache-from: type=gha,scope=webify-${{ matrix.arch }}
+          cache-to: type=gha,scope=webify-${{ matrix.arch }},mode=max
 
       - name: Test suite (behavioral + golden)
         run: docker run --rm webify-test:ci

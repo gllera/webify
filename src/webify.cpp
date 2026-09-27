@@ -67,6 +67,7 @@
 /* the sandbox (see the ==== Sandbox ==== section): Landlock fences the
  * filesystem, a seccomp allowlist kills exec/socket/ptrace, and rlimits/timers
  * cap a bomb or a runaway loop. Linux-only, which webify already is. */
+#include <libgen.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -118,7 +119,8 @@ extern const unsigned char _binary_magic_mgc_end[];
  * fields into columns) and before scaling (fields are interleaved source
  * lines); send_frame keeps the frame rate */
 #define DEINT_FILTER "bwdif=mode=send_frame:deint=interlaced,"
-#define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=%s:channel_layouts=%s"
+/* FFmpeg's native AAC encoder takes planar float (fltp) */
+#define AUDIO_FILTERS "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=%s"
 /* high-quality swscale conversions for the image pipeline (rounding flags are
  * no-ops where they don't apply; lanczos only kicks in for --max scaling, and
  * libaom takes no RGB so swscale always does the RGB→YUV subsampling) */
@@ -152,7 +154,7 @@ static void progress_tick(double t)
     if (!prog.tty || !prog.label || prog.duration <= 0)
         return;
     pct = (int)(t * 100.0 * AV_TIME_BASE / prog.duration);
-    pct = FFMIN(FFMAX(pct, 0), 100);
+    pct = av_clip(pct, 0, 100);
     if (pct != prog.pct) {
         fprintf(stderr, "\r%s %3d%%", prog.label, pct);
         prog.pct = pct;
@@ -198,13 +200,11 @@ static const char *err2str(int errnum)
 }
 
 /* a frame of w*h pixels within the --max-pixels bomb guard? Checked against the
- * container's coded dimensions (before the decoder allocates) and again against
- * each decoded frame (headers can lie). 0/negative dims are "not yet known" and
- * pass — the per-frame check catches them. */
+ * container's coded dimensions (check_canvas, before the decoder allocates) and
+ * again against each decoded frame (headers can lie). */
 static int pixels_ok(int w, int h)
 {
-    return opt.max_pixels <= 0 || w <= 0 || h <= 0 ||
-           (long)w * h <= opt.max_pixels;
+    return opt.max_pixels <= 0 || (long)w * h <= opt.max_pixels;
 }
 
 /* --max-pixels as libavcodec's own max_pixels (which tops out at INT_MAX), so a
@@ -250,15 +250,12 @@ static int find_stream_info(AVFormatContext *ifmt)
 #define PREFIX_SIZE (64 * 1024)
 #define IO_BUFSIZE  (64 * 1024)
 
-static const char *const image_demuxers[] = { "image2", "png_pipe", "jpeg_pipe",
-    "bmp_pipe", "tiff_pipe", "webp_pipe", "gif", NULL };
-
+/* the image demuxers vendor.d/80-ffmpeg.sh enables: image2 (opened by file
+ * name) and the image pipes (sniffed) */
 static int is_image_demuxer(const char *name)
 {
-    for (int i = 0; image_demuxers[i]; i++)
-        if (!strcmp(name, image_demuxers[i]))
-            return 1;
-    return 0;
+    return av_match_name(name, "image2,png_pipe,jpeg_pipe,bmp_pipe,tiff_pipe,"
+                               "webp_pipe,gif");
 }
 
 struct StdinIO {
@@ -378,14 +375,20 @@ static int write_all(int fd, const uint8_t *p, size_t n)
     return 0;
 }
 
-/* every webify temp file comes from here: webify-XXXXXX in $TMPDIR or
- * /tmp (doc/piping.md documents that name as the SIGKILL-leftover caveat).
+/* $TMPDIR or /tmp: where every webify temp file lives — and so the directory
+ * the sandbox's Landlock ruleset must grant */
+static const char *tmp_dir(void)
+{
+    const char *d = getenv("TMPDIR");
+    return d && *d ? d : "/tmp";
+}
+
+/* every webify temp file comes from here: webify-XXXXXX in tmp_dir()
+ * (doc/piping.md documents that name as the SIGKILL-leftover caveat).
  * Returns the mkstemp fd, path gets the name */
 static int make_temp(char *path, size_t len)
 {
-    const char *dir = getenv("TMPDIR");
-
-    snprintf(path, len, "%s/webify-XXXXXX", dir && *dir ? dir : "/tmp");
+    snprintf(path, len, "%s/webify-XXXXXX", tmp_dir());
     return mkstemp(path);
 }
 
@@ -439,6 +442,23 @@ static int drain_file_to_stdout(const char *path)
     return ret;
 }
 
+/* the custom avio context the demuxer reads a StdinIO through (freed by
+ * close_stdin_io) */
+static int alloc_stdin_pb(StdinIO *io, int (*read_cb)(void *, uint8_t *, int),
+                          int64_t (*seek_cb)(void *, int64_t, int))
+{
+    uint8_t *iobuf = (uint8_t *)av_malloc(IO_BUFSIZE);
+
+    if (!iobuf)
+        return AVERROR(ENOMEM);
+    io->pb = avio_alloc_context(iobuf, IO_BUFSIZE, 0, io, read_cb, NULL, seek_cb);
+    if (!io->pb) {
+        av_free(iobuf);
+        return AVERROR(ENOMEM);
+    }
+    return 0;
+}
+
 /* open a demuxer on a custom avio context (the stdin paths) */
 static int open_with_pb(AVFormatContext **ifmt, AVIOContext *pb)
 {
@@ -450,7 +470,6 @@ static int open_with_pb(AVFormatContext **ifmt, AVIOContext *pb)
 
 static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO *io)
 {
-    uint8_t *iobuf;
     const AVInputFormat *fmt;
     int (*read_cb)(void *, uint8_t *, int) = pre_read;
     int64_t (*seek_cb)(void *, int64_t, int) = NULL;
@@ -507,13 +526,8 @@ static int open_stdin_input(const char *in_path, AVFormatContext **ifmt, StdinIO
         read_cb = file_read;
         seek_cb = file_seek;
     }
-    if (!(iobuf = (uint8_t *)av_malloc(IO_BUFSIZE)))
-        return AVERROR(ENOMEM);
-    io->pb = avio_alloc_context(iobuf, IO_BUFSIZE, 0, io, read_cb, NULL, seek_cb);
-    if (!io->pb) {
-        av_free(iobuf);
-        return AVERROR(ENOMEM);
-    }
+    if ((ret = alloc_stdin_pb(io, read_cb, seek_cb)) < 0)
+        return ret;
     return open_with_pb(ifmt, io->pb);
 }
 
@@ -529,7 +543,10 @@ static void close_stdin_io(StdinIO *io)
         close(io->fd); /* already unlinked: this removes the temp file */
 }
 
-static int open_decoder(AVFormatContext *ifmt, int stream_index, AVCodecContext **out)
+/* threads: 0 = auto (frame threading), 1 when only a first frame is wanted —
+ * frame threading must be fed ~nproc packets before it returns any frame */
+static int open_decoder(AVFormatContext *ifmt, int stream_index, int threads,
+                        AVCodecContext **out)
 {
     AVStream *st = ifmt->streams[stream_index];
     const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
@@ -548,7 +565,7 @@ static int open_decoder(AVFormatContext *ifmt, int stream_index, AVCodecContext 
         return ret;
     }
     dec->pkt_timebase = st->time_base;
-    dec->thread_count = 0; /* auto */
+    dec->thread_count = threads;
     if (codec_max_pixels()) /* refuse a bomb frame before allocating it */
         dec->max_pixels = codec_max_pixels();
     if (dec->codec_type == AVMEDIA_TYPE_VIDEO)
@@ -663,24 +680,11 @@ static int is_hdr_trc(enum AVColorTransferCharacteristic trc)
     return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67;
 }
 
-/* tile/thread count by output width: <512 -> 2, 480p-ish -> 4, 720-1080p -> 8,
- * 1440p+ -> 16 (the original VP9 tile-columns table, kept for the encoder
- * thread counts) */
-static int width_tlog(int w)
-{
-    return w >= 2560 ? 3 : w >= 1280 ? 2 : w >= 512 ? 1 : 0;
-}
-
+/* encoder thread count by output width: <512 -> 2, 480p-ish -> 4,
+ * 720-1080p -> 8, 1440p+ -> 16 */
 static int width_threads(int w)
 {
-    return 2 << width_tlog(w);
-}
-
-/* the audio stream's header bitrate (mkv/webm declare none, which leaves the
- * audio cap off — AAC then rides the -q anchor) */
-static int64_t source_audio_rate(const AVStream *ist)
-{
-    return ist->codecpar->bit_rate;
+    return w >= 2560 ? 16 : w >= 1280 ? 8 : w >= 512 ? 4 : 2;
 }
 
 /* does the frame actually use transparency? checks the palette for
@@ -755,9 +759,11 @@ static const uint8_t *coded_sd(const AVStream *st, enum AVPacketSideDataType t)
  * it keeps decoding to learn whether a second frame proves an animation and
  * whether the source carries real transparency (the AVIF auxiliary alpha
  * stream); a video peek wants only the orientation/HDR side data of the first
- * frame. */
+ * frame. A still decoded cleanly to EOF keeps its one frame (`still`), which
+ * the transcode encodes directly instead of rewinding to decode it again. */
 static struct {
     int32_t m[9]; int set; double peak; int animated; int alpha;
+    AVFrame *still;
 } peeked;
 
 static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
@@ -765,24 +771,28 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
     AVCodecContext *dec = NULL;
     AVPacket *pkt = av_packet_alloc();
     AVFrame *fr = av_frame_alloc();
-    int ret, flushed = 0, frames = 0;
+    int ret, flushed = 0, frames = 0, eof = 0, clean = 1, keep = 0;
 
     peeked = {};
-    if (!pkt || !fr || open_decoder(ifmt, vidx, &dec) < 0)
+    if (!pkt || !fr || open_decoder(ifmt, vidx, detect_anim ? 0 : 1, &dec) < 0)
         goto end;
     for (;;) {
         if (!flushed && (ret = av_read_frame(ifmt, pkt)) >= 0) {
             ret = pkt->stream_index == vidx ? avcodec_send_packet(dec, pkt) : 0;
             av_packet_unref(pkt);
         } else if (!flushed) { /* tiny input: flush to get the frame out */
+            eof     = ret == AVERROR_EOF;
             flushed = 1;
-            ret = avcodec_send_packet(dec, NULL);
+            ret     = avcodec_send_packet(dec, NULL);
         } else {
+            /* the whole input decoded without an error the transcode would
+             * fail on: a still's one frame is final */
+            keep = eof && clean && frames == 1;
             break;
         }
         if (ret < 0)
             break;
-        while (avcodec_receive_frame(dec, fr) >= 0) {
+        while ((ret = avcodec_receive_frame(dec, fr)) >= 0) {
             if (!pixels_ok(fr->width, fr->height)) {
                 av_frame_unref(fr);
                 goto end; /* bomb guard: let the caller reopen and reject */
@@ -801,6 +811,8 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
                 }
                 peeked.peak = peak_from_metadata(cll ? cll->data : NULL,
                                                  mdm ? mdm->data : NULL);
+                if (detect_anim) /* kept at the end if it proves a still */
+                    peeked.still = av_frame_clone(fr);
             }
             if (detect_anim && !peeked.alpha && frame_has_real_alpha(fr))
                 peeked.alpha = 1;
@@ -813,10 +825,14 @@ static void peek_first_frame(AVFormatContext *ifmt, int vidx, int detect_anim)
             if (peeked.animated && peeked.alpha)
                 goto end;
         }
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+            clean = 0; /* a decode error: the transcode will meet it too */
         if (frames > 0 && !detect_anim)
             break; /* the first frame settles it */
     }
 end:
+    if (!keep)
+        av_frame_free(&peeked.still);
     avcodec_free_context(&dec);
     av_packet_free(&pkt);
     av_frame_free(&fr);
@@ -834,19 +850,55 @@ static int input_is_image(const AVFormatContext *ifmt, int vidx, int aidx)
     /* exactly 1: heif/avif items report nb_frames = 1, while 0 means the
      * demuxer doesn't know the count (fragmented mp4) — that is video */
     return aidx < 0 && ifmt->streams[vidx]->nb_frames == 1 &&
-           !strncmp(ifmt->iformat->name, "mov,", 4);
+           av_match_name("mov", ifmt->iformat->name);
 }
 
-/* the geometry/timing/flags fields the AVIF alpha encoder inherits from the
- * already-configured color encoder; callers override what genuinely differs */
-static void copy_enc_geometry(AVCodecContext *dst, const AVCodecContext *src)
+/* what webify_run transcodes an input as — and so what --peek predicts */
+enum InputKind { IN_NONE, IN_AUDIO, IN_IMAGE, IN_VIDEO };
+
+/* pick the streams and classify the input: a real video stream drives
+ * image/video mode (a cover-art "video" doesn't count); with only audio,
+ * transcode that to AAC in an .m4a (mp4 muxer). *vidx comes back -1 unless
+ * there is a real video stream, *aidx -1 for an image (its pipeline takes no
+ * audio). */
+static enum InputKind pick_streams(AVFormatContext *ifmt, int *vidx, int *aidx)
 {
-    dst->width               = src->width;
-    dst->height              = src->height;
-    dst->pix_fmt             = src->pix_fmt;
-    dst->time_base           = src->time_base;
-    dst->sample_aspect_ratio = src->sample_aspect_ratio;
-    dst->flags               = src->flags;
+    *vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    *aidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (*vidx < 0 ||
+        (ifmt->streams[*vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+        *vidx = -1;
+        return *aidx >= 0 ? IN_AUDIO : IN_NONE;
+    }
+    if (input_is_image(ifmt, *vidx, *aidx)) {
+        *aidx = -1;
+        return IN_IMAGE;
+    }
+    return IN_VIDEO;
+}
+
+/* decompression-bomb guard on the coded dimensions, before the decoder
+ * allocates a frame buffer for them (the per-frame check in push_frame catches
+ * headers that lie). A codec whose size only decoding reveals (PNG) was
+ * already refused by the probe decoder's max_pixels, which leaves the size
+ * unknown — and an unknown size can't build the buffersrc anyway, so name the
+ * likely cause here rather than fail later in the filter graph. Logs why;
+ * returns 0 or the error. */
+static int check_canvas(const AVStream *st, const char *in_path)
+{
+    const AVCodecParameters *par = st->codecpar;
+
+    if (par->width <= 0 || par->height <= 0) {
+        av_log(NULL, AV_LOG_ERROR, "cannot determine the size of '%s'%s\n",
+               in_path, opt.max_pixels > 0 ? " (over --max-pixels?)" : "");
+        return AVERROR_INVALIDDATA;
+    }
+    if (!pixels_ok(par->width, par->height)) {
+        av_log(NULL, AV_LOG_ERROR, "input %dx%d exceeds --max-pixels %ld\n",
+               par->width, par->height, opt.max_pixels);
+        return AVERROR(ERANGE);
+    }
+    return 0;
 }
 
 /* ==== Quality settings =======================================================
@@ -934,7 +986,10 @@ static int add_stream(AVFormatContext *ofmt, const AVCodecContext *enc, int *ind
  * SEI), the container (mkv/mp4 boxes), or assume the typical 1000-nit
  * master. The last zscale quantizes tonemap's float output down to 8 bits:
  * undithered, the smooth gradients tonemapping produces band visibly
- * (zscale's dither default is none). */
+ * (zscale's dither default is none). It runs on one thread: error diffusion
+ * carries each row's rounding error into the next, so slicing the frame
+ * across threads makes the output depend on the core count — the only such
+ * step in any encode path, so pinned here it keeps HDR output deterministic. */
 static void tonemap_spec(const AVCodecContext *dec, const AVStream *ist,
                          char *buf, size_t size)
 {
@@ -950,7 +1005,7 @@ static void tonemap_spec(const AVCodecContext *dec, const AVStream *ist,
     snprintf(buf, size,
              "zscale=tin=%s%s%s:t=linear:npl=100,format=gbrpf32le,"
              "zscale=p=bt709,tonemap=hable:desat=0:peak=%.6g,"
-             "zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion,",
+             "zscale=t=bt709:m=bt709:r=tv:dither=error_diffusion:threads=1,",
              dec->color_trc == AVCOL_TRC_SMPTE2084
                  ? "smpte2084" : "arib-std-b67",
              dec->colorspace == AVCOL_SPC_UNSPECIFIED
@@ -964,31 +1019,43 @@ static void tonemap_spec(const AVCodecContext *dec, const AVStream *ist,
            peak * 100);
 }
 
+/* the named encoder and a fresh context for it in p->enc */
+static int alloc_encoder(Pipe *p, const char *name, const AVCodec **codec)
+{
+    if (!(*codec = avcodec_find_encoder_by_name(name))) {
+        av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n", name);
+        return AVERROR_ENCODER_NOT_FOUND;
+    }
+    return (p->enc = avcodec_alloc_context3(*codec)) ? 0 : AVERROR(ENOMEM);
+}
+
+/* the libaom options the AVIF color and alpha streams share: row-mt at the
+ * tuned speed (avifenc defaults to speed 6; webify digs deeper — files are
+ * downloaded many times), and all-intra for a still */
+static void avif_opts(AVDictionary **opts, int crf)
+{
+    av_dict_set_int(opts, "crf", crf, 0);
+    av_dict_set(opts, "row-mt", "1", 0);
+    av_dict_set(opts, "cpu-used", "4", 0);
+    if (!peeked.animated) {
+        av_dict_set(opts, "usage", "allintra", 0);
+        av_dict_set(opts, "still-picture", "1", 0);
+    }
+}
+
 /* images: AVIF via libaom, stills and animations alike. -q maps to the
  * recommended CRF (avif_still_crf / avif_anim_crf, in the quality-settings
  * section). Everything stays 8-bit 4:2:0 = AV1 Main profile. */
 static void setup_avif(Pipe *p, AVDictionary **opts)
 {
-    int crf = peeked.animated ? avif_anim_crf() : avif_still_crf();
-
     p->enc->bit_rate     = 0;
     p->enc->thread_count = width_threads(p->enc->width);
-    av_dict_set_int(opts, "crf", crf, 0);
-    av_dict_set(opts, "row-mt", "1", 0);
-    if (peeked.animated) {
-        /* animated GIF -> animated AVIF (the muxer's 'avis' brand),
-         * inter-coded at the video gop — all-intra would spend a full
-         * keyframe on every GIF frame (gop_size left at its default of 12
-         * would too, every 12) */
+    avif_opts(opts, peeked.animated ? avif_anim_crf() : avif_still_crf());
+    /* animated GIF -> animated AVIF (the muxer's 'avis' brand), inter-coded at
+     * the video gop — all-intra would spend a full keyframe on every GIF frame
+     * (gop_size left at its default of 12 would too, every 12) */
+    if (peeked.animated)
         p->enc->gop_size = 240;
-        av_dict_set(opts, "cpu-used", "4", 0);
-    } else {
-        /* stills: all-intra at the tuned speed (avifenc defaults to speed 6;
-         * webify digs deeper — files are downloaded many times) */
-        av_dict_set(opts, "usage", "allintra", 0);
-        av_dict_set(opts, "still-picture", "1", 0);
-        av_dict_set(opts, "cpu-used", "4", 0);
-    }
 }
 
 /* video: H.264 via libx264 in pure CRF mode (its lookahead/mbtree plan the
@@ -1016,43 +1083,47 @@ static int init_alpha(Pipe *p, const AVCodec *codec)
 
     if (!(p->enc_a = avcodec_alloc_context3(codec)))
         return AVERROR(ENOMEM);
-    copy_enc_geometry(p->enc_a, p->enc);
-    p->enc_a->pix_fmt      = AV_PIX_FMT_GRAY8;
-    p->enc_a->thread_count = p->enc->thread_count;
-    p->enc_a->bit_rate     = 0;
+    p->enc_a->width               = p->enc->width;
+    p->enc_a->height              = p->enc->height;
+    p->enc_a->time_base           = p->enc->time_base;
+    p->enc_a->sample_aspect_ratio = p->enc->sample_aspect_ratio;
+    p->enc_a->flags               = p->enc->flags;
+    p->enc_a->pix_fmt             = AV_PIX_FMT_GRAY8;
+    p->enc_a->thread_count        = p->enc->thread_count;
+    p->enc_a->bit_rate            = 0;
     /* alpha is full-range by definition (MIAF), and decoders assume so:
      * left at the limited-range default the bitstream says "tv" and
      * libavif-class decoders stretch 16-235 to 0-255, distorting every
      * gradient (measured SSIM 0.90 on a radial alpha vs 1.0 intended) */
     p->enc_a->color_range  = AVCOL_RANGE_JPEG;
     /* crf 0 ~ lossless: alpha gradients band visibly while costing few bits */
-    av_dict_set(&aopts, "crf", "0", 0);
-    if (!peeked.animated) {
-        av_dict_set(&aopts, "usage", "allintra", 0);
-        av_dict_set(&aopts, "still-picture", "1", 0);
-    }
-    av_dict_set(&aopts, "row-mt", "1", 0);
-    av_dict_set(&aopts, "cpu-used", "4", 0);
+    avif_opts(&aopts, 0);
     ret = avcodec_open2(p->enc_a, codec, &aopts);
     av_dict_free(&aopts);
     return ret;
 }
 
 /* Map the deprecated yuvjXXXp (JPEG/full-range) pixel formats to their
- * canonical yuvXXXp equivalents; everything else passes through. The layouts
- * are bit-identical — the J variants only signalled full range, which we carry
- * explicitly as AVCOL_RANGE_JPEG. Used on both the buffersrc args and the
- * frames pushed into it so they agree and swscale never sees a J format. */
-static enum AVPixelFormat dejpeg_pix_fmt(enum AVPixelFormat fmt)
+ * canonical yuvXXXp equivalents plus an explicit AVCOL_RANGE_JPEG; everything
+ * else passes through. The layouts are bit-identical — the J variants only
+ * signalled full range. mjpeg & friends decode to them; applied to both the
+ * buffersrc args and every frame pushed into it, so the two agree (the graph
+ * never sees frame properties change on the fly) and swscale never sees a J
+ * format (silencing its "deprecated pixel format ... set range" warning). */
+static void dejpeg(int *fmt, enum AVColorRange *range)
 {
-    switch (fmt) {
-    case AV_PIX_FMT_YUVJ420P: return AV_PIX_FMT_YUV420P;
-    case AV_PIX_FMT_YUVJ422P: return AV_PIX_FMT_YUV422P;
-    case AV_PIX_FMT_YUVJ444P: return AV_PIX_FMT_YUV444P;
-    case AV_PIX_FMT_YUVJ440P: return AV_PIX_FMT_YUV440P;
-    case AV_PIX_FMT_YUVJ411P: return AV_PIX_FMT_YUV411P;
-    default:                  return fmt;
+    int canon;
+
+    switch (*fmt) {
+    case AV_PIX_FMT_YUVJ420P: canon = AV_PIX_FMT_YUV420P; break;
+    case AV_PIX_FMT_YUVJ422P: canon = AV_PIX_FMT_YUV422P; break;
+    case AV_PIX_FMT_YUVJ444P: canon = AV_PIX_FMT_YUV444P; break;
+    case AV_PIX_FMT_YUVJ440P: canon = AV_PIX_FMT_YUV440P; break;
+    case AV_PIX_FMT_YUVJ411P: canon = AV_PIX_FMT_YUV411P; break;
+    default:                  return;
     }
+    *fmt   = canon;
+    *range = AVCOL_RANGE_JPEG;
 }
 
 /* image != 0 selects the AVIF pipeline (libaom, alpha kept when really used);
@@ -1067,22 +1138,17 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     const AVPacketSideData *psd;
     const int32_t *mat = NULL;
     char args[512], spec[768], scale[256] = "", rotate[40], tonemap[256] = "";
-    int ret, hdr, alpha = 0;
+    int ret, hdr, alpha = image && peeked.alpha; /* the AVIF alpha stream */
     int maxw = opt.max_w, maxh = opt.max_h;
 
     p->in_index = stream_index;
-    if ((ret = open_decoder(ifmt, stream_index, &p->dec)) < 0)
+    if ((ret = open_decoder(ifmt, stream_index, 0, &p->dec)) < 0)
         return ret;
 
     sar = p->dec->sample_aspect_ratio;
-    /* mjpeg & friends decode to the deprecated yuvjXXXp formats; normalise to
-     * the canonical format + JPEG range so the buffersrc, the frames it later
-     * receives (re-stamped identically in decode_packet) and the graph's
-     * swscale all agree on one format — silencing swscale's "deprecated pixel
-     * format ... set range" warning. Bit-identical layout: output unchanged. */
-    enum AVPixelFormat pix = dejpeg_pix_fmt(p->dec->pix_fmt);
-    enum AVColorRange  rng = pix != p->dec->pix_fmt ? AVCOL_RANGE_JPEG
-                                                    : p->dec->color_range;
+    int               pix = p->dec->pix_fmt;
+    enum AVColorRange rng = p->dec->color_range;
+    dejpeg(&pix, &rng);
     snprintf(args, sizeof(args),
              "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d"
              ":colorspace=%d:range=%d",
@@ -1124,7 +1190,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
             av_log(NULL, AV_LOG_WARNING, "HDR image input: colors may come "
                    "out washed; only video inputs are tonemapped\n");
         snprintf(spec, sizeof(spec), "%s%sformat=%s", rotate, scale,
-                 peeked.alpha ? "yuva420p" : "yuv420p");
+                 alpha ? "yuva420p" : "yuv420p");
     } else {
         if (hdr) /* tone-map PQ/HLG to SDR bt709 (see tonemap_spec) */
             tonemap_spec(p->dec, ist, tonemap, sizeof(tonemap));
@@ -1136,27 +1202,18 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
                           image ? "flags=" IMAGE_SWS : NULL)) < 0)
         return ret;
 
-    const char *enc_name = image ? "libaom-av1" : "libx264";
-
-    codec = avcodec_find_encoder_by_name(enc_name);
-    if (!codec) {
-        av_log(NULL, AV_LOG_ERROR, "%s encoder missing from this build\n",
-               enc_name);
-        return AVERROR_ENCODER_NOT_FOUND;
-    }
-    if (!(p->enc = avcodec_alloc_context3(codec)))
-        return AVERROR(ENOMEM);
+    if ((ret = alloc_encoder(p, image ? "libaom-av1" : "libx264", &codec)) < 0)
+        return ret;
 
     p->enc->width               = av_buffersink_get_w(p->sink);
     p->enc->height              = av_buffersink_get_h(p->sink);
     p->enc->pix_fmt             = (AVPixelFormat)av_buffersink_get_format(p->sink);
-    if (image && p->enc->pix_fmt == AV_PIX_FMT_YUVA420P) {
+    if (alpha) {
         /* libaom takes no alpha plane: the color planes of a yuva420p frame
          * are a valid yuv420p frame as-is, and the alpha plane rides as a
          * second AV1 stream that the avif muxer stores as the auxiliary
          * alpha item (the standard AVIF transparency layout) */
         p->enc->pix_fmt = AV_PIX_FMT_YUV420P;
-        alpha = 1;
     }
     p->enc->sample_aspect_ratio = av_buffersink_get_sample_aspect_ratio(p->sink);
     p->enc->time_base           = av_buffersink_get_time_base(p->sink);
@@ -1172,7 +1229,7 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         if (p->enc->framerate.num > 0 && av_q2d(p->enc->framerate) > opt.max_fps)
             p->enc->framerate = av_d2q(opt.max_fps, 100000);
     }
-    if (ofmt && (ofmt->oformat->flags & AVFMT_GLOBALHEADER))
+    if (ofmt->oformat->flags & AVFMT_GLOBALHEADER)
         p->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     if (image)
@@ -1187,14 +1244,10 @@ static int init_video(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     if (alpha && (ret = init_alpha(p, codec)) < 0)
         return ret;
 
-    p->prog = !image;
-
-    if (ofmt) {
-        if ((ret = add_stream(ofmt, p->enc, &p->out_index)) < 0)
-            return ret;
-        if (p->enc_a && (ret = add_stream(ofmt, p->enc_a, &p->out_index_a)) < 0)
-            return ret;
-    }
+    if ((ret = add_stream(ofmt, p->enc, &p->out_index)) < 0)
+        return ret;
+    if (p->enc_a && (ret = add_stream(ofmt, p->enc_a, &p->out_index_a)) < 0)
+        return ret;
 
     return alloc_pipe_buffers(p);
 }
@@ -1208,7 +1261,7 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     int ret, mono;
 
     p->in_index = stream_index;
-    if ((ret = open_decoder(ifmt, stream_index, &p->dec)) < 0)
+    if ((ret = open_decoder(ifmt, stream_index, 0, &p->dec)) < 0)
         return ret;
 
     if (p->dec->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
@@ -1222,18 +1275,12 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
     /* mono sources stay mono (an upmix would just spend bits twice on the
      * same signal); anything else is downmixed to stereo */
     mono = p->dec->ch_layout.nb_channels == 1;
-    /* FFmpeg's native AAC encoder takes planar float (fltp) */
-    snprintf(spec, sizeof(spec), AUDIO_FILTERS, "fltp", mono ? "mono" : "stereo");
+    snprintf(spec, sizeof(spec), AUDIO_FILTERS, mono ? "mono" : "stereo");
     if ((ret = init_graph(p, "abuffer", args, "abuffersink", spec, NULL)) < 0)
         return ret;
 
-    codec = avcodec_find_encoder_by_name("aac");
-    if (!codec) {
-        av_log(NULL, AV_LOG_ERROR, "aac encoder missing from this build\n");
-        return AVERROR_ENCODER_NOT_FOUND;
-    }
-    if (!(p->enc = avcodec_alloc_context3(codec)))
-        return AVERROR(ENOMEM);
+    if ((ret = alloc_encoder(p, "aac", &codec)) < 0)
+        return ret;
 
     p->enc->sample_rate = av_buffersink_get_sample_rate(p->sink);
     p->enc->sample_fmt  = (AVSampleFormat)av_buffersink_get_format(p->sink);
@@ -1241,7 +1288,8 @@ static int init_audio(Pipe *p, AVFormatContext *ifmt, AVFormatContext *ofmt,
         return ret;
     /* -q scales the audio too, capped by a lossy source's own rate (the
      * anchors and the why live in audio_bitrate, in the calibration section) */
-    p->enc->bit_rate  = audio_bitrate(mono, source_audio_rate(ist));
+    /* the header bitrate: mkv/webm declare none, which leaves the cap off */
+    p->enc->bit_rate  = audio_bitrate(mono, ist->codecpar->bit_rate);
     p->enc->time_base = AVRational{ 1, p->enc->sample_rate };
     if (ofmt->oformat->flags & AVFMT_GLOBALHEADER)
         p->enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -1351,6 +1399,44 @@ static int drain_sink(AVFormatContext *ofmt, Pipe *p)
     }
 }
 
+/* one decoded frame (p->dec_frame) into the pipe: the per-frame bomb guard,
+ * the pts, progress and the --max @F drop, the yuvj re-stamp, then through the
+ * graph to the encoder */
+static int push_frame(AVFormatContext *ofmt, Pipe *p)
+{
+    AVFrame *f = p->dec_frame;
+    int ret;
+
+    if (!pixels_ok(f->width, f->height)) {
+        av_log(NULL, AV_LOG_ERROR, "frame %dx%d exceeds --max-pixels %ld\n",
+               f->width, f->height, opt.max_pixels);
+        av_frame_unref(f);
+        return AVERROR(ERANGE);
+    }
+    f->pts = f->best_effort_timestamp;
+    if ((p->prog || p->min_gap > 0) && f->pts != AV_NOPTS_VALUE) {
+        double t = f->pts * av_q2d(p->dec->pkt_timebase);
+
+        if (p->prog)
+            progress_tick(t);
+        if (p->min_gap > 0) { /* --max @F: enforce a minimum pts gap */
+            if (t < p->next_keep) {
+                av_frame_unref(f);
+                return 0;
+            }
+            p->next_keep = t + p->min_gap * 0.999; /* float-safe spacing */
+        }
+    }
+    if (p->dec->codec_type == AVMEDIA_TYPE_VIDEO)
+        dejpeg(&f->format, &f->color_range); /* as the buffersrc (init_video) */
+    /* flags=0: the graph consumes our reference (we don't reuse the frame) */
+    ret = av_buffersrc_add_frame_flags(p->src, f, 0);
+    av_frame_unref(f);
+    if (ret < 0)
+        return ret;
+    return drain_sink(ofmt, p);
+}
+
 /* pkt == NULL flushes the decoder */
 static int decode_packet(AVFormatContext *ofmt, Pipe *p, AVPacket *pkt)
 {
@@ -1363,41 +1449,7 @@ static int decode_packet(AVFormatContext *ofmt, Pipe *p, AVPacket *pkt)
             return 0;
         if (ret < 0)
             return ret;
-        if (!pixels_ok(p->dec_frame->width, p->dec_frame->height)) {
-            av_log(NULL, AV_LOG_ERROR, "frame %dx%d exceeds --max-pixels %ld\n",
-                   p->dec_frame->width, p->dec_frame->height, opt.max_pixels);
-            av_frame_unref(p->dec_frame);
-            return AVERROR(ERANGE);
-        }
-        p->dec_frame->pts = p->dec_frame->best_effort_timestamp;
-        if ((p->prog || p->min_gap > 0) && p->dec_frame->pts != AV_NOPTS_VALUE) {
-            double t = p->dec_frame->pts * av_q2d(p->dec->pkt_timebase);
-
-            if (p->prog)
-                progress_tick(t);
-            if (p->min_gap > 0) { /* --max @F: enforce a minimum pts gap */
-                if (t < p->next_keep) {
-                    av_frame_unref(p->dec_frame);
-                    continue;
-                }
-                p->next_keep = t + p->min_gap * 0.999; /* float-safe spacing */
-            }
-        }
-        /* re-stamp deprecated yuvjXXXp to match the buffersrc's de-jpeg'd format
-         * (see init_video) — same bytes, modern range-tagged enum — so the
-         * graph doesn't see frame properties change on the fly */
-        enum AVPixelFormat dj =
-            dejpeg_pix_fmt((enum AVPixelFormat)p->dec_frame->format);
-        if (dj != p->dec_frame->format) {
-            p->dec_frame->format      = dj;
-            p->dec_frame->color_range = AVCOL_RANGE_JPEG;
-        }
-        /* flags=0: the graph consumes our reference (we don't reuse the frame) */
-        ret = av_buffersrc_add_frame_flags(p->src, p->dec_frame, 0);
-        av_frame_unref(p->dec_frame);
-        if (ret < 0)
-            return ret;
-        if ((ret = drain_sink(ofmt, p)) < 0)
+        if ((ret = push_frame(ofmt, p)) < 0)
             return ret;
     }
 }
@@ -1417,18 +1469,18 @@ static int flush_pipe(AVFormatContext *ofmt, Pipe *p)
     return encode_write(ofmt, p, NULL);                 /* flush encoder  */
 }
 
-/* the EXIF/HDR peek (and the image animation/alpha detection) consumed the
- * input; rewind by reopening, which covers both real files and the
- * spooled/slurped stdin paths behind the custom pb. Reopening invalidates the
- * stream indices, so they are rebound here; the discard flags reset too — the
- * caller re-applies those */
 static int input_can_rewind(const AVFormatContext *ifmt)
 {
     return ifmt->pb && (ifmt->pb->seekable & AVIO_SEEKABLE_NORMAL);
 }
 
+/* the EXIF/HDR peek (and the image animation/alpha detection) consumed the
+ * input; rewind by reopening, which covers both real files and the
+ * spooled/slurped stdin paths behind the custom pb. Reopening invalidates the
+ * stream indices, so they are rebound here; the discard flags reset too — the
+ * caller re-applies those */
 static int reopen_input(const char *in_path, AVFormatContext **ifmt,
-                        StdinIO *io, int image, int *vidx, int *aidx)
+                        StdinIO *io, int *vidx, int *aidx)
 {
     int64_t pos;
     int ret;
@@ -1445,9 +1497,7 @@ static int reopen_input(const char *in_path, AVFormatContext **ifmt,
         return ret;
     if ((ret = find_stream_info(*ifmt)) < 0)
         return ret;
-    *vidx = av_find_best_stream(*ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    *aidx = image ? -1
-          : av_find_best_stream(*ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    pick_streams(*ifmt, vidx, aidx);
     return *vidx < 0 ? AVERROR_STREAM_NOT_FOUND : 0;
 }
 
@@ -1457,21 +1507,6 @@ static void discard_other_streams(AVFormatContext *ifmt, int vidx, int aidx)
     for (unsigned i = 0; i < ifmt->nb_streams; i++)
         if ((int)i != vidx && (int)i != aidx)
             ifmt->streams[i]->discard = AVDISCARD_ALL;
-}
-
-/* hand a finished in-memory output to its destination: stdout for a pipe,
- * otherwise the named file (the avif muxer assembles in memory for pipes) */
-static int emit_output(int to_pipe, const char *path, const uint8_t *buf, int n)
-{
-    AVIOContext *pb = NULL;
-    int ret;
-
-    if (to_pipe)
-        return write_all(STDOUT_FILENO, buf, n);
-    if ((ret = avio_open(&pb, path, AVIO_FLAG_WRITE)) < 0)
-        return ret;
-    avio_write(pb, buf, n);
-    return avio_closep(&pb); /* flushes; surfaces a write error */
 }
 
 /* the output webify produces for each input class: image -> AVIF, audio-only ->
@@ -1492,6 +1527,7 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
     AVDictionary *muxopts = NULL;
     char tmp_out[512] = "";
     const char *sink, *oname;
+    enum InputKind kind;
     int ret, vidx, aidx, image = 0, audio_only = 0, mem_out = 0;
     int out_pipe = is_pipe(out_path);
 
@@ -1508,62 +1544,31 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
     if ((ret = find_stream_info(ifmt)) < 0)
         goto end;
 
-    vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    aidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    /* a real video stream drives image/video mode; a cover-art "video" doesn't
-     * count. With only audio, transcode that to AAC in an .m4a (mp4 muxer). */
-    audio_only = vidx < 0 ||
-                 (ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC);
-    if (audio_only) {
-        if (aidx < 0) {
-            av_log(NULL, AV_LOG_ERROR, "'%s' has no video or audio stream\n", in_path);
-            ret = AVERROR_STREAM_NOT_FOUND;
-            goto end;
-        }
-        vidx = -1;
-    } else {
-        image = input_is_image(ifmt, vidx, aidx);
-        if (image)
-            aidx = -1; /* the image pipeline takes no audio */
+    kind = pick_streams(ifmt, &vidx, &aidx);
+    if (kind == IN_NONE) {
+        av_log(NULL, AV_LOG_ERROR, "'%s' has no video or audio stream\n", in_path);
+        ret = AVERROR_STREAM_NOT_FOUND;
+        goto end;
     }
-
-    /* decompression-bomb guard: reject an over-large canvas from the coded
-     * dimensions, before the decoder allocates a frame buffer for it (the
-     * per-frame check in decode_packet catches headers that lie). A codec
-     * whose size only decoding reveals (PNG) was already refused by the probe
-     * decoder's max_pixels, which leaves the size unknown — and an unknown
-     * size can't build the buffersrc anyway, so name the likely cause here
-     * rather than fail later in the filter graph. */
-    if (!audio_only) {
-        const AVCodecParameters *par = ifmt->streams[vidx]->codecpar;
-
-        if (par->width <= 0 || par->height <= 0) {
-            av_log(NULL, AV_LOG_ERROR, "cannot determine the size of '%s'%s\n",
-                   in_path, opt.max_pixels > 0 ? " (over --max-pixels?)" : "");
-            ret = AVERROR_INVALIDDATA;
-            goto end;
-        }
-        if (!pixels_ok(par->width, par->height)) {
-            av_log(NULL, AV_LOG_ERROR, "input %dx%d exceeds --max-pixels %ld\n",
-                   par->width, par->height, opt.max_pixels);
-            ret = AVERROR(ERANGE);
-            goto end;
-        }
-    }
+    audio_only = kind == IN_AUDIO;
+    image      = kind == IN_IMAGE;
+    if (!audio_only && (ret = check_canvas(ifmt->streams[vidx], in_path)) < 0)
+        goto end;
 
     prog.tty      = isatty(STDERR_FILENO);
     prog.duration = ifmt->duration;
 
     /* images peek for animation/alpha/orientation; HDR videos peek for the
      * source peak — both consume the input, so rewind after (HDR videos that
-     * cannot rewind fall back to tag defaults) */
+     * cannot rewind fall back to tag defaults). A still the peek decoded
+     * cleanly needs no rewind: its frame is encoded as-is below */
     if (!audio_only &&
         (image ||
          (is_hdr_trc((AVColorTransferCharacteristic)
                      ifmt->streams[vidx]->codecpar->color_trc) &&
           input_can_rewind(ifmt)))) {
         peek_first_frame(ifmt, vidx, image);
-        if ((ret = reopen_input(in_path, &ifmt, &io, image, &vidx, &aidx)) < 0)
+        if (!peeked.still && (ret = reopen_input(in_path, &ifmt, &io, &vidx, &aidx)) < 0)
             goto end;
     }
 
@@ -1599,14 +1604,15 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
      * a file run (and same-input reruns cache-friendly) */
     ofmt->flags |= AVFMT_FLAG_BITEXACT;
 
-    if (!image)
+    if (!image) { /* progress rides the video frames, or audio-only's audio */
         progress_start("encoding:");
+        video.prog = !audio_only;
+        audio.prog = audio_only;
+    }
     if (!audio_only && (ret = init_video(&video, ifmt, ofmt, vidx, image)) < 0)
         goto end;
     if (aidx >= 0 && (ret = init_audio(&audio, ifmt, ofmt, aidx)) < 0)
         goto end;
-    if (audio_only)
-        audio.prog = 1; /* drive the progress bar off the audio frames */
 
     if (!(pkt = av_packet_alloc())) {
         ret = AVERROR(ENOMEM);
@@ -1643,6 +1649,14 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
     if (ret < 0)
         goto end;
 
+    /* the peek's still, pushed like any decoded frame; its input is already at
+     * EOF, so the read loop falls straight through to the flush */
+    if (peeked.still) {
+        av_frame_move_ref(video.dec_frame, peeked.still);
+        if ((ret = push_frame(ofmt, &video)) < 0)
+            goto end;
+    }
+
     while ((ret = av_read_frame(ifmt, pkt)) >= 0) {
         if (video.dec && pkt->stream_index == video.in_index)
             ret = decode_packet(ofmt, &video, pkt);
@@ -1663,18 +1677,19 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
 
 end:
     progress_done(); /* leave stderr on a clean line for any error below */
+    av_frame_free(&peeked.still);
     free_pipe(&video);
     free_pipe(&audio);
     av_packet_free(&pkt);
     avformat_close_input(&ifmt);
     close_stdin_io(&io);
     if (ofmt) {
-        if (mem_out && ofmt->pb) {
+        if (mem_out && ofmt->pb) { /* the piped AVIF, assembled in memory */
             uint8_t *buf = NULL;
             int n = avio_close_dyn_buf(ofmt->pb, &buf);
 
             ofmt->pb = NULL;
-            if (ret >= 0 && (ret = emit_output(out_pipe, out_path, buf, n)) < 0)
+            if (ret >= 0 && (ret = write_all(STDOUT_FILENO, buf, n)) < 0)
                 av_log(NULL, AV_LOG_ERROR, "cannot write output: %s\n",
                        err2str(ret));
             av_free(buf);
@@ -1705,19 +1720,6 @@ end:
     return 0;
 }
 
-/* first two bytes are the gzip magic (1f 8b)? */
-static int is_gzip(const char *path)
-{
-    unsigned char b[2] = { 0, 0 };
-    FILE         *f    = fopen(path, "rb");
-
-    if (!f)
-        return 0;
-    size_t r = fread(b, 1, sizeof b, f);
-    fclose(f);
-    return r == 2 && b[0] == 0x1f && b[1] == 0x8b;
-}
-
 /* a browser-facing file extension for the common web asset types `file` reports
  * (empty when unmapped — the caller then keeps the source name's extension) */
 static const char *mime_to_ext(const char *mime)
@@ -1741,7 +1743,7 @@ static const char *mime_to_ext(const char *mime)
         { "audio/ogg", "ogg" },      { "audio/aac", "aac" },
         { "audio/aiff", "aiff" },    { "audio/mp4", "m4a" },
     };
-    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(map); i++)
         if (!strcmp(mime, map[i].mime))
             return map[i].ext;
     return "";
@@ -1768,7 +1770,8 @@ static void peek_identify(const char *path, char *mime, size_t mn,
     }
 
     const char *t      = NULL;
-    int         gz_src = is_gzip(path);
+    gzFile      gz     = gzopen(path, "rb"); /* gzdirect: not the gzip magic */
+    int         gz_src = gz && !gzdirect(gz);
     if (gz_src) {
         /* inflate up to CAP bytes, not just a header: libmagic's compiled-in
          * whole-document detectors (JSON, CSV) reject a truncated fragment, so
@@ -1777,9 +1780,8 @@ static void peek_identify(const char *path, char *mime, size_t mn,
          * document libmagic would scan on the uncompressed magic_file() path. */
         const size_t   CAP  = 10u * 1024 * 1024;
         unsigned char *head = (unsigned char *)av_malloc(CAP);
-        gzFile         gz   = gzopen(path, "rb");
 
-        if (head && gz) {
+        if (head) {
             size_t off = 0;
             int    n;
             while (off < CAP &&
@@ -1789,12 +1791,12 @@ static void peek_identify(const char *path, char *mime, size_t mn,
                 t = magic_buffer(m, head, off); /* t points into libmagic's own
                                                  * buffer, safe past av_free */
         }
-        if (gz)
-            gzclose(gz);
         av_free(head);
     } else {
         t = magic_file(m, path);
     }
+    if (gz)
+        gzclose(gz);
 
     if (t && *t) {
         av_strlcpy(mime, t, mn);
@@ -1823,7 +1825,7 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, int video, char *mime,
         if (v)
             mt = v;
         size_t n = strcspn(mt, ",");
-        av_strlcpy(mime, mt, n + 1 < mn ? n + 1 : mn);
+        av_strlcpy(mime, mt, FFMIN(n + 1, mn));
         return;
     }
     static const struct {
@@ -1834,7 +1836,7 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, int video, char *mime,
         { "aiff", "audio/aiff" },
     };
     const char *n = ifmt->iformat->name;
-    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(map); i++)
         if (!strcmp(n, map[i].name)) {
             av_strlcpy(mime, map[i].mime, mn);
             return;
@@ -1842,7 +1844,7 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, int video, char *mime,
     /* the mov/mp4/m4a family is one comma-joined demuxer name: an mp4 when it
      * carries a video stream webify won't transcode (no decoder, or over
      * --max-pixels), else audio (m4a) */
-    if (strstr(n, "mp4"))
+    if (av_match_name("mp4", n))
         av_strlcpy(mime, video ? "video/mp4" : "audio/mp4", mn);
 }
 
@@ -1859,7 +1861,7 @@ static int webify_peek(const char *in_path)
     AVFormatContext *ifmt = NULL;
     StdinIO          io   = {};
     char        mime[256] = "", ext[16] = "", enc[16] = "";
-    int         supported = 0, vidx = -1;
+    int         supported = 0, vidx = -1, aidx = -1;
     const char *mt, *ex;
 
     av_log_set_level(AV_LOG_FATAL); /* a non-media input failing to open is the
@@ -1868,40 +1870,25 @@ static int webify_peek(const char *in_path)
     int ret    = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
                                   : avformat_open_input(&ifmt, in_path, NULL, NULL);
     int opened = ret >= 0 && find_stream_info(ifmt) >= 0;
-    int aidx   = opened ? av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
-    /* a real (non-cover-art) video stream means image/video mode; only audio
-     * means audio-only mode — the same split webify_run makes */
-    int has_video = opened &&
-        (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
-        !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC);
-    /* the transcode's own gate: a known size within --max-pixels. A canvas over
-     * it, or one the probe decoder refused to size (a PNG bomb reads 0x0), is
-     * rejected by webify_run — so report the source's type, not an output the
-     * transcode won't produce */
-    int sized = has_video &&
-        pixels_ok(ifmt->streams[vidx]->codecpar->width,
-                  ifmt->streams[vidx]->codecpar->height) &&
-        ifmt->streams[vidx]->codecpar->width > 0 &&
-        ifmt->streams[vidx]->codecpar->height > 0;
+    /* the same split and canvas gate webify_run applies, so a supported:true
+     * never promises an output the transcode then rejects (an unsizable or
+     * over-large canvas reports the source's type instead) */
+    enum InputKind kind = opened ? pick_streams(ifmt, &vidx, &aidx) : IN_NONE;
+    int st = kind == IN_AUDIO ? aidx : vidx;
 
-    if (sized && avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
-        /* a video stream webify can actually decode (not just a demuxer match —
-         * e.g. SVG is recognized but has no decoder): transcodes to avif/mp4 */
+    /* a stream webify can actually decode (not just a demuxer match — e.g. SVG
+     * is recognized but has no decoder): transcodes to avif/mp4/m4a */
+    if (kind != IN_NONE && avcodec_find_decoder(ifmt->streams[st]->codecpar->codec_id) &&
+        (kind == IN_AUDIO || check_canvas(ifmt->streams[st], in_path) >= 0)) {
         supported = 1;
-        output_type(input_is_image(ifmt, vidx, aidx), 0, &mt, &ex);
-        av_strlcpy(mime, mt, sizeof mime);
-        av_strlcpy(ext, ex, sizeof ext);
-    } else if (!has_video && aidx >= 0 &&
-               avcodec_find_decoder(ifmt->streams[aidx]->codecpar->codec_id)) {
-        /* audio-only webify can decode: transcodes the audio to AAC in an .m4a */
-        supported = 1;
-        output_type(0, 1, &mt, &ex);
+        output_type(kind == IN_IMAGE, kind == IN_AUDIO, &mt, &ex);
         av_strlcpy(mime, mt, sizeof mime);
         av_strlcpy(ext, ex, sizeof ext);
     } else if (opened) {
         /* FFmpeg recognized the container but webify can't transcode it (an
-         * undecodable codec): report the type FFmpeg already knows */
-        ffmpeg_mime(ifmt, has_video, mime, sizeof mime);
+         * undecodable codec, an unsizable/over-large canvas): report the type
+         * FFmpeg already knows */
+        ffmpeg_mime(ifmt, kind >= IN_IMAGE, mime, sizeof mime);
         if (*mime)
             av_strlcpy(ext, mime_to_ext(mime), sizeof ext);
     }
@@ -1943,13 +1930,6 @@ static int webify_peek(const char *in_path)
 #error "webify sandbox: unsupported architecture"
 #endif
 
-/* the temp directory make_temp / the input spool use — Landlock must grant it */
-static const char *tmp_dir(void)
-{
-    const char *d = getenv("TMPDIR");
-    return d && *d ? d : "/tmp";
-}
-
 /* Landlock has no musl wrappers — raw syscalls. __NR_* resolve per-arch. */
 static long ll_create_ruleset(const struct landlock_ruleset_attr *attr,
                               size_t size, __u32 flags)
@@ -1982,25 +1962,12 @@ static void ll_allow(int rs, const char *path, __u64 access)
     close(fd);
 }
 
-/* the directory holding `path`, into `out` ("." when it has no slash) */
-static void parent_dir(const char *path, char *out, size_t n)
-{
-    const char *slash = strrchr(path, '/');
-
-    if (!slash)
-        av_strlcpy(out, ".", n);
-    else if (slash == path)
-        av_strlcpy(out, "/", n);
-    else
-        av_strlcpy(out, path, (size_t)(slash - path) + 1 < n
-                                  ? (size_t)(slash - path) + 1 : n);
-}
-
 /* fence the filesystem to exactly what a transcode touches: the temp dir (the
  * input spool + the piped-output temp), the input file, and the output's
  * directory. Best-effort — a kernel without Landlock (or an older ABI) gets
- * fewer rights or none, and webify still runs. in_path/out_path are NULL for a
- * pipe end (its fd is already open; Landlock doesn't gate pipes). */
+ * fewer rights or none, and webify still runs. out_path is NULL for --peek; a
+ * pipe end needs no grant (its fd is already open; Landlock doesn't gate
+ * pipes). */
 static void sandbox_fs(const char *in_path, const char *out_path)
 {
     struct landlock_ruleset_attr attr = {};
@@ -2027,11 +1994,12 @@ static void sandbox_fs(const char *in_path, const char *out_path)
         return;
     }
 
-    ll_allow(rs, tmp_dir(), rw_dir); /* spool + piped-output temp */
-    ll_allow(rs, in_path, ro_file);  /* the input file (read)     */
-    if (out_path) {                  /* the output's directory    */
-        parent_dir(out_path, dir, sizeof(dir));
-        ll_allow(rs, dir, rw_dir);
+    ll_allow(rs, tmp_dir(), rw_dir);     /* spool + piped-output temp */
+    if (!is_pipe(in_path))
+        ll_allow(rs, in_path, ro_file);  /* the input file (read)     */
+    if (out_path && !is_pipe(out_path)) { /* the output's directory   */
+        av_strlcpy(dir, out_path, sizeof(dir));
+        ll_allow(rs, dirname(dir), rw_dir);
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || ll_restrict_self(rs, 0))
@@ -2116,8 +2084,8 @@ static const int seccomp_allow[] = {
 
 static void sandbox_seccomp(void)
 {
-    const size_t K = sizeof(seccomp_allow) / sizeof(seccomp_allow[0]);
-    struct sock_filter f[2 * (sizeof(seccomp_allow) / sizeof(int)) + 16];
+    const size_t K = FF_ARRAY_ELEMS(seccomp_allow);
+    struct sock_filter f[2 * FF_ARRAY_ELEMS(seccomp_allow) + 16];
     struct sock_fprog prog;
     size_t n = 0;
 #define PUSH(...) do { struct sock_filter _f = __VA_ARGS__; f[n++] = _f; } while (0)
@@ -2222,6 +2190,9 @@ static int sandbox_selftest(void)
     pid_t pid = fork();
 
     if (pid == 0) {
+        /* its SIGSYS death dumps core by default — ~1 s through a piped core
+         * handler — and there is nothing to debug in it */
+        prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
         sandbox_apply("pipe:0", NULL);
         syscall(__NR_socket, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 0);
         _exit(0); /* socket() returned — not blocked */
@@ -2325,20 +2296,32 @@ bad:
     return -1;
 }
 
+/* a non-negative integer option value; -1 (after the error) when it isn't */
+static long parse_nonneg(const char *name, const char *arg)
+{
+    char *end;
+    long  v = strtol(arg, &end, 10);
+
+    if (*end || end == arg || v < 0) {
+        fprintf(stderr, "webify: --%s must be >= 0, got '%s'\n", name, arg);
+        return -1;
+    }
+    return v;
+}
+
 #ifdef WEBIFY_FUZZER
 /* libFuzzer entry (Dockerfile `fuzz` stage): drive the demux + first-frame
  * decode path — the --peek/probe CVE surface — over the input bytes in memory,
- * reusing the real code (the same StdinIO mem buffer, open_with_pb and
- * peek_first_frame a real --peek uses). No encode, no stdout; the --max-pixels
- * guard stays on (opt keeps its default) so a crafted giant canvas can't OOM
- * the fuzzer. No sandbox here — fuzzing wants raw access. */
+ * reusing the real code (the slurped-stdin StdinIO path, open_with_pb and
+ * peek_first_frame). No encode, no stdout; the --max-pixels guard stays on
+ * (opt keeps its default) so a crafted giant canvas can't OOM the fuzzer. No
+ * sandbox here — fuzzing wants raw access. */
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     static const int quiet = (av_log_set_level(AV_LOG_QUIET), 0);
     AVFormatContext *ifmt = NULL;
     StdinIO io = {};
-    uint8_t *iobuf = NULL;
-    int vidx = -1;
+    int vidx;
     (void)quiet;
 
     if (size == 0 || size > (32u << 20)) /* bound the input */
@@ -2349,31 +2332,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     memset(io.buf + size, 0, AVPROBE_PADDING_SIZE);
     io.size = size;
 
-    if (!(iobuf = (uint8_t *)av_malloc(IO_BUFSIZE))) {
-        av_free(io.buf);
-        return 0;
-    }
-    io.pb = avio_alloc_context(iobuf, IO_BUFSIZE, 0, &io, mem_read, NULL, mem_seek);
-    if (!io.pb) {
-        av_free(iobuf);
-        av_free(io.buf);
-        return 0;
-    }
-
-    if (open_with_pb(&ifmt, io.pb) >= 0) { /* frees ifmt itself on failure */
+    /* open_with_pb frees ifmt itself on failure */
+    if (alloc_stdin_pb(&io, mem_read, mem_seek) >= 0 &&
+        open_with_pb(&ifmt, io.pb) >= 0) {
         ifmt->probesize            = 1 << 20;
         ifmt->max_analyze_duration = AV_TIME_BASE;
-        if (find_stream_info(ifmt) >= 0) {
-            vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-            if (vidx >= 0)
-                peek_first_frame(ifmt, vidx, 1); /* side data + bomb guard */
+        /* any video stream, cover art included: more decoders under the fuzzer */
+        if (find_stream_info(ifmt) >= 0 &&
+            (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0) {
+            peek_first_frame(ifmt, vidx, 1); /* side data + bomb guard */
+            av_frame_free(&peeked.still);
         }
     }
 
-    avformat_close_input(&ifmt); /* the custom pb survives this (see reopen) */
-    av_freep(&io.pb->buffer);
-    avio_context_free(&io.pb);
-    av_free(io.buf);
+    avformat_close_input(&ifmt); /* the custom pb survives this */
+    close_stdin_io(&io);
     return 0;
 }
 #else
@@ -2419,20 +2392,12 @@ int main(int argc, char **argv)
             peek = 1;
             break;
         case OPT_MAXPIX:
-            opt.max_pixels = strtol(optarg, &end, 10);
-            if (*end || end == optarg || opt.max_pixels < 0) {
-                fprintf(stderr, "webify: --max-pixels must be >= 0, got '%s'\n",
-                        optarg);
+            if ((opt.max_pixels = parse_nonneg("max-pixels", optarg)) < 0)
                 return 2;
-            }
             break;
         case OPT_TIMEOUT:
-            opt.timeout = (int)strtol(optarg, &end, 10);
-            if (*end || end == optarg || opt.timeout < 0) {
-                fprintf(stderr, "webify: --timeout must be >= 0, got '%s'\n",
-                        optarg);
+            if ((opt.timeout = (int)parse_nonneg("timeout", optarg)) < 0)
                 return 2;
-            }
             break;
         case 'q':
             opt.quality = strtod(optarg, &end);
@@ -2450,19 +2415,18 @@ int main(int argc, char **argv)
             return usage(stderr, 2);
         }
     }
-    /* --peek takes exactly one input and no output (it never writes media) */
-    if (peek) {
-        if (emit_json || argc - optind != 1)
-            return usage(stderr, 2);
-        const char *in = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
-        sandbox_apply(is_pipe(in) ? NULL : in, NULL);
-        return webify_peek(in);
-    }
-    if (argc - optind < 1 || argc - optind > 2)
+    /* --peek takes exactly one input and no output (it never writes media);
+     * a transcode takes an input and an optional output */
+    if (peek ? emit_json || argc - optind != 1
+             : argc - optind < 1 || argc - optind > 2)
         return usage(stderr, 2);
     /* the '-' convention lives in the ffmpeg CLI, not libavformat;
      * <output> may be omitted entirely and defaults to stdout */
-    const char *in  = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
+    const char *in = strcmp(argv[optind], "-") ? argv[optind] : "pipe:0";
+    if (peek) {
+        sandbox_apply(in, NULL);
+        return webify_peek(in);
+    }
     const char *out = argc - optind < 2 || !strcmp(argv[optind + 1], "-")
                           ? "pipe:1" : argv[optind + 1];
     /* --json reports on stdout, so the media must go to a file, not stdout */
@@ -2472,7 +2436,7 @@ int main(int argc, char **argv)
         return 2;
     }
     /* fence the process before a single byte of the input is opened */
-    sandbox_apply(is_pipe(in) ? NULL : in, is_pipe(out) ? NULL : out);
+    sandbox_apply(in, out);
     return webify_run(in, out, emit_json);
 }
 #endif /* WEBIFY_FUZZER */

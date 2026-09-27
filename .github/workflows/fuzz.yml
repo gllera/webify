@@ -26,30 +26,18 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       # Build the clang/libFuzzer binary. Same per-library layer cache as the
-      # normal build, so the vendored stack restores instead of recompiling.
+      # normal build, so the vendored stack restores instead of recompiling, plus
+      # this workflow's own scope for the clang stage and the fuzz compile.
       - name: Build fuzz binary
         uses: docker/build-push-action@v7
         with:
           context: .
           target: fuzz-bin
           outputs: type=local,dest=fuzzbin
-          cache-from: type=gha,scope=webify-amd64
+          cache-from: |
+            type=gha,scope=webify-amd64
+            type=gha,scope=webify-fuzz
           cache-to: type=gha,scope=webify-fuzz,mode=max
-
-      # A seed corpus of small real media so the fuzzer starts from valid
-      # headers of each demuxer webify accepts, not from zero.
-      - name: Seed corpus
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-          mkdir -p corpus
-          ff() { ffmpeg -hide_banner -loglevel error -y "$@"; }
-          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/a.png
-          ff -f lavfi -i "testsrc2=size=48x48:d=1:r=4" corpus/b.gif
-          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=10" -f lavfi -i "sine=d=1" \
-             -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest corpus/c.mp4
-          ff -i corpus/c.mp4 -c copy corpus/d.mkv
-          ff -f lavfi -i "sine=d=1" corpus/e.wav
-          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/f.jpg
 
       # Accumulate interesting inputs across weekly runs.
       - name: Restore corpus cache
@@ -58,6 +46,26 @@ jobs:
           path: corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
+
+      # A seed corpus of small real media so the fuzzer starts from valid
+      # headers of each demuxer webify accepts, not from zero. Only on a cold
+      # cache: a restored corpus already holds these seeds.
+      - name: Seed corpus
+        run: |
+          mkdir -p corpus
+          if [ -n "$(find corpus -type f -print -quit)" ]; then
+            echo "Restored corpus: $(find corpus -type f | wc -l) inputs, seeding skipped."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+          ff() { ffmpeg -hide_banner -loglevel error -y "$@"; }
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/a.png
+          ff -f lavfi -i "testsrc2=size=48x48:d=1:r=4" corpus/b.gif
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=10" -f lavfi -i "sine=d=1" \
+             -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest corpus/c.mp4
+          ff -i corpus/c.mp4 -c copy corpus/d.mkv
+          ff -f lavfi -i "sine=d=1" corpus/e.wav
+          ff -f lavfi -i "testsrc2=size=64x64:d=1:r=1" -frames:v 1 corpus/f.jpg
 
       # The binary is dynamic musl, so run it inside Alpine (libFuzzer +
       # libstdc++). A crash writes crash-<hash> to the mount, failing the run.

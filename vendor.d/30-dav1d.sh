@@ -6,10 +6,12 @@ set -euo pipefail
 DAV1D_VERSION=1.5.3
 # sha256 matches the publisher's checksum file
 DAV1D_SHA256=732010aa5ef461fa93355ed2c6c5fedb48ddc4b74e697eaabe8907eaeb943011
+# tarball URL, @V@ = DAV1D_VERSION (update-vendor.sh probes with it too)
+DAV1D_URL=https://downloads.videolan.org/pub/videolan/dav1d/@V@/dav1d-@V@.tar.xz
 
 built dav1d && exit 0
 
-fetch "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D_VERSION/dav1d-$DAV1D_VERSION.tar.xz" dav1d "$DAV1D_SHA256"
+fetch "${DAV1D_URL//@V@/$DAV1D_VERSION}" dav1d "$DAV1D_SHA256"
 echo "==> building dav1d"
 (cd "$SRC/dav1d" && \
     meson setup build --prefix="$PREFIX" --libdir=lib \

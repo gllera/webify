@@ -51,27 +51,31 @@ COPY --from=zimg  /build/vendor/out vendor/out
 COPY vendor.d/80-ffmpeg.sh vendor.d/
 RUN vendor.d/80-ffmpeg.sh
 
-FROM base AS build
+# What both compiles (release `build`, libFuzzer `fuzz`) link against, resolved
+# once: the vendored static libs, their flags written to ./cflags and ./ldlibs,
+# and the compiled libmagic database embedded as an object (symbols
+# _binary_magic_mgc_{start,end}) so the binary needs no external magic file.
+# libmagic + zlib link directly (no .pc): -I/-L vendor/out, -lmagic, -lz.
+FROM base AS link
 COPY --from=ffmpeg   /build/vendor/out vendor/out
 COPY --from=libmagic /build/vendor/out vendor/out
+RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
+    export PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig && \
+    echo "$(pkg-config --cflags $libs) -Ivendor/out/include" > cflags && \
+    echo "$(pkg-config --libs --static $libs) -Lvendor/out/lib -lmagic -lz" > ldlibs && \
+    cp vendor/out/share/misc/magic.mgc magic.mgc && \
+    ld -r -b binary magic.mgc -o magic_mgc.o
+
+FROM link AS build
 COPY src ./src
-ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
 # the version --version reports: CI passes the release tag on tag builds,
 # everything else self-identifies as a dev build
 ARG VERSION=dev
-RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
-    # embed the compiled libmagic database as an object (symbols
-    # _binary_magic_mgc_{start,end}) so the binary needs no external magic file
-    cp vendor/out/share/misc/magic.mgc magic.mgc && \
-    ld -r -b binary magic.mgc -o magic_mgc.o && \
-    # -no-pie: drop the static-PIE self-relocation table (musl/gcc default
-    # to PIE); the vendored libs are --enable-pic so they link clean. ~3% smaller.
-    # libmagic + zlib link directly (no .pc): -I/-L vendor/out, -lmagic, -lz.
-    g++ -Os -static -no-pie -fno-pie -Wall -Wextra -ffunction-sections -fdata-sections \
+# -no-pie: drop the static-PIE self-relocation table (musl/gcc default to PIE);
+# the vendored libs are --enable-pic so they link clean. ~3% smaller.
+RUN g++ -Os -static -no-pie -fno-pie -Wall -Wextra -ffunction-sections -fdata-sections \
         -DWEBIFY_VERSION="\"$VERSION\"" \
-        $(pkg-config --cflags $libs) -Ivendor/out/include \
-        src/webify.cpp magic_mgc.o -o /webify \
-        $(pkg-config --libs --static $libs) -Lvendor/out/lib -lmagic -lz \
+        $(cat cflags) src/webify.cpp magic_mgc.o -o /webify $(cat ldlibs) \
         -Wl,--gc-sections -s && \
     ls -lh /webify
 
@@ -81,22 +85,19 @@ ARG COMPRESS=0
 RUN if [ "$COMPRESS" = "1" ]; then apk add --no-cache upx && upx --best --lzma /webify; fi
 
 # libFuzzer build of the demux + first-frame decode path (the --peek CVE
-# surface), compiled with clang against the same vendored static libs. Not part
-# of the default build — fuzz.yml (weekly) builds `fuzz-bin` and runs it. Dynamic
-# (not -static): the libFuzzer/compiler-rt runtime needs it. -Wno-unused-function
+# surface), compiled with clang against the same `link` inputs. Not part of the
+# default build — fuzz.yml (weekly) builds `fuzz-bin` and runs it. clang sits in
+# its own stage off `base`, so a vendor bump doesn't re-install it. Dynamic (not
+# -static): the libFuzzer/compiler-rt runtime needs it. -Wno-unused-function
 # because main() and the encode path are #ifdef'd out under WEBIFY_FUZZER.
-FROM ffmpeg AS fuzz
+FROM base AS clang
 RUN apk add --no-cache clang compiler-rt
-COPY --from=libmagic /build/vendor/out vendor/out
+
+FROM clang AS fuzz
+COPY --from=link /build /build
 COPY src ./src
-ENV PKG_CONFIG_PATH=/build/vendor/out/lib/pkgconfig
-RUN libs="libavfilter libavformat libavcodec libswscale libswresample libavutil" && \
-    cp vendor/out/share/misc/magic.mgc magic.mgc && \
-    ld -r -b binary magic.mgc -o magic_mgc.o && \
-    clang++ -g -O1 -DWEBIFY_FUZZER -fsanitize=fuzzer -Wno-unused-function \
-        $(pkg-config --cflags $libs) -Ivendor/out/include \
-        src/webify.cpp magic_mgc.o -o /webify_fuzz \
-        $(pkg-config --libs --static $libs) -Lvendor/out/lib -lmagic -lz && \
+RUN clang++ -g -O1 -DWEBIFY_FUZZER -fsanitize=fuzzer -Wno-unused-function \
+        $(cat cflags) src/webify.cpp magic_mgc.o -o /webify_fuzz $(cat ldlibs) && \
     ls -lh /webify_fuzz
 
 FROM scratch AS fuzz-bin

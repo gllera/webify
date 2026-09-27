@@ -7,6 +7,10 @@
 # per library, exits 2 if any upstream check failed (and still applies the
 # bumps that succeeded).
 #
+# Each script declares its tarball URL once as <P>_URL (with @V@ for the
+# version), which this reads the same way it reads <P>_VERSION — the URL the
+# bump hashes is always the URL the build fetches.
+#
 # Where the publisher signs a checksum file (dav1d) the new sha256 pin is taken
 # from that file and the build's own fetch verifies the bytes; for the rest the
 # pin is the hash of a fresh download, the same trust-on-first-use model the
@@ -36,18 +40,21 @@ dav1d_versions()  { get https://downloads.videolan.org/pub/videolan/dav1d/ | gre
 aom_versions()    { get 'https://storage.googleapis.com/aom-releases/' | grep -oE '<Key>libaom-[0-9]+(\.[0-9]+)*\.tar\.gz</Key>' | grep -oE '[0-9]+(\.[0-9]+)*'; }
 zimg_versions()   { git ls-remote --tags https://github.com/sekrit-twc/zimg.git 'release-*' | grep -oE 'refs/tags/release-[0-9]+(\.[0-9]+)*$' | sed 's|.*release-||'; }
 ffmpeg_versions() { get https://ffmpeg.org/releases/ | grep -oE 'ffmpeg-[0-9]+(\.[0-9]+)*\.tar\.xz' | grep -oE '[0-9]+(\.[0-9]+)*'; }
+file_versions()   { get https://astron.com/pub/file/ | grep -oE 'file-[0-9]+(\.[0-9]+)*\.tar\.gz' | grep -oE '[0-9]+(\.[0-9]+)*'; }
 
 # ---- publisher checksum files (sha pinned from the file, fetch verifies) ----
 
 dav1d_sha() { get "https://downloads.videolan.org/pub/videolan/dav1d/$1/dav1d-$1.tar.xz.sha256" | cut -d' ' -f1; }
 
-# ---- generic bump: check <script> <VAR prefix> <url, @V@=version> \
-#                          <versions-fn> [publisher-sha-fn] ------------------
+# ---- generic bump: check <script> <VAR prefix> <versions-fn> \
+#                          [publisher-sha-fn] --------------------------------
 
 check() {
-    local f=$1 prefix=$2 tmpl=$3 versions_fn=$4 sha_fn=${5:-}
-    local cur new url sha
+    local f=$1 prefix=$2 versions_fn=$3 sha_fn=${4:-}
+    local cur new tmpl url sha
     cur=$(var "$f" "${prefix}_VERSION")
+    tmpl=$(var "$f" "${prefix}_URL")
+    if [ -z "$tmpl" ]; then fail "$f: no ${prefix}_URL template"; return; fi
     new=$("$versions_fn" | latest) || true
     if [ -z "$new" ]; then fail "$f: could not determine latest upstream version"; return; fi
     if ! newer "$cur" "$new"; then echo "ok    $f: $cur (latest)"; return; fi
@@ -72,7 +79,8 @@ check_x264() {
     new=$(git ls-remote https://code.videolan.org/videolan/x264.git refs/heads/stable | cut -f1) || true
     if [ -z "$new" ]; then fail "$f: could not resolve stable branch tip"; return; fi
     if [ "$cur" = "$new" ]; then echo "ok    $f: ${cur:0:9} (stable tip)"; return; fi
-    url="https://code.videolan.org/videolan/x264/-/archive/$new/x264-$new.tar.gz"
+    url=$(var "$f" X264_URL)
+    url=${url//@V@/$new}
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' RETURN
     if ! get "$url" -o "$tmp/x264.tar.gz"; then fail "$f: download failed: $url"; return; fi
@@ -89,11 +97,12 @@ check_x264() {
     echo "bump  $f: ${cur:0:9} -> ${new:0:9} (build $build, $date)"
 }
 
-check 00-nasm.sh   NASM   'https://www.nasm.us/pub/nasm/releasebuilds/@V@/nasm-@V@.tar.xz'                  nasm_versions
-check 30-dav1d.sh  DAV1D  'https://downloads.videolan.org/pub/videolan/dav1d/@V@/dav1d-@V@.tar.xz'          dav1d_versions dav1d_sha
-check 40-aom.sh    AOM    'https://storage.googleapis.com/aom-releases/libaom-@V@.tar.gz'                   aom_versions
+check 00-nasm.sh     NASM   nasm_versions
+check 30-dav1d.sh    DAV1D  dav1d_versions dav1d_sha
+check 40-aom.sh      AOM    aom_versions
+check 50-libmagic.sh FILE   file_versions
 check_x264
-check 70-zimg.sh   ZIMG   'https://github.com/sekrit-twc/zimg/archive/refs/tags/release-@V@.tar.gz'         zimg_versions
-check 80-ffmpeg.sh FFMPEG 'https://ffmpeg.org/releases/ffmpeg-@V@.tar.xz'                                   ffmpeg_versions
+check 70-zimg.sh     ZIMG   zimg_versions
+check 80-ffmpeg.sh   FFMPEG ffmpeg_versions
 
 exit $((FAILED ? 2 : 0))

@@ -43,7 +43,9 @@ Two flags exist for asset-self-hosting integration (e.g. SRR's `asset-peek` /
   `{"mimetype","extension"}`. Purely additive: the media bytes are byte-identical
   to a run without it (asserted in `test.sh`); rejected with a stdout `<output>`.
 
-`--peek` lives in `webify_peek` / `peek_identify` / `mime_to_ext` / `is_gzip`;
+`--peek` lives in `webify_peek` (sharing `pick_streams` / `check_canvas` with the
+transcode, so its verdict can't drift from what `webify_run` accepts) /
+`peek_identify` / `mime_to_ext`;
 `--json` in the `emit_json` tail of `webify_run`. **libmagic** is vendored
 (`vendor.d/50-libmagic.sh`, file 5.46, static) and its magic database is
 recompiled to a **curated** subset (`MAGIC_SET` = documents, markup, fonts — the
@@ -125,9 +127,9 @@ FUZZ=1 ./build.sh # export the libFuzzer binary to ./dist/webify_fuzz
 8. **EXIF/display-matrix rotation baked in; interlaced video deinterlaced
    (bwdif); HDR (PQ/HLG) video tonemapped to SDR bt709.**
 9. **The sandbox never changes output bytes and encodes stay byte-stable across
-   core counts.** Every encoded path (x264, libaom, aac) is thread-deterministic;
-   only the zimg/zscale HDR tonemap is not (excluded from the golden set). The
-   golden hashes (`goldens/<arch>.sha256`, enforced by the hermetic `test` stage)
+   core counts.** Every encoded path (x264, libaom, aac, and the HDR tonemap —
+   its error-diffusion zscale is pinned to one thread in `tonemap_spec`) is
+   thread-deterministic. The golden hashes (`goldens/<arch>.sha256`, enforced by the hermetic `test` stage)
    pin this — fixtures are `-threads 1` so their bytes don't drift with the
    runner's cores either.
 
@@ -154,7 +156,7 @@ reference pipeline to fit against.
   (`mwader/static-ffmpeg`), so fixtures (and the golden hashes) are byte-stable
   and need no host toolchain; `docker run` it enforces `WEBIFY_GOLDEN=1`. It gates
   the `release` job. Tag pattern `'[0-9]*'` publishes a GitHub Release.
-- **Golden hashes** (`goldens/<arch>.sha256`): sha256 of ~18 deterministic
+- **Golden hashes** (`goldens/<arch>.sha256`): sha256 of 19 deterministic
   outputs, per-arch (encoders aren't bit-identical across amd64/arm64). Enforced
   only under the pinned ffmpeg (the `test` stage sets `WEBIFY_GOLDEN=1`); a dev's
   `./test.sh` skips them. A **missing** arch file is a soft skip (bootstraps a new

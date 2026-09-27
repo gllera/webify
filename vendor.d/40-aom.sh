@@ -9,10 +9,12 @@ set -euo pipefail
 AOM_VERSION=3.14.1
 # pinned from a verified-good download
 AOM_SHA256=44bf90dbd23e734d50e70a8c41c285193922938bd0d3bc2ee56764d181d55ef5
+# tarball URL, @V@ = AOM_VERSION (update-vendor.sh probes with it too)
+AOM_URL=https://storage.googleapis.com/aom-releases/libaom-@V@.tar.gz
 
 built aom && exit 0
 
-fetch "https://storage.googleapis.com/aom-releases/libaom-$AOM_VERSION.tar.gz" aom "$AOM_SHA256"
+fetch "${AOM_URL//@V@/$AOM_VERSION}" aom "$AOM_SHA256"
 echo "==> building libaom"
 (mkdir -p "$SRC/aom-build" && cd "$SRC/aom-build" && \
     cmake "$SRC/aom" \

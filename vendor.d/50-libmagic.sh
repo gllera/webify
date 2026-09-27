@@ -18,6 +18,8 @@ set -euo pipefail
 
 FILE_VERSION=5.46
 FILE_SHA256=c9cc77c7c560c543135edc555af609d5619dbef011997e988ce40a3d75d86088
+# tarball URL, @V@ = FILE_VERSION (update-vendor.sh probes with it too)
+FILE_URL=https://astron.com/pub/file/file-@V@.tar.gz
 
 # magic/Magdir files compiled into the embedded database. Adding a web asset
 # type webify should identify = add its Magdir file here. A rename upstream
@@ -26,7 +28,7 @@ MAGIC_SET="pdf sgml fonts"
 
 built libmagic && exit 0
 
-fetch "https://astron.com/pub/file/file-$FILE_VERSION.tar.gz" file "$FILE_SHA256"
+fetch "${FILE_URL//@V@/$FILE_VERSION}" file "$FILE_SHA256"
 echo "==> building libmagic"
 (cd "$SRC/file" && \
     CFLAGS="-O2 -fPIC $SECTION_CFLAGS" ./configure --prefix="$PREFIX" \

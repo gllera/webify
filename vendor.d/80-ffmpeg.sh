@@ -15,10 +15,12 @@ set -euo pipefail
 FFMPEG_VERSION=8.1.2
 # pinned from a verified-good download
 FFMPEG_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+# tarball URL, @V@ = FFMPEG_VERSION (update-vendor.sh probes with it too)
+FFMPEG_URL=https://ffmpeg.org/releases/ffmpeg-@V@.tar.xz
 
 built ffmpeg && exit 0
 
-fetch "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" ffmpeg "$FFMPEG_SHA256"
+fetch "${FFMPEG_URL//@V@/$FFMPEG_VERSION}" ffmpeg "$FFMPEG_SHA256"
 echo "==> building ffmpeg"
 (cd "$SRC/ffmpeg" && \
     ./configure \

@@ -7,10 +7,12 @@ set -euo pipefail
 ZIMG_VERSION=3.0.6
 # pinned from a verified-good download
 ZIMG_SHA256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
+# tarball URL, @V@ = ZIMG_VERSION (update-vendor.sh probes with it too)
+ZIMG_URL=https://github.com/sekrit-twc/zimg/archive/refs/tags/release-@V@.tar.gz
 
 built zimg && exit 0
 
-fetch "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-$ZIMG_VERSION.tar.gz" zimg "$ZIMG_SHA256"
+fetch "${ZIMG_URL//@V@/$ZIMG_VERSION}" zimg "$ZIMG_SHA256"
 echo "==> building zimg"
 (cd "$SRC/zimg" && ./autogen.sh && \
     CXXFLAGS="-O2 -fPIC $SECTION_CFLAGS" ./configure --prefix="$PREFIX" \

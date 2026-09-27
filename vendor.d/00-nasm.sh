@@ -6,11 +6,13 @@ set -euo pipefail
 
 NASM_VERSION=3.01
 NASM_SHA256=b7324cbe86e767b65f26f467ed8b12ad80e124e3ccb89076855c98e43a9eddd4
+# tarball URL, @V@ = NASM_VERSION (update-vendor.sh probes with it too)
+NASM_URL=https://www.nasm.us/pub/nasm/releasebuilds/@V@/nasm-@V@.tar.xz
 
 built nasm && exit 0
 { command -v nasm >/dev/null || command -v yasm >/dev/null; } && exit 0
 
-fetch "https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.xz" nasm "$NASM_SHA256"
+fetch "${NASM_URL//@V@/$NASM_VERSION}" nasm "$NASM_SHA256"
 echo "==> building nasm"
 (cd "$SRC/nasm" && ./configure --prefix="$PREFIX" && make -j"$JOBS" nasm && \
     install -Dm755 nasm "$PREFIX/bin/nasm")

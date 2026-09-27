@@ -10,10 +10,12 @@ set -euo pipefail
 X264_COMMIT=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
 # pinned from a verified-good download
 X264_SHA256=cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9
+# tarball URL, @V@ = X264_COMMIT (update-vendor.sh probes with it too)
+X264_URL=https://code.videolan.org/videolan/x264/-/archive/@V@/x264-@V@.tar.gz
 
 built x264 && exit 0
 
-fetch "https://code.videolan.org/videolan/x264/-/archive/$X264_COMMIT/x264-$X264_COMMIT.tar.gz" x264 "$X264_SHA256"
+fetch "${X264_URL//@V@/$X264_COMMIT}" x264 "$X264_SHA256"
 echo "==> building x264"
 (cd "$SRC/x264" && \
     ./configure --prefix="$PREFIX" \
