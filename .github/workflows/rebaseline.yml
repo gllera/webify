@@ -80,13 +80,17 @@ jobs:
           path: goldens
 
       - name: Commit refreshed goldens
+        # stage first: an arch's first golden file (bootstrapping arm64) is
+        # untracked, and both `git diff` and `git commit -- <path>` ignore
+        # untracked files — it would never be committed
         run: |
-          if git diff --quiet -- goldens; then
+          git add goldens
+          if git diff --cached --quiet -- goldens; then
             echo "Goldens already current for both arches."
           else
             git -c user.name='github-actions[bot]' \
                 -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                commit -m 'test: refresh golden hashes' -- goldens
+                commit -m 'test: refresh golden hashes'
             git push origin HEAD:'${{ github.event.inputs.ref }}'
           fi
 
