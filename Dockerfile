@@ -110,7 +110,7 @@ COPY --from=fuzz /webify_fuzz /webify_fuzz
 # `-e REBASELINE=1 -v "$PWD/goldens:/src/goldens"` to refresh them on the host.
 FROM alpine:3.24 AS test
 RUN apk add --no-cache bash coreutils findutils grep gawk sed python3
-COPY --from=mwader/static-ffmpeg:8.0@sha256:415a41fa3167b890b9703d20bd0f00bf1e9dab8a4b6c27fef1445b2bf5f1ab4a \
+COPY --from=mwader/static-ffmpeg:9.0.2@sha256:7d9bdaaf887f7e6ce6151f67325c344074b5ff1fb75316011c3376503e449a7b \
      /ffmpeg /ffprobe /usr/local/bin/
 COPY --from=build /webify /usr/local/bin/webify
 WORKDIR /src

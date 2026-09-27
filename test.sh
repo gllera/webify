@@ -146,7 +146,7 @@ fx ff -f lavfi -i "color=c=red@0.5:size=320x240:rate=1,format=rgba" -frames:v 1 
 fx ff -f lavfi -i "color=c=red:size=320x240:rate=1,format=rgba" -frames:v 1 opaque.png # alpha channel, all 0xFF
 # PQ-tagged HDR. setparams stamps the frame-level color tags so they survive
 # across ffmpeg versions — a bare -color_trc doesn't land on the stream under
-# ffmpeg 8 (the hermetic test toolchain), leaving webify nothing to tonemap.
+# ffmpeg 8+ (the hermetic test toolchain), leaving webify nothing to tonemap.
 fx ff -f lavfi -i "testsrc2=size=640x480:duration=1:rate=30" \
    -vf "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
    -c:v libx264 -threads 1 -pix_fmt yuv420p \

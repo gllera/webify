@@ -16,8 +16,8 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-FILE_VERSION=5.46
-FILE_SHA256=c9cc77c7c560c543135edc555af609d5619dbef011997e988ce40a3d75d86088
+FILE_VERSION=5.48
+FILE_SHA256=ed14656883b23a364b4057c05595d93252da9bc473d30106519519d0da141283
 # tarball URL, @V@ = FILE_VERSION (update-vendor.sh probes with it too)
 FILE_URL=https://astron.com/pub/file/file-@V@.tar.gz
 

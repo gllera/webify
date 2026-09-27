@@ -4,8 +4,8 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-NASM_VERSION=3.01
-NASM_SHA256=b7324cbe86e767b65f26f467ed8b12ad80e124e3ccb89076855c98e43a9eddd4
+NASM_VERSION=3.02
+NASM_SHA256=87336eba53b4acfe917424ab5d500d2b0054d9f5148d35c2273ccf2cfb712f0d
 # tarball URL, @V@ = NASM_VERSION (update-vendor.sh probes with it too)
 NASM_URL=https://www.nasm.us/pub/nasm/releasebuilds/@V@/nasm-@V@.tar.xz
 

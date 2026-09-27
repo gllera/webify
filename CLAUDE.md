@@ -47,7 +47,7 @@ Two flags exist for asset-self-hosting integration (e.g. SRR's `asset-peek` /
 transcode, so its verdict can't drift from what `webify_run` accepts) /
 `peek_identify` / `mime_to_ext`;
 `--json` in the `emit_json` tail of `webify_run`. **libmagic** is vendored
-(`vendor.d/50-libmagic.sh`, file 5.46, static) and its magic database is
+(`vendor.d/50-libmagic.sh`, file 5.48, static) and its magic database is
 recompiled to a **curated** subset (`MAGIC_SET` = documents, markup, fonts — the
 only non-media web assets the FFmpeg path can't decode) so the embedded `.mgc`
 is ~150 KB, not ~10 MB; the Dockerfile `build` stage embeds it via `ld -r -b
@@ -147,7 +147,7 @@ reference pipeline to fit against.
 - `vendor.d/*.sh`: one script per library, upstream release version +
   tarball sha256 pinned. Linked: **x264** (H.264 encode, GPL, pinned to the
   `stable` branch tip by commit hash), **libaom** (AV1/AVIF encode), **dav1d**
-  (AV1 decode), **zimg** (HDR tonemap), **libmagic** (file 5.46 — `--peek`
+  (AV1 decode), **zimg** (HDR tonemap), **libmagic** (file 5.48 — `--peek`
   content sniffing, curated magic db; linked into webify directly, not through
   ffmpeg). `00-nasm.sh` only builds on bare hosts.
 - `.github/workflows/build.yml`: native amd64 + arm64 builds, BuildKit layer

@@ -6,9 +6,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-AOM_VERSION=3.14.1
+AOM_VERSION=3.15.1
 # pinned from a verified-good download
-AOM_SHA256=44bf90dbd23e734d50e70a8c41c285193922938bd0d3bc2ee56764d181d55ef5
+AOM_SHA256=8ca0c52746174603500f0adb6f2a215d69c9ca2aab2acb3caa06fb791d8d01bf
 # tarball URL, @V@ = AOM_VERSION (update-vendor.sh probes with it too)
 AOM_URL=https://storage.googleapis.com/aom-releases/libaom-@V@.tar.gz
 
@@ -21,7 +21,8 @@ echo "==> building libaom"
         -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=0 \
         -DCONFIG_AV1_DECODER=0 -DCONFIG_AV1_HIGHBITDEPTH=0 \
-        -DENABLE_EXAMPLES=0 -DENABLE_TESTS=0 -DENABLE_TOOLS=0 -DENABLE_DOCS=0 \
+        -DENABLE_APPS=0 -DENABLE_EXAMPLES=0 -DENABLE_TESTS=0 -DENABLE_TOOLS=0 \
+        -DENABLE_DOCS=0 \
         -DCMAKE_C_FLAGS="-O2 -fPIC $SECTION_CFLAGS" && \
     make -j"$JOBS" && make install)
 mark aom

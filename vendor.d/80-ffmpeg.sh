@@ -12,9 +12,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-FFMPEG_VERSION=8.1.2
+FFMPEG_VERSION=9.0.2
 # pinned from a verified-good download
-FFMPEG_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 # tarball URL, @V@ = FFMPEG_VERSION (update-vendor.sh probes with it too)
 FFMPEG_URL=https://ffmpeg.org/releases/ffmpeg-@V@.tar.xz
 
