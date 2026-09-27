@@ -46,8 +46,9 @@ file arguments):
   Each part is optional: `720`, `480x854`, `720x`, `@30`, and `480x@30`
   are all valid.
 - `--max-pixels <N>` — reject any decoded frame larger than `N` pixels
-  (width×height); a decompression-bomb guard checked before the decoder
-  allocates and again per frame. Default `134217728` (128 MP — well above 8K or
+  (width×height); a decompression-bomb guard enforced inside the decoders, so an
+  over-large frame is refused before it is allocated (`--peek` reports such an
+  input as `supported:false`). Default `134217728` (128 MP — well above 8K or
   a 108 MP phone photo); `0` disables. Also `WEBIFY_MAX_PIXELS`.
 - `--timeout <S>` — kill the transcode after `S` wall-clock seconds. Default `0`
   (unlimited); a batch caller feeding untrusted input should set it. Also

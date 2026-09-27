@@ -60,6 +60,12 @@ channels() { probe a:0 channels "$1"; }
 trc()      { probe v:0 color_transfer "$1"; }
 pixfmt()   { probe v:0 pix_fmt "$1"; }
 size()     { stat -c%s "$1"; }
+# peak RSS of a command in MB (its exit status is ignored)
+peak_mb() {
+    python3 -c 'import resource, subprocess, sys
+subprocess.run(sys.argv[1:], capture_output=True)
+print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024)' "$@"
+}
 # MP4 faststart: the moov atom must precede the mdat atom
 moov_at_head() {
     python3 -c 'import sys
@@ -104,6 +110,17 @@ ff -f lavfi -i "testsrc2=size=320x240:duration=1:rate=30" \
    -c:v libx264 -threads 1 -pix_fmt yuv420p -movflags +frag_keyframe+empty_moov frag.mp4 # muted, nb_frames unknown
 # a source big/long enough that a veryslow re-encode reliably outlasts --timeout 1
 ff -f lavfi -i "testsrc2=size=1280x720:duration=8:rate=30" -c:v libx264 -pix_fmt yuv420p slow.mp4
+# a PNG bomb: 12000x12000 gray (144 MP, over the 128 MP default) in ~200 KB. Its
+# size lives only in the IHDR, so FFmpeg learns it by decoding a frame
+python3 - > bomb.png <<'EOF'
+import struct, sys, zlib
+W = H = 12000
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+c = zlib.compressobj(9); row = bytes(W + 1)
+idat = b"".join(c.compress(row) for _ in range(H)) + c.flush()
+sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 0, 0, 0, 0))
+                        + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
+EOF
 python3 - > evil.mp4 <<'EOF'                      # crafted 64-bit atom size: garbage in must not hang
 import struct, sys
 out  = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
@@ -178,6 +195,20 @@ t "sandbox: image encode works fenced"     bash -c "$W photo.png sb.avif >/dev/n
 # --max-pixels bomb guard: photo.png is 640x480 = 307200 px
 t "guard: --max-pixels 1000 rejects photo" rejects --max-pixels 1000 photo.png sb2.avif
 t "guard: --max-pixels 500000 allows photo" bash -c "$W --max-pixels 500000 photo.png sb3.avif >/dev/null 2>&1 && grep -aq ftypavif sb3.avif"
+# the bomb's size is only known by decoding it: the probe decoder gets
+# max_pixels too, so it refuses before allocating the 144 MB canvas (without
+# that, both modes peaked at ~150 MB before the guard saw the size)
+t "guard: PNG bomb rejected"               rejects bomb.png bomb.avif
+t "guard: PNG bomb never allocated"        lt "$(peak_mb "$WEBIFY" bomb.png bomb2.avif)" 64
+t "guard: --peek PNG bomb never allocated" lt "$(peak_mb "$WEBIFY" --peek bomb.png)" 64
+# --peek applies the transcode's gate: over the guard is supported:false with
+# the source's type (not a promised output the transcode then rejects)
+t "guard: --peek PNG bomb unsupported"     has "$("$WEBIFY" --peek bomb.png)" '"supported":false'
+t "guard: --peek over --max-pixels unsupported" has "$("$WEBIFY" --max-pixels 1000 --peek photo.png)" '"supported":false'
+pv=$("$WEBIFY" --max-pixels 1000 --peek tv.mp4)
+t "guard: --peek mp4 over it unsupported"  has "$pv" '"supported":false'
+t "guard: --peek mp4 over it -> video/mp4" has "$pv" '"mimetype":"video/mp4"'
+t "guard: --peek mkv over it -> video/*"   has "$("$WEBIFY" --max-pixels 1000 --peek tv.mkv)" '"mimetype":"video/webm"'
 # --timeout: a veryslow re-encode of an 8s 720p source cannot finish in 1s, and
 # the outer `timeout 20` proves webify killed itself (exit != 0 and != 124/hang)
 t "guard: --timeout 1 kills a slow encode" bash -c "timeout 20 $W --timeout 1 slow.mp4 slow_out.mp4 >/dev/null 2>&1; c=\$?; [ \$c -ne 0 ] && [ \$c -ne 124 ]"

@@ -70,9 +70,13 @@ filter):
   build, not production. Symbolic `__NR_*` (arch-resolved, `#ifdef`-guarded for the
   `*at`-only arm64 names). `--sandbox-selftest` (used by `test.sh`) forks a child,
   installs the sandbox, and attempts `socket()` to prove the filter is live.
-- **`--max-pixels N`** (default 128 MP; `WEBIFY_MAX_PIXELS`) rejects an over-large
-  canvas from the coded dims *before* the decoder allocates, and again per decoded
-  frame — a decompression-bomb guard. **`--timeout S`** (default 0/off;
+- **`--max-pixels N`** (default 128 MP; `WEBIFY_MAX_PIXELS`) is a
+  decompression-bomb guard. It rides into libavcodec as `max_pixels` on every
+  decoder — including the probe decoders `find_stream_info` opens, since a PNG's
+  size is only learned by decoding — so an over-large frame is refused *before*
+  it is allocated; the coded dims and each decoded frame are checked again
+  (`pixels_ok`). `--peek` applies the same gate: an over-limit (or unsizable)
+  canvas is `supported:false` with the source's type. **`--timeout S`** (default 0/off;
   `WEBIFY_TIMEOUT`) is a wall-clock `SIGALRM` ceiling (SRR passes it per asset).
   `RLIMIT_AS` is opt-in via `WEBIFY_MEM_MB` (address-space caps fight mmap
   allocators).

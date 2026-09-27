@@ -207,6 +207,37 @@ static int pixels_ok(int w, int h)
            (long)w * h <= opt.max_pixels;
 }
 
+/* --max-pixels as libavcodec's own max_pixels (which tops out at INT_MAX), so a
+ * decoder refuses an over-large frame before allocating it rather than handing
+ * it to pixels_ok afterwards. 0 = guard off (libavcodec's default applies) */
+static int64_t codec_max_pixels(void)
+{
+    return opt.max_pixels > 0 ? FFMIN(opt.max_pixels, (long)INT_MAX) : 0;
+}
+
+/* avformat_find_stream_info with the guard handed to the decoders it opens: it
+ * decodes a frame of any stream whose size no header carries (a PNG, say), and
+ * without max_pixels that probe allocates the whole canvas before pixels_ok
+ * ever sees its dimensions */
+static int find_stream_info(AVFormatContext *ifmt)
+{
+    AVDictionary **opts = NULL;
+    unsigned n = ifmt->nb_streams, i;
+    int ret;
+
+    if (codec_max_pixels() && n) {
+        if (!(opts = (AVDictionary **)av_calloc(n, sizeof(*opts))))
+            return AVERROR(ENOMEM);
+        for (i = 0; i < n; i++)
+            av_dict_set_int(&opts[i], "max_pixels", codec_max_pixels(), 0);
+    }
+    ret = avformat_find_stream_info(ifmt, opts);
+    for (i = 0; opts && i < n; i++)
+        av_dict_free(&opts[i]);
+    av_free(opts);
+    return ret;
+}
+
 /* ---- stdin input -----------------------------------------------------------
  * Probing the first bytes lets us pick the right strategy: image files are
  * slurped whole into memory so demuxers that need a seekable input still work
@@ -518,6 +549,8 @@ static int open_decoder(AVFormatContext *ifmt, int stream_index, AVCodecContext 
     }
     dec->pkt_timebase = st->time_base;
     dec->thread_count = 0; /* auto */
+    if (codec_max_pixels()) /* refuse a bomb frame before allocating it */
+        dec->max_pixels = codec_max_pixels();
     if (dec->codec_type == AVMEDIA_TYPE_VIDEO)
         dec->framerate = av_guess_frame_rate(ifmt, st, NULL);
     if ((ret = avcodec_open2(dec, codec, NULL)) < 0) {
@@ -1410,7 +1443,7 @@ static int reopen_input(const char *in_path, AVFormatContext **ifmt,
     }
     if (ret < 0)
         return ret;
-    if ((ret = avformat_find_stream_info(*ifmt, NULL)) < 0)
+    if ((ret = find_stream_info(*ifmt)) < 0)
         return ret;
     *vidx = av_find_best_stream(*ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     *aidx = image ? -1
@@ -1472,7 +1505,7 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
         av_log(NULL, AV_LOG_ERROR, "cannot open '%s': %s\n", in_path, err2str(ret));
         goto end;
     }
-    if ((ret = avformat_find_stream_info(ifmt, NULL)) < 0)
+    if ((ret = find_stream_info(ifmt)) < 0)
         goto end;
 
     vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -1496,15 +1529,26 @@ static int webify_run(const char *in_path, const char *out_path, int emit_json)
 
     /* decompression-bomb guard: reject an over-large canvas from the coded
      * dimensions, before the decoder allocates a frame buffer for it (the
-     * per-frame check in decode_packet catches headers that lie) */
-    if (!audio_only &&
-        !pixels_ok(ifmt->streams[vidx]->codecpar->width,
-                   ifmt->streams[vidx]->codecpar->height)) {
-        av_log(NULL, AV_LOG_ERROR, "input %dx%d exceeds --max-pixels %ld\n",
-               ifmt->streams[vidx]->codecpar->width,
-               ifmt->streams[vidx]->codecpar->height, opt.max_pixels);
-        ret = AVERROR(ERANGE);
-        goto end;
+     * per-frame check in decode_packet catches headers that lie). A codec
+     * whose size only decoding reveals (PNG) was already refused by the probe
+     * decoder's max_pixels, which leaves the size unknown — and an unknown
+     * size can't build the buffersrc anyway, so name the likely cause here
+     * rather than fail later in the filter graph. */
+    if (!audio_only) {
+        const AVCodecParameters *par = ifmt->streams[vidx]->codecpar;
+
+        if (par->width <= 0 || par->height <= 0) {
+            av_log(NULL, AV_LOG_ERROR, "cannot determine the size of '%s'%s\n",
+                   in_path, opt.max_pixels > 0 ? " (over --max-pixels?)" : "");
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        if (!pixels_ok(par->width, par->height)) {
+            av_log(NULL, AV_LOG_ERROR, "input %dx%d exceeds --max-pixels %ld\n",
+                   par->width, par->height, opt.max_pixels);
+            ret = AVERROR(ERANGE);
+            goto end;
+        }
     }
 
     prog.tty      = isatty(STDERR_FILENO);
@@ -1762,15 +1806,22 @@ static void peek_identify(const char *path, char *mime, size_t mn,
 }
 
 /* the mimetype FFmpeg already knows for a container it opened but webify can't
- * transcode (audio-only, or an undecodable video codec). Prefers the demuxer's
+ * transcode (audio-only, an undecodable video codec, or a canvas over
+ * --max-pixels; `video` says a real video stream is present). Prefers the demuxer's
  * own mime_type (set for e.g. mp3 -> audio/mpeg); otherwise maps the stable
  * demuxer name, since most audio demuxers leave mime_type unset. Stays empty for
  * a demuxer that pins nothing useful (e.g. the generic image2 used for SVG) — the
  * caller then falls back to libmagic. */
-static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
+static void ffmpeg_mime(const AVFormatContext *ifmt, int video, char *mime,
+                        size_t mn)
 {
     const char *mt = ifmt->iformat->mime_type;
-    if (mt && *mt) { /* a comma-joined list for some demuxers; take the first */
+    if (mt && *mt) { /* a comma-joined list for some demuxers; take the first,
+                      * or with a video stream the first video/ one (matroska's
+                      * list leads with audio/webm) */
+        const char *v = video ? strstr(mt, "video/") : NULL;
+        if (v)
+            mt = v;
         size_t n = strcspn(mt, ",");
         av_strlcpy(mime, mt, n + 1 < mn ? n + 1 : mn);
         return;
@@ -1788,10 +1839,11 @@ static void ffmpeg_mime(const AVFormatContext *ifmt, char *mime, size_t mn)
             av_strlcpy(mime, map[i].mime, mn);
             return;
         }
-    /* the mov/mp4/m4a family is one comma-joined demuxer name; with no decodable
-     * video (we are here) an opened one is audio (m4a) */
+    /* the mov/mp4/m4a family is one comma-joined demuxer name: an mp4 when it
+     * carries a video stream webify won't transcode (no decoder, or over
+     * --max-pixels), else audio (m4a) */
     if (strstr(n, "mp4"))
-        av_strlcpy(mime, "audio/mp4", mn);
+        av_strlcpy(mime, video ? "video/mp4" : "audio/mp4", mn);
 }
 
 /* --peek: identify the input and print {"mimetype","extension","supported",
@@ -1815,15 +1867,24 @@ static int webify_peek(const char *in_path)
 
     int ret    = is_pipe(in_path) ? open_stdin_input(in_path, &ifmt, &io)
                                   : avformat_open_input(&ifmt, in_path, NULL, NULL);
-    int opened = ret >= 0 && avformat_find_stream_info(ifmt, NULL) >= 0;
+    int opened = ret >= 0 && find_stream_info(ifmt) >= 0;
     int aidx   = opened ? av_find_best_stream(ifmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) : -1;
     /* a real (non-cover-art) video stream means image/video mode; only audio
      * means audio-only mode — the same split webify_run makes */
     int has_video = opened &&
         (vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0)) >= 0 &&
         !(ifmt->streams[vidx]->disposition & AV_DISPOSITION_ATTACHED_PIC);
+    /* the transcode's own gate: a known size within --max-pixels. A canvas over
+     * it, or one the probe decoder refused to size (a PNG bomb reads 0x0), is
+     * rejected by webify_run — so report the source's type, not an output the
+     * transcode won't produce */
+    int sized = has_video &&
+        pixels_ok(ifmt->streams[vidx]->codecpar->width,
+                  ifmt->streams[vidx]->codecpar->height) &&
+        ifmt->streams[vidx]->codecpar->width > 0 &&
+        ifmt->streams[vidx]->codecpar->height > 0;
 
-    if (has_video && avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
+    if (sized && avcodec_find_decoder(ifmt->streams[vidx]->codecpar->codec_id)) {
         /* a video stream webify can actually decode (not just a demuxer match —
          * e.g. SVG is recognized but has no decoder): transcodes to avif/mp4 */
         supported = 1;
@@ -1840,7 +1901,7 @@ static int webify_peek(const char *in_path)
     } else if (opened) {
         /* FFmpeg recognized the container but webify can't transcode it (an
          * undecodable codec): report the type FFmpeg already knows */
-        ffmpeg_mime(ifmt, mime, sizeof mime);
+        ffmpeg_mime(ifmt, has_video, mime, sizeof mime);
         if (*mime)
             av_strlcpy(ext, mime_to_ext(mime), sizeof ext);
     }
@@ -2302,7 +2363,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (open_with_pb(&ifmt, io.pb) >= 0) { /* frees ifmt itself on failure */
         ifmt->probesize            = 1 << 20;
         ifmt->max_analyze_duration = AV_TIME_BASE;
-        if (avformat_find_stream_info(ifmt, NULL) >= 0) {
+        if (find_stream_info(ifmt) >= 0) {
             vidx = av_find_best_stream(ifmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
             if (vidx >= 0)
                 peek_first_frame(ifmt, vidx, 1); /* side data + bomb guard */
