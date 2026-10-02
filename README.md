@@ -156,9 +156,16 @@ Details — vendoring, the update workflow, CI: [doc/build.md](doc/build.md).
 - [doc/calibration.md](doc/calibration.md) — where the `-q` → CRF curves come
   from
 
-## License note
+## License
 
-The binary statically links LGPL-2.1+ code (FFmpeg), BSD code (dav1d, libaom),
-WTFPL code (zimg) — and **GPL-2.0+ code (x264)**, with FFmpeg built
+webify is licensed under the **GNU General Public License, version 2 or (at
+your option) any later version** — see [COPYING](COPYING).
+
+The binary statically links LGPL-2.1+ code (FFmpeg), BSD code (dav1d, libaom,
+libmagic), WTFPL code (zimg) — and **GPL-2.0+ code (x264)**, with FFmpeg built
 `--enable-gpl`. The combined binary is therefore governed by the GPL-2.0+: if
 you redistribute it, GPL terms apply (provide the full corresponding source).
+GitHub Releases carry that source as `webify-<tag>-source.tar.gz`: this
+repository at the tag plus the exact upstream tarballs `vendor.d` pins
+(`./sources.sh <name>` builds it; for releases older than October 2026, which
+predate it, run it on a checkout of the tag).

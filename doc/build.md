@@ -75,4 +75,8 @@ in the GitHub Actions cache per arch — one Docker stage per vendored
 library means bumping one library's pin recompiles only that library.
 Version-tag builds (tags matching `[0-9]*` — see "Keeping pins current"
 above for the scheme) additionally publish a GitHub Release with both
-binary tarballs attached.
+binary tarballs attached (each carries `COPYING` beside the binary), plus
+`COPYING` itself and `webify-<tag>-source.tar.gz` — the GPL's complete
+corresponding source, built by `./sources.sh`: this repo at the tag plus the
+upstream tarballs `vendor.d` pins, re-downloaded and sha256-verified. The
+release job fails if `COPYING` is missing.

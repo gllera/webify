@@ -172,7 +172,12 @@ reference pipeline to fit against.
   Dockerfile stage (clang + libFuzzer, `LLVMFuzzerTestOneInput` at the tail of
   `webify.cpp` under `#ifdef WEBIFY_FUZZER`) and fuzzes the demux + first-frame
   decode path (the `--peek` CVE surface) over a seed corpus.
-- License: **GPL-2.0+** (x264 is GPL; everything else is more permissive).
+- License: **GPL-2.0+** (x264 is GPL; everything else is more permissive), text in
+  `COPYING`. The `release` job refuses to publish without it, packs it into each
+  binary tarball, and attaches `webify-<tag>-source.tar.gz` from `./sources.sh`
+  (repo at the tag + the pinned upstream tarballs, sha256-verified) — the GPL's
+  corresponding source. `sources.sh` reads pins like `update-vendor.sh` does, so
+  a new library only needs the usual `<P>_URL`/`<P>_VERSION`/`<P>_SHA256` lines.
 
 ## Removed vs the original (don't re-add without a reason)
 
