@@ -6,9 +6,9 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-AOM_VERSION=3.15.1
+AOM_VERSION=3.15.3
 # pinned from a verified-good download
-AOM_SHA256=8ca0c52746174603500f0adb6f2a215d69c9ca2aab2acb3caa06fb791d8d01bf
+AOM_SHA256=12c01dc731ed7b5a999e28120b45bf58a002ba3435a4ba2cfbc1e084a27c9c04
 # tarball URL, @V@ = AOM_VERSION (update-vendor.sh probes with it too)
 AOM_URL=https://storage.googleapis.com/aom-releases/libaom-@V@.tar.gz
 
